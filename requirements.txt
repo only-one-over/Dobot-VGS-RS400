@@ -1,0 +1,11 @@
+PyQt6>=6.0
+numpy
+requests
+pymodbus>=3.0
+opencv-python
+onnxruntime
+scipy
+pyrealsense2
+minimalmodbus
+python-can
+lapx

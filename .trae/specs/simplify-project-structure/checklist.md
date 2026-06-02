@@ -1,0 +1,18 @@
+- [x] `.gitignore` 已创建，`__pycache__/`、`build/`、`dist/` 等被正确忽略
+- [x] 根目录散落的 `config.json`、`grasp_flow_modules.json`、`CODE_WIKI.md` 已删除
+- [x] `TCP-IP-Python-V4-main/` 目录已删除（原本不存在）
+- [x] `config_manager.py` 使用 `__file__` 定位配置文件，CWD 无关
+- [x] `dobot_move_python/config.json` 和 `dobot_move_python/grasp_flow_modules.json` 已删除，仅保留包内版本
+- [x] `DobotControl.spec` 打包路径已更新
+- [x] `modbus_utils.py` 已创建，`float_to_regs`/`regs_to_float` 公共函数可用
+- [x] `modbus_server.py` 和 `modbus_client.py` 从 `modbus_utils` 导入，无重复代码
+- [x] `dobot_move/__init__.py` 已创建，核心类可正常导入
+- [x] `config.json` 包含 `calibration` 字段
+- [x] `vision_system.py` 从配置读取标定参数，硬编码值作为默认回退
+- [x] `workers.py` 已创建，包含 4 个线程类
+- [x] `gui_app.py` 从 `workers.py` 导入线程类，自身仅含 UI 逻辑
+- [x] `files/alarmController.py` 和 `files/alarmServo.py` 已删除
+- [x] `dobot_api.py` 中报警文件引用已确认使用 `.json`（无需修改）
+- [x] 程序可从 `dobot_move_python/` 目录正常启动
+- [x] 所有 import 路径正确无误
+- [x] `build.bat` 打包脚本可正常工作

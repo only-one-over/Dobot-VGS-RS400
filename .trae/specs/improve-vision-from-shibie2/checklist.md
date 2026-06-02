@@ -1,0 +1,9 @@
+- [x] 相机内参从 profile 动态获取，不再硬编码
+- [x] 深度范围参数调整为 min_depth=0.5, max_depth=2.2
+- [x] 深度补偿方法 extract_mask_point_cloud_with_median_compensation 已实现
+- [x] 面积过滤方法 filter_detections_by_area 已实现
+- [x] calculate_object_position 使用深度补偿获取抓取点深度
+- [x] _postprocess_yolov8_py 末尾调用面积过滤
+- [x] 调试日志包含输出形状、NMS前后数量、补偿信息
+- [x] 掩码中心点深度无效时能通过中位数补偿正确计算坐标
+- [x] 面积过小的误检被过滤掉

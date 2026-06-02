@@ -1,0 +1,5 @@
+- [x] 模型路径使用 `os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.onnx")` 绝对路径
+- [x] 模型加载失败时抛出 `RuntimeError`
+- [x] 后处理支持 1 个输出（detect）和 2 个输出（seg）的模型
+- [x] `num_classes` 从模型输出形状动态推断
+- [x] detect 模型时检测结果 mask 字段为 None

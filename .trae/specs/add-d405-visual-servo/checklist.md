@@ -1,0 +1,13 @@
+- [x] visual_servo_controller.py 文件已创建
+- [x] VisualServoController 类包含 servo_to_target 方法
+- [x] PBVS 闭环: 每帧计算 e = p_target - p_current，执行 MovL(p_current + e × gain)
+- [x] 自适应增益: 远距离 gain=0.6/speed=10%, 中距离 gain=0.4/speed=5%, 近距离 gain=0.2/speed=2%
+- [x] 收敛判断: ||e|| < converge_threshold(2mm) 返回成功
+- [x] 超时退出: 超过 max_iterations(60) 返回失败
+- [x] 卡尔曼前馈补偿: p_cmd += kalman.v × dt
+- [x] 安全保护: 限步长 max_step_mm(5mm)、限 Z 轴
+- [x] _adaptive_gain 方法根据误差距离返回 (gain, speed)
+- [x] _safety_clamp 方法限制单步位移和 Z 轴下限
+- [x] servo_to_target 返回 (success, final_error_mm, iterations)
+- [x] gui_app.py FlowThread 新增 visual_servo 模块类型处理
+- [x] 流程编辑器 UI 新增 visual_servo 模块类型

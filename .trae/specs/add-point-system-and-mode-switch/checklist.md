@@ -1,0 +1,27 @@
+- [x] config.json 包含 points 字段，3 个默认点位（p_d435i、p_u405、p_n405）
+- [x] config_manager 提供 get_points / set_points / get_point / set_point / add_point / delete_point / resolve_point 接口
+- [x] resolve_point 能递归解析相对点位为绝对坐标
+- [x] D435i 状态标签独占一行，连接/断开按钮另起一行
+- [x] D405 状态标签独占一行，连接/断开按钮另起一行
+- [x] 运动编辑选项卡有点位列表区域，显示名称+坐标+是否相对+基准点位
+- [x] 添加点位功能正常，名称唯一
+- [x] 删除点位功能正常，默认点位不可删除
+- [x] 编辑点位坐标功能正常
+- [x] 相对点位设置功能正常（选择基准点位+偏移量）
+- [x] 基准点位变化时相对点位自动重新计算
+- [x] 点位变化自动保存到 config.json
+- [x] 直线运动参数编辑有"坐标模式/点位模式"切换
+- [x] 坐标模式显示偏移值输入框（与现有一致）
+- [x] 点位模式显示点位选择下拉框
+- [x] 模式切换时各模式参数独立保存不丢失
+- [x] 力控圆弧参数编辑有"坐标模式/点位模式"切换
+- [x] 力控圆弧点位模式下圆心使用选中点位坐标
+- [x] D435i 识别后自动更新 p_d435i 点位
+- [x] D405 识别后自动更新 p_u405 和 p_n405 点位
+- [x] FlowThread 直线运动支持 point_name 参数解析坐标
+- [x] FlowThread 力控圆弧支持 point_name 参数解析圆心
+- [x] 相对点位自动递归解析
+- [x] 点位不存在时报错终止流程
+- [x] add_module 新增模块包含 mode 和 point_name 字段
+- [x] update_module_params 根据模式读取对应参数
+- [x] on_step_clicked 恢复模式切换状态

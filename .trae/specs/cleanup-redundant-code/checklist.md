@@ -1,0 +1,9 @@
+- [x] transform_utils.py 包含 euler2rot 和 pose2matrix 函数
+- [x] config_manager.py 从 transform_utils 导入而非自定义
+- [x] vision_system.py 从 transform_utils 导入而非自定义
+- [x] hand_eye_calib.py 从 transform_utils 导入而非自定义
+- [x] gui_app.py 中 vision 属性已删除
+- [x] robot_controller.py 中 move_arc 方法已删除
+- [x] robot_controller.py 中 move_to_target_position 方法已删除
+- [x] robot_controller.py 不再导入 get_target_offset
+- [x] config_manager.py 中 get_target_offset 和 set_target_offset 已删除

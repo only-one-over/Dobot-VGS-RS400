@@ -1,0 +1,8 @@
+- [x] "参数设置"Tab中"运行速度设置"QGroupBox已删除
+- [x] set_speed() 方法已删除
+- [x] "机器人力控"Tab仅保留"关节力矩数据"，历史数据和预警已删除
+- [x] robot_controller.py 新增 move_jog() 和 stop_jog() 方法
+- [x] "点动控制"Tab包含关节轴(J1-J4)正反向按钮
+- [x] "点动控制"Tab包含坐标轴(X/Y/Z/Rx/Ry/Rz)正反向按钮
+- [x] 点动按钮按下开始、松开停止
+- [x] 未连接时点击点动按钮有提示

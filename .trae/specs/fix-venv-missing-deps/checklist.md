@@ -1,0 +1,6 @@
+- [x] requirements.txt 中所有依赖包安装成功
+- [x] pymodbus 可正常导入，不再出现 ModuleNotFoundError
+- [x] requests 可正常导入
+- [x] opencv-python (cv2) 可正常导入
+- [x] onnxruntime 可正常导入
+- [x] gui_app.py 启动时无 ImportError/ModuleNotFoundError

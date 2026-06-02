@@ -1,0 +1,11 @@
+- [x] gui_app.py 新增"相机测试"选项卡
+- [x] 相机选择 QComboBox(D435i/D405) + 开始/停止按钮
+- [x] 实时画面 QLabel 显示检测结果（bbox + 掩码轮廓）
+- [x] 坐标显示区域：相机坐标/末端坐标/基座坐标/置信度
+- [x] D405 专用显示：柄端坐标、钩尖坐标、铁钩长度
+- [x] 检测状态 QLabel
+- [x] _start_camera_test() 检查相机连接并启动 QTimer
+- [x] _stop_camera_test() 停止 QTimer
+- [x] _camera_test_tick() 调用检测→3D定位→坐标转换→更新UI
+- [x] 相机未连接时提示
+- [x] 机器人未连接时仅显示相机坐标

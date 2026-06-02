@@ -1,0 +1,3 @@
+- [x] 检查点1：dobot_api.py中存在GetForce(tool=2)方法
+- [x] 检查点2：robot_controller.py中存在get_force(tool=2)方法
+- [x] 检查点3：响应解析正确返回Fx, Fy, Fz, Mx, My, Mz

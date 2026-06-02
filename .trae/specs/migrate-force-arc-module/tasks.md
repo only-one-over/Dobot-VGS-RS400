@@ -1,0 +1,31 @@
+# Tasks
+- [x] Task 1: 修改 ForceArcController 支持外部 dashboard 对象
+  - [x] SubTask 1.1: 添加 `set_dashboard(dashboard)` 方法，允许传入已有的 dashboard 连接
+  - [x] SubTask 1.2: 修改 `execute()` 方法，在无内部 dashboard 时使用外部 dashboard
+  - [x] SubTask 1.3: 修改 `execute()` 中 `finally` 块，仅关闭内部创建的连接
+- [x] Task 2: 在 gui_app.py 中导入力控圆弧相关模块
+  - [x] SubTask 2.1: 导入 ForceArcController
+- [x] Task 3: 创建力控圆弧参数 UI 面板
+  - [x] SubTask 3.1: 创建 force_arc_params QWidget，包含圆弧参数（圆心XYZ、半径、起始角度、终止角度、旋转轴、路点数、速度）
+  - [x] SubTask 3.2: 添加力控参数（力控轴选择、修正增益、偏差阈值平移/旋转、阻尼平移/旋转）
+- [x] Task 4: 在模块选择下拉框中添加"力控圆弧"选项
+  - [x] SubTask 4.1: module_combo.addItems 中添加"力控圆弧"
+- [x] Task 5: 在添加模块逻辑中支持力控圆弧
+  - [x] SubTask 5.1: add_module 中添加"力控圆弧"分支，创建 type="force_arc" 模块
+- [x] Task 6: 在参数面板切换逻辑中支持力控圆弧
+  - [x] SubTask 6.1: on_module_combo_changed 中添加"力控圆弧"分支
+- [x] Task 7: 在参数更新逻辑中支持力控圆弧
+  - [x] SubTask 7.1: update_module_params 中添加"力控圆弧"分支，保存所有参数
+- [x] Task 8: 在流程显示中支持力控圆弧
+  - [x] SubTask 8.1: view_current_grasp_flow 中添加 force_arc 类型的显示格式
+- [x] Task 9: 在 FlowThread 中添加力控圆弧执行逻辑
+  - [x] SubTask 9.1: run() 中添加 module['type'] == "force_arc" 分支
+  - [x] SubTask 9.2: 创建 ForceArcController 实例，设置外部 dashboard
+  - [x] SubTask 9.3: 配置力控参数和圆弧参数，调用 execute()
+- [x] Task 10: 验证力控圆弧模块可正常添加、编辑、显示
+
+# Task Dependencies
+- Task 2 依赖 Task 1
+- Task 3 独立
+- Task 4-9 依赖 Task 3
+- Task 10 依赖 Task 4-9

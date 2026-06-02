@@ -1,0 +1,4 @@
+- [x] 6个关节力Label（J1-J6）已创建
+- [x] 布局为3行2列
+- [x] 数据更新使用 IActual 而非 ActualJointTorque
+- [x] 6个关节Label均能实时更新

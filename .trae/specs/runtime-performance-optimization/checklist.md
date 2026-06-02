@@ -1,0 +1,10 @@
+- [x] `_skeletonize_mask` 方法使用 `for` 循环替代 `while True`，最大迭代 200 次，超限时降级为 `cv2.ximgproc.thinning`
+- [x] `_update_modbus_status` 从 `feed_data[144:168]`（ToolVectorActual）提取位姿，不再调用 `get_current_pose()`
+- [x] `CameraTestWorker.run()` 有帧率控制（30 FPS 上限），`color_image.copy()` 已删除
+- [x] `realtime_feedback_dialog.py` `_feed_loop` 使用 `time.sleep(0.005)` 替代 `time.sleep(0.001)`
+- [x] `onnxruntime` 不再在 `vision_system.py` / `gui_app.py` 模块级导入，改为延迟导入到 `VisionSystem.__init__` 内部
+- [x] `gui_app.py` 的 `_missing_deps` 中 `onnxruntime` 检测逻辑仍然有效
+- [x] `refresh_points_table` 使用增量更新，仅调整行数 + 更新值，不重建 widget
+- [x] `refresh_points_table` 更新时 spinbox 信号被 `blockSignals` 屏蔽
+- [x] `resolve_point` 不再调用 `set_points()` 写入磁盘
+- [x] 「没有发现 opencv」等原有错误提示不受影响

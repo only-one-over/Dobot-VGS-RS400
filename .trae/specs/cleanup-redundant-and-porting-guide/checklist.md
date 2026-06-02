@@ -1,0 +1,10 @@
+- [ ] transform_utils.py 包含 euler2rot 和 pose2matrix 函数
+- [ ] config_manager.py 从 transform_utils 导入而非自定义
+- [ ] vision_system.py 从 transform_utils 导入而非自定义
+- [ ] hand_eye_calib.py 从 transform_utils 导入而非自定义
+- [ ] gui_app.py 中 vision 属性已删除
+- [ ] robot_controller.py 中 move_arc 方法已删除
+- [ ] robot_controller.py 中 move_to_target_position 方法已删除
+- [ ] robot_controller.py 不再导入 get_target_offset
+- [ ] config_manager.py 中 get_target_offset 和 set_target_offset 已删除
+- [ ] PORTING_GUIDE.md 包含完整的移植方案文档

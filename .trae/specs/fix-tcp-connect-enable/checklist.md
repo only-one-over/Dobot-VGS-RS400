@@ -1,0 +1,5 @@
+- [x] 检查点1：robot_controller.connect()不再重复调用RequestControl()
+- [x] 检查点2：DobotApiDashboard.connect()自动调用RequestControl()
+- [x] 检查点3：enable_robot()正确处理各种机器人状态
+- [x] 检查点4：默认IP为192.168.5.1
+- [x] 检查点5：PowerOn后轮询等待上电完成

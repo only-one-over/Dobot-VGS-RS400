@@ -1,0 +1,4 @@
+- [x] `run_grasping_task()` 调用 `self.run_grasp_flow()` 而非弹窗结束
+- [x] `run_grasping_task()` 保留了前置检查（相机/机器人/使能）
+- [x] `run_grasp_flow()` 中 `target == "camera_detected"` 且 `base_coords` 为 None 时报错，不静默跳过
+- [x] 报错消息包含明确的问题描述和修复建议

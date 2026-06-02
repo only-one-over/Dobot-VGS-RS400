@@ -1,0 +1,12 @@
+- [x] config_manager.py 提供 get_cart_ip / set_cart_ip 函数
+- [x] config_manager.py 提供 get_cart_port / set_cart_port 函数
+- [x] config_manager.py 提供 get_modbus_port / set_modbus_port 函数
+- [x] gui_app.py 导入新增的 config_manager 函数
+- [x] 小车 IP 输入框初始值从配置读取
+- [x] 小车端口输入框初始值从配置读取
+- [x] Modbus 端口输入框初始值从配置读取
+- [x] 机器人 IP 输入框 editingFinished 信号绑定即时保存
+- [x] 小车 IP 输入框 editingFinished 信号绑定即时保存
+- [x] 小车端口输入框 editingFinished 信号绑定即时保存
+- [x] Modbus 端口输入框 editingFinished 信号绑定即时保存
+- [x] 修改 IP 后重启应用，IP 自动恢复

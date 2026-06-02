@@ -1,0 +1,3 @@
+- [x] minimalmodbus 已安装且可导入
+- [x] python-can 已安装且可导入
+- [x] requirements.txt 包含 minimalmodbus 和 python-can

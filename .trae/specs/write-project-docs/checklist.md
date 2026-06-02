@@ -1,0 +1,10 @@
+- [x] README.md 存在且包含项目简介章节
+- [x] README.md 包含系统架构章节（模块关系和职责列表）
+- [x] README.md 包含硬件要求章节（机械臂、相机、夹爪、网络）
+- [x] README.md 包含环境安装章节（Python 版本、pip install、C++ 编译、验证命令）
+- [x] README.md 包含配置说明章节（config.json 各字段含义）
+- [x] README.md 包含运行方式章节（启动命令和首次使用流程）
+- [x] README.md 包含模块说明章节（各 .py 文件职责）
+- [x] README.md 包含 C++ 加速模块章节（dobot_core 编译和回退机制）
+- [x] README.md 包含常见问题章节
+- [x] PORTING_GUIDE.md 已更新，包含 dobot_core C++ 模块移植说明

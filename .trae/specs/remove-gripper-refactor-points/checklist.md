@@ -1,0 +1,19 @@
+- [x] config_manager.py _DEFAULT_POINTS 仅包含 d435i 和 d405 两个点位
+- [x] gui_app.py 夹爪控制 UI 已删除（开/关按钮、位置标签）
+- [x] gui_app.py 夹爪模块参数编辑器已删除
+- [x] gui_app.py 模块拼接工具中"夹爪开合"选项已移除
+- [x] gui_app.py FlowThread 中 gripper 模块类型处理已移除
+- [x] gui_app.py FlowThread.__init__ 不再接收 gripper 参数
+- [x] gui_app.py self.gripper / self.gripper_thread 初始化已删除
+- [x] gui_app.py _on_device_initFinished 不再处理 gripper
+- [x] gui_app.py D435iLowFpsWorker 更新 d435i 点位
+- [x] gui_app.py FlowThread D405 识别更新 d405 点位
+- [x] gui_app.py 视觉选项卡包含 D435i 低帧率识别 UI 控件
+- [x] robot_control_mixin.py gripper_open / gripper_close / update_gripper_position 已删除
+- [x] robot_control_mixin.py start_monitor_threads 不再启动夹爪监控
+- [x] workers.py DeviceInitThread 不再初始化夹爪
+- [x] workers.py init_finished 信号只传 battery
+- [x] visual_servo_controller.py 点位名 p_d435i 改为 d435i
+- [x] config.json 点位结构为 d435i / d405
+- [x] README.md 已更新（移除夹爪、更新点位、添加低帧率识别说明）
+- [x] PORTING_GUIDE.md 已更新

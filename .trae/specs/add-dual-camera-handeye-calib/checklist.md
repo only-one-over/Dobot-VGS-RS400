@@ -1,0 +1,18 @@
+- [x] config.json 中 calibration 字段已迁移为多相机结构，D435i 保留原有值，D405 有默认值
+- [x] 旧格式 config.json 能自动迁移为新格式，不丢失数据
+- [x] config_manager.py 提供 get_calibration / set_calibration / get_all_calibrations / get_camera_handeye_matrix 接口
+- [x] hand_eye_calib.py 的 HandEyeCalibManager 能读取、修改、保存标定矩阵
+- [x] HandEyeCalibManager 支持从位姿参数计算标定矩阵
+- [x] HandEyeCalibManager 支持直接设置 4x4 矩阵
+- [x] 标定矩阵修改后永久写入 config.json
+- [x] VisionSystem 接受 camera_type 参数，D435i 和 D405 各自加载对应标定矩阵
+- [x] D435i 相机识别结果返回目标中心点坐标（与原有行为一致）
+- [x] D405 相机识别结果返回铁钩两端端点坐标和抓取位置
+- [x] D405 端点提取逻辑：掩码骨架化 → 端点检测 → 深度查表 → 3D 坐标
+- [x] GUI 手眼标定选项卡能显示所有相机的 4x4 标定矩阵
+- [x] GUI 手眼标定选项卡支持编辑矩阵元素并保存
+- [x] GUI 手眼标定选项卡支持重置为默认值
+- [x] GUI 相机连接区域有相机类型下拉框（D435i/D405）
+- [x] 抓取流程编辑器中相机模块有"相机选择"参数
+- [x] FlowThread 中 D405 模式使用端点坐标计算抓取位置
+- [x] 两种相机的识别结果都能正确传递给后续运动模块

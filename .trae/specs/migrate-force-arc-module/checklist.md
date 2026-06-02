@@ -1,0 +1,11 @@
+- [x] ForceArcController 支持外部 dashboard 对象（set_dashboard 方法）
+- [x] gui_app.py 导入 ForceArcController
+- [x] 力控圆弧参数 UI 面板包含圆弧参数（圆心XYZ、半径、起止角度、旋转轴、路点数、速度）
+- [x] 力控圆弧参数 UI 面板包含力控参数（力控轴、修正增益、偏差阈值、阻尼）
+- [x] 模块选择下拉框包含"力控圆弧"选项
+- [x] 添加模块逻辑支持创建 type="force_arc" 模块
+- [x] 参数面板切换支持力控圆弧
+- [x] 参数更新逻辑支持保存力控圆弧参数
+- [x] 流程显示支持力控圆弧模块信息
+- [x] FlowThread 执行逻辑支持力控圆弧
+- [x] 力控圆弧模块可正常添加、编辑、显示

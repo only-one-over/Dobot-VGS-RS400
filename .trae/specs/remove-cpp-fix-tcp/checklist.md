@@ -1,0 +1,6 @@
+- [x] 检查点1：dobot_api.py connect()正确读取欢迎消息并自动调用RequestControl()
+- [x] 检查点2：send_command()能正确接收响应
+- [x] 检查点3：cpp_core目录已删除
+- [x] 检查点4：test_tcp_interface.py已删除
+- [x] 检查点5：vision_system.py不再引用dobot_core
+- [x] 检查点6：torque_monitor.py不再引用dobot_core

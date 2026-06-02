@@ -1,0 +1,5 @@
+- [x] `wait_reply()` 在 `socket.timeout` 时不执行 `reConnect`，返回空字符串
+- [x] `wait_reply()` 在 `ConnectionResetError` 时仍执行 `reConnect`
+- [x] `reConnect()` 在创建新 socket 前关闭旧 socket
+- [x] `sendRecvMsg()` 添加整体超时保护，防止锁被长时间持有
+- [x] `get_current_pose()` 重试机制在超时后仍能正常运作

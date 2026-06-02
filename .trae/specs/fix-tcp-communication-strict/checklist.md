@@ -1,0 +1,6 @@
+- [x] 检查点1：DobotApiDashboard.connect()连接后消费欢迎消息
+- [x] 检查点2：send_command()超时时间增加到15秒，正确处理响应格式
+- [x] 检查点3：EnableRobot()无参数时不发送0值
+- [x] 检查点4：robot_controller.py连接后先调用RequestControl()
+- [x] 检查点5：torque_monitor.py力控数据字节偏移修正为576开始
+- [x] 检查点6：gui_app.py力控选项卡标签正确更新

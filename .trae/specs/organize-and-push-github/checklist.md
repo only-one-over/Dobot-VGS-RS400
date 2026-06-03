@@ -1,11 +1,11 @@
-- [ ] README.md 中无夹爪控制器相关描述
-- [ ] README.md 中无骨架化端点检测描述，改为掩码几何中心
-- [ ] README.md 点位系统描述为 d435i/d405 两个点位
-- [ ] README.md 抓取流程无夹爪闭合步骤
-- [ ] README.md 核心模块表无 gripper_controller.py 行
-- [ ] README.md 依赖列表无 minimalmodbus/pyserial
-- [ ] .gitignore 存在且正确排除 .venv/、build/、__pycache__/、*.pyd、graphify-out/、.pip_packages/、.vscode/
-- [ ] git init 成功
-- [ ] git commit 成功，提交信息为 conventional commit 格式
-- [ ] GitHub 仓库 Dobot-VGS-RS400 创建成功
-- [ ] 代码成功推送到 GitHub 远程仓库
+- [x] README.md 中无夹爪控制器相关描述
+- [x] README.md 中无骨架化端点检测描述，改为掩码几何中心
+- [x] README.md 点位系统描述为 d435i/d405 两个点位
+- [x] README.md 抓取流程无夹爪闭合步骤
+- [x] README.md 核心模块表无 gripper_controller.py 行
+- [x] README.md 依赖列表无 minimalmodbus/pyserial
+- [x] .gitignore 存在且正确排除 .venv/、build/、__pycache__/、*.pyd、graphify-out/、.pip_packages/、.vscode/
+- [x] git init 成功
+- [x] git commit 成功，提交信息为 conventional commit 格式
+- [x] GitHub 仓库 Dobot-VGS-RS400 创建成功
+- [x] 代码成功推送到 GitHub 远程仓库

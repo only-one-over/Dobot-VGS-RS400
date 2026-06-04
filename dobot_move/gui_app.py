@@ -16,17 +16,17 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QGroupBox, QGridLayout, QStatusBar,
     QMessageBox, QTabWidget, QLineEdit, QDoubleSpinBox, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QFrame, QScrollArea, QStackedWidget,
-    QRadioButton, QCheckBox, QInputDialog
+    QCheckBox, QInputDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QPalette, QColor, QImage, QPixmap
+from PyQt6.QtGui import QImage, QPixmap
 
 # 添加当前目录到Python路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from robot_controller import DobotController
-from config_manager import set_photo_position as config_set_photo_position, get_robot_ip, set_robot_ip as config_set_robot_ip, get_cart_ip, set_cart_ip as config_set_cart_ip, get_cart_port, set_cart_port as config_set_cart_port, get_modbus_port, set_modbus_port as config_set_modbus_port, get_points, get_point, set_point, add_point, delete_point, resolve_point
-from workers import DeviceInitThread, StatusUpdateThread, MonitorThread, RobotCmdThread
+from config_manager import set_photo_position as config_set_photo_position, get_robot_ip, set_robot_ip as config_set_robot_ip, get_cart_ip, set_cart_ip as config_set_cart_ip, get_cart_port, set_cart_port as config_set_cart_port, get_modbus_port, set_modbus_port as config_set_modbus_port, get_points, get_point, set_point, add_point, delete_point, resolve_point, ConfigService
+from workers import DeviceInitThread, MonitorThread, RobotCmdThread, FlowThread, CameraTestWorker, D435iLowFpsWorker
 from force_arc_controller import ForceArcController
 from gui_mixins import (
     RobotControlMixin,
@@ -38,6 +38,9 @@ from gui_mixins import (
     JogMixin,
 )
 from visual_servo_controller import VisualServoController
+from ui_theme import apply_app_palette, apply_status_visual, set_button_role, GLOBAL_STYLESHEET
+from flow_step_list import FlowStepList
+from main_control_panel import MainControlPanel
 
 logger = logging.getLogger(__name__)
 
@@ -123,371 +126,6 @@ _DEFAULT_GRASP_FLOW_MODULES = [
     }
 ]
 
-class FlowThread(QThread):
-    flow_log = pyqtSignal(str)
-    flow_finished = pyqtSignal(bool)
-    flow_module_progress = pyqtSignal(int, int, str)
-
-    def __init__(self, controller, vision_d435i, vision_d405, grasp_flow_modules, is_paused_ref, parent=None):
-        super().__init__(parent)
-        self.controller = controller
-        self.vision_d435i = vision_d435i
-        self.vision_d405 = vision_d405
-        self.grasp_flow_modules = grasp_flow_modules
-        self.is_paused_ref = is_paused_ref
-
-    def run(self):
-        try:
-            modules = self.grasp_flow_modules
-            total = len(modules)
-            base_coords = None
-            for i, module in enumerate(modules):
-                while self.is_paused_ref[0]:
-                    time.sleep(0.1)
-                name = module.get("name", f"模块{i+1}")
-                self.flow_module_progress.emit(i + 1, total, name)
-                try:
-                    if hasattr(self.controller, 'dashboard') and self.controller.dashboard:
-                        mode = self.controller.dashboard.RobotMode()
-                        mode_val = int(str(mode)) if mode is not None else -1
-                        if mode_val == 9:
-                            self.flow_log.emit("⚠️ 检测到报警，自动清除...")
-                            self.controller.clear_error()
-                            time.sleep(0.5)
-                except Exception:
-                    pass
-                if module['type'] == "move":
-                    if module['params']['target'] == "initial_position":
-                        if not self.controller.move_to_initial_position():
-                            self.flow_log.emit(f"❌ 模块{i+1}运动失败: 移动到初始位置失败")
-                            self.flow_finished.emit(False)
-                            return
-                    elif module['params']['target'] == "camera_detected":
-                        if base_coords is None:
-                            self.flow_log.emit("❌ 相机未识别到物体坐标，请确保流程中先有相机识别步骤")
-                            self.flow_finished.emit(False)
-                            return
-                        current_pose = self.controller.get_current_pose()
-                        if not current_pose:
-                            self.flow_log.emit("❌ 无法获取当前机器人位姿")
-                            self.flow_finished.emit(False)
-                            return
-                        if module['params']['motion_type'] == "MovL":
-                            point_name = module['params'].get('point_name', '')
-                            if not point_name:
-                                self.flow_log.emit(f"❌ 模块{i+1}直线运动未指定目标点位")
-                                self.flow_finished.emit(False)
-                                return
-                            resolved = resolve_point(point_name)
-                            if resolved is None:
-                                self.flow_log.emit(f"❌ 点位 '{point_name}' 不存在或循环引用")
-                                self.flow_finished.emit(False)
-                                return
-                            success = self.controller.move_to_point(
-                                resolved,
-                                move_type="MovL",
-                                speed_percentage=module['params']['speed']
-                            )
-                            if not success:
-                                self.flow_log.emit(f"❌ 模块{i+1}直线运动失败")
-                                self.flow_finished.emit(False)
-                                return
-                elif module['type'] == "force_arc":
-                    if not self.controller.is_connected:
-                        self.flow_log.emit("❌ 机器人未连接，无法执行力控圆弧")
-                        self.flow_finished.emit(False)
-                        return
-                    try:
-                        p = dict(module['params'])
-                        if module['params'].get('mode') == 'point' and module['params'].get('point_name'):
-                            point_name = module['params']['point_name']
-                            resolved = resolve_point(point_name)
-                            if resolved is None:
-                                self.flow_log.emit(f"❌ 点位 '{point_name}' 不存在或循环引用")
-                                self.flow_finished.emit(False)
-                                return
-                            p['center'] = resolved[:3]
-                        if module['params'].get('center_mode') == 'point' and module['params'].get('center_point_name'):
-                            center_point_name = module['params']['center_point_name']
-                            center_resolved = resolve_point(center_point_name)
-                            if center_resolved is None:
-                                self.flow_log.emit(f"❌ 圆心点位 '{center_point_name}' 不存在或循环引用")
-                                self.flow_finished.emit(False)
-                                return
-                            p['center'] = center_resolved[:3]
-                        fa_ctrl = ForceArcController()
-                        fa_ctrl.set_dashboard(self.controller.dashboard)
-                        fa_ctrl.configure_force_control(
-                            deviation_pos=p['deviation_pos'],
-                            deviation_rot=p['deviation_rot'],
-                            controltype=1,
-                            damping={
-                                'x': p['damping_pos'], 'y': p['damping_pos'], 'z': p['damping_pos'],
-                                'rx': p['damping_rot'], 'ry': p['damping_rot'], 'rz': p['damping_rot']
-                            }
-                        )
-                        fa_ctrl.configure_arc(
-                            center=p['center'],
-                            radius=p['radius'],
-                            start_angle=p['start_angle'],
-                            end_angle=p['end_angle'],
-                            rotation_axis=p['rotation_axis'],
-                            num_waypoints=p['num_waypoints'],
-                            speed_factor=p['speed']
-                        )
-                        fa_ctrl.execute(
-                            fc_axes=p['fc_axes'],
-                            correction_gain=p['correction_gain']
-                        )
-                        self.flow_log.emit(f"✅ 模块{i+1}力控圆弧运动完成")
-                    except Exception as e:
-                        self.flow_log.emit(f"❌ 模块{i+1}力控圆弧运动失败: {e}")
-                        self.flow_finished.emit(False)
-                        return
-                elif module['type'] == "camera":
-                    camera_type = module['params'].get('camera_type', 'D435i')
-                    if camera_type == "D405":
-                        vision_to_use = self.vision_d405
-                    else:
-                        vision_to_use = self.vision_d435i
-
-                    if vision_to_use is None:
-                        self.flow_log.emit(f"❌ {camera_type} 相机未连接，无法识别物体")
-                        self.flow_finished.emit(False)
-                        return
-
-                    vision_to_use.reset_tracking()
-
-                    N_FRAMES = 5
-                    best_result = None
-                    best_confidence = 0.0
-
-                    for frame_idx in range(N_FRAMES):
-                        depth_frame, color_frame = vision_to_use.capture_frames()
-                        if not depth_frame or not color_frame:
-                            continue
-                        color_image = np.asanyarray(color_frame.get_data())
-
-                        target = vision_to_use.run_detection_tracked(color_image)
-                        object_position = vision_to_use.calculate_object_position_smoothed(depth_frame, color_frame, target)
-
-                        if object_position:
-                            conf = object_position.get('confidence', 0.0)
-                            self.flow_log.emit(f"📊 帧{frame_idx+1}/{N_FRAMES} 置信度={conf:.2f} 来源={object_position.get('source', 'unknown')}")
-                            if conf > best_confidence:
-                                best_result = object_position
-                                best_confidence = conf
-                            if best_confidence > 0.9:
-                                self.flow_log.emit(f"✅ 置信度充足({best_confidence:.2f})，提前退出")
-                                break
-
-                    if not best_result or best_confidence < 0.3:
-                        self.flow_log.emit(f"❌ 多帧检测失败，最高置信度={best_confidence:.2f}")
-                        self.flow_finished.emit(False)
-                        return
-
-                    object_position = best_result
-                    self.flow_log.emit(f"✅ 最终结果: 置信度={best_confidence:.2f}")
-
-                    end_coords = vision_to_use.convert_to_end_coords(object_position['camera_coords'])
-                    current_pose = self.controller.get_current_pose()
-                    if not current_pose:
-                        self.flow_log.emit("❌ 无法获取当前机器人位姿")
-                        self.flow_finished.emit(False)
-                        return
-                    base_coords = vision_to_use.convert_to_base_coords(end_coords, current_pose)
-
-                    if base_coords is not None and current_pose is not None:
-                        point_name = "d435i" if camera_type == "D435i" else "d405"
-                        point_data = get_point(point_name) or {"coords": [0]*6, "is_relative": False, "relative_to": None, "offset": [0]*6, "is_default": True}
-                        point_data["coords"] = list(base_coords) + list(current_pose[3:])
-                        set_point(point_name, point_data)
-                        self.flow_log.emit(f"📍 已更新点位 {point_name}")
-                elif module['type'] == "visual_servo":
-                    if self.vision_d405 is None:
-                        self.flow_log.emit("❌ D405 相机未连接，无法执行视觉伺服")
-                        self.flow_finished.emit(False)
-                        return
-
-                    target_type = module['params'].get('target_type', 'grasp_point')
-                    converge_threshold = module['params'].get('converge_threshold', 2.0)
-                    max_iterations = module['params'].get('max_iterations', 60)
-
-                    servo_ctrl = VisualServoController(
-                        vision=self.vision_d405,
-                        controller=self.controller,
-                        converge_threshold=converge_threshold,
-                        max_iterations=max_iterations,
-                    )
-
-                    def servo_log(msg):
-                        self.flow_log.emit(msg)
-
-                    success, final_error, iterations = servo_ctrl.servo_to_target(
-                        target_type=target_type,
-                        log_callback=servo_log,
-                    )
-
-                    if not success:
-                        self.flow_log.emit(f"❌ 视觉伺服失败，最终误差={final_error:.1f}mm")
-                        self.flow_finished.emit(False)
-                        return
-
-                    self.flow_log.emit(f"✅ 视觉伺服完成，误差={final_error:.1f}mm，迭代={iterations}次")
-                elif module['type'] == "joint_move":
-                    offsets = module['params'].get('offsets', [0]*6)
-                    acceleration = module['params'].get('acceleration', 20)
-                    speed = module['params'].get('speed', 50)
-                    success = self.controller.move_joint_relative(
-                        offsets,
-                        a=acceleration,
-                        v=speed
-                    )
-                    if not success:
-                        self.flow_log.emit(f"❌ 模块{i+1}关节旋转运动失败")
-                        self.flow_finished.emit(False)
-                        return
-            self.flow_log.emit("✅ 抓取流程执行完成")
-            self.flow_finished.emit(True)
-        except Exception as e:
-            self.flow_log.emit(f"❌ 流程异常: {e}")
-            self.flow_finished.emit(False)
-
-class CameraTestWorker(QThread):
-    result_ready = pyqtSignal(dict)
-
-    def __init__(self, vision, cam_type, controller):
-        super().__init__()
-        self.vision = vision
-        self.cam_type = cam_type
-        self.controller = controller
-        self.running = True
-        self.last_frame_time = 0
-        self.frame_interval = 1.0 / 30.0
-
-    def run(self):
-        self.vision.reset_tracking()
-        while self.running:
-            try:
-                elapsed = time.time() - self.last_frame_time
-                if elapsed < self.frame_interval:
-                    time.sleep(self.frame_interval - elapsed)
-                self.last_frame_time = time.time()
-
-                depth_frame, color_frame = self.vision.capture_frames()
-                if not depth_frame or not color_frame:
-                    self.result_ready.emit({'status': 'no_frame'})
-                    continue
-
-                color_image = np.asanyarray(color_frame.get_data())
-                display_image = color_image
-
-                target = self.vision.run_detection_tracked(color_image)
-
-                if target and not target.get('predicted', False):
-                    bbox = target.get('bbox')
-                    if bbox:
-                        x1, y1, x2, y2 = bbox
-                        cv2.rectangle(display_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    mask = target.get('mask')
-                    if mask is not None and np.any(mask > 0):
-                        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        cv2.drawContours(display_image, contours, -1, (0, 255, 0), 2)
-
-                object_position = self.vision.calculate_object_position_smoothed(depth_frame, color_frame, target)
-
-                rgb_image = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb_image.shape
-                bytes_per_line = ch * w
-                q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
-
-                result = {
-                    'status': 'ok',
-                    'q_image': q_img,
-                    'object_position': object_position,
-                    'cam_type': self.cam_type,
-                }
-
-                if object_position:
-                    cam_coords = object_position.get('camera_coords', [])
-                    result['cam_coords'] = cam_coords
-                    result['confidence'] = object_position.get('confidence', 0.0)
-                    result['source'] = object_position.get('source', 'unknown')
-
-                    if self.controller.is_connected and len(cam_coords) >= 3:
-                        end_coords = self.vision.convert_to_end_coords(cam_coords)
-                        result['end_coords'] = end_coords
-                        current_pose = self.controller.get_current_pose()
-                        if current_pose:
-                            base_coords = self.vision.convert_to_base_coords(end_coords, current_pose)
-                            result['base_coords'] = base_coords
-
-
-                self.result_ready.emit(result)
-
-            except Exception as e:
-                self.result_ready.emit({'status': 'error', 'error_msg': str(e)[:100]})
-
-    def stop(self):
-        self.running = False
-
-class D435iLowFpsWorker(QThread):
-    low_fps_result = pyqtSignal(dict)
-
-    def __init__(self, vision, controller):
-        super().__init__()
-        self.vision = vision
-        self.controller = controller
-        self.running = True
-        self.frame_interval = 1.0 / 5.0
-        self.last_frame_time = 0
-
-    def run(self):
-        self.vision.reset_tracking()
-        while self.running:
-            try:
-                elapsed = time.time() - self.last_frame_time
-                if elapsed < self.frame_interval:
-                    time.sleep(self.frame_interval - elapsed)
-                self.last_frame_time = time.time()
-
-                depth_frame, color_frame = self.vision.capture_frames()
-                if not depth_frame or not color_frame:
-                    self.low_fps_result.emit({'status': 'no_frame'})
-                    continue
-
-                color_image = np.asanyarray(color_frame.get_data())
-                target = self.vision.run_detection_tracked(color_image)
-                object_position = self.vision.calculate_object_position_smoothed(depth_frame, color_frame, target)
-
-                result = {'status': 'ok', 'object_position': object_position}
-
-                if object_position:
-                    cam_coords = object_position.get('camera_coords', [])
-                    result['cam_coords'] = cam_coords
-                    result['confidence'] = object_position.get('confidence', 0.0)
-                    result['source'] = object_position.get('source', 'unknown')
-
-                    if self.controller.is_connected and len(cam_coords) >= 3:
-                        end_coords = self.vision.convert_to_end_coords(cam_coords)
-                        result['end_coords'] = end_coords
-                        current_pose = self.controller.get_current_pose()
-                        if current_pose:
-                            base_coords = self.vision.convert_to_base_coords(end_coords, current_pose)
-                            result['base_coords'] = base_coords
-                            from config_manager import get_point, set_point
-                            point_data = get_point("d435i") or {"coords": [0]*6, "is_relative": False, "relative_to": None, "offset": [0]*6, "is_default": True}
-                            point_data["coords"] = list(base_coords) + list(current_pose[3:])
-                            set_point("d435i", point_data)
-
-                self.low_fps_result.emit(result)
-
-            except Exception as e:
-                self.low_fps_result.emit({'status': 'error', 'error_msg': str(e)[:100]})
-
-    def stop(self):
-        self.running = False
-
 class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManagementMixin, ForceArcMixin, GraspFlowMixin, JogMixin, QMainWindow):
     """越疆机器人控制GUI"""
     
@@ -495,6 +133,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         super().__init__()
         self.setWindowTitle("越疆机器人抓取控制程序")
         self.setGeometry(100, 100, 800, 600)
+        self.setMinimumSize(1100, 760)
         
         self.set_blue_theme()
         
@@ -504,10 +143,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.vision_d405 = None
         self.battery = None
         self.battery_thread = None
-        
-        self.status_thread = StatusUpdateThread(self.controller, self.vision_d435i, self.vision_d405)
-        self.status_thread.status_updated.connect(self.update_status)
-        self.status_thread.start()
         
         _module_dir = os.path.dirname(os.path.abspath(__file__))
         file_path = os.path.join(_module_dir, "grasp_flow_modules.json")
@@ -525,6 +160,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self._flow_running = False
         
         self.init_ui()
+        self._start_status_timer()
         if HANDEYE_AVAILABLE:
             self._load_calib_matrix("D435i")
         self.statusBar().showMessage("正在初始化设备连接...")
@@ -546,6 +182,8 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self._device_init_thread.init_error.connect(
             lambda msg: logger.warning(msg))
         self._device_init_thread.init_finished.connect(self._on_device_initFinished)
+        self._device_init_thread.finished.connect(lambda: setattr(self, "_device_init_thread", None))
+        self._device_init_thread.finished.connect(self._device_init_thread.deleteLater)
         self._device_init_thread.start()
     
     def _on_device_initFinished(self, battery):
@@ -555,227 +193,10 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
     
     def set_blue_theme(self):
         """设置蓝色主题"""
-        # 创建调色板
-        palette = QPalette()
-        
-        # 主背景色 - 浅蓝色
-        palette.setColor(QPalette.ColorRole.Window, QColor(240, 248, 255))
-        
-        # 文本颜色 - 深蓝色
-        palette.setColor(QPalette.ColorRole.WindowText, QColor(26, 35, 126))
-        
-        # 按钮颜色 - 白色
-        palette.setColor(QPalette.ColorRole.Button, QColor(255, 255, 255))
-        palette.setColor(QPalette.ColorRole.ButtonText, QColor(26, 35, 126))
-        
-        # 选中状态
-        palette.setColor(QPalette.ColorRole.Highlight, QColor(33, 150, 243))
-        palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
-        
-        # 应用调色板
-        self.setPalette(palette)
+        apply_app_palette(self)
         
         # 设置全局样式
-        self.setStyleSheet("""
-            * {
-                font-family: 'Segoe UI', Arial, sans-serif;
-                font-size: 10pt;
-            }
-            QMainWindow {
-                background-color: #f0f8ff;
-            }
-            QWidget {
-                background-color: #f0f8ff;
-            }
-            QScrollArea {
-                background-color: #f0f8ff;
-                border: none;
-            }
-            QLineEdit {
-                padding: 6px 10px;
-                border: 1px solid #42a5f5;
-                border-radius: 4px;
-                background-color: white;
-                color: #1a237e;
-            }
-            QLineEdit:hover {
-                border-color: #2196f3;
-            }
-            QLineEdit:focus {
-                border-color: #1976d2;
-                outline: none;
-            }
-            QTableWidget {
-                background-color: white;
-                alternate-background-color: #e3f2fd;
-                gridline-color: #bbdefb;
-                border: 1px solid #42a5f5;
-                border-radius: 4px;
-                color: #1a237e;
-            }
-            QTableWidget::item {
-                padding: 4px;
-            }
-            QTableWidget::item:selected {
-                background-color: #2196f3;
-                color: white;
-            }
-            QHeaderView::section {
-                background-color: #e3f2fd;
-                color: #1a237e;
-                padding: 6px;
-                border: 1px solid #bbdefb;
-                font-weight: bold;
-            }
-            QScrollBar:vertical {
-                background-color: #f0f8ff;
-                width: 10px;
-                border: none;
-            }
-            QScrollBar::handle:vertical {
-                background-color: #90caf9;
-                min-height: 30px;
-                border-radius: 5px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background-color: #42a5f5;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-                background: none;
-            }
-            QScrollBar:horizontal {
-                background-color: #f0f8ff;
-                height: 10px;
-                border: none;
-            }
-            QScrollBar::handle:horizontal {
-                background-color: #90caf9;
-                min-width: 30px;
-                border-radius: 5px;
-            }
-            QScrollBar::handle:horizontal:hover {
-                background-color: #42a5f5;
-            }
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-                width: 0px;
-            }
-            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
-                background: none;
-            }
-            QGroupBox {
-                font-weight: bold;
-                border: 1px solid #42a5f5;
-                border-radius: 8px;
-                margin-top: 15px;
-                background-color: white;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 15px;
-                padding: 0 10px 0 10px;
-                color: #1a237e;
-                background-color: white;
-                border-radius: 4px;
-            }
-            QPushButton {
-                padding: 8px 16px;
-                border: 1px solid #42a5f5;
-                border-radius: 6px;
-                background-color: white;
-                color: #1a237e;
-                font-weight: 500;
-            }
-            QPushButton:hover {
-                background-color: #e3f2fd;
-                border-color: #2196f3;
-            }
-            QPushButton:pressed {
-                background-color: #bbdefb;
-                border-color: #1976d2;
-            }
-            QPushButton:default {
-                background-color: #2196f3;
-                color: white;
-                border-color: #1976d2;
-            }
-            QPushButton:default:hover {
-                background-color: #1976d2;
-            }
-            QDoubleSpinBox, QComboBox {
-                padding: 8px;
-                border: 1px solid #42a5f5;
-                border-radius: 4px;
-                background-color: white;
-                color: #1a237e;
-                min-height: 30px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: white;
-                color: #1a237e;
-                selection-background-color: #e3f2fd;
-                selection-color: #1a237e;
-                border: 1px solid #42a5f5;
-            }
-            QDoubleSpinBox:hover, QComboBox:hover {
-                border-color: #2196f3;
-            }
-            QDoubleSpinBox:focus, QComboBox:focus {
-                border-color: #1976d2;
-                outline: none;
-            }
-            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                width: 24px;
-                height: 15px;
-            }
-            QDoubleSpinBox::up-arrow, QDoubleSpinBox::down-arrow {
-                width: 10px;
-                height: 10px;
-            }
-            QLabel {
-                color: #1a237e;
-            }
-            QTabWidget::pane {
-                border: 1px solid #42a5f5;
-                border-radius: 8px;
-                background-color: white;
-            }
-            QTabBar::tab {
-                padding: 10px 20px;
-                margin-right: 4px;
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
-                background-color: #f0f8ff;
-                color: #1a237e;
-                border: 1px solid #42a5f5;
-                border-bottom: none;
-            }
-            QTabBar::tab:selected {
-                background-color: white;
-                border-bottom: 1px solid white;
-            }
-            QTabBar::tab:hover {
-                background-color: #e3f2fd;
-            }
-            QStatusBar {
-                background-color: #e3f2fd;
-                border-top: 1px solid #42a5f5;
-                color: #1a237e;
-            }
-            QMessageBox {
-                background-color: white;
-                border: 1px solid #42a5f5;
-                border-radius: 8px;
-            }
-            QMessageBox QLabel {
-                color: #1a237e;
-            }
-            QMessageBox QPushButton {
-                min-width: 80px;
-            }
-        """.strip())
+        self.setStyleSheet(GLOBAL_STYLESHEET)
     
     def init_ui(self):
         """初始化UI"""
@@ -796,15 +217,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         # 机器人状态
         self.robot_status_label = QLabel("机器人状态: 未连接")
         status_layout.addWidget(self.robot_status_label, 0, 0)
-        
-        # IP地址输入
-        ip_label = QLabel("IP地址:")
-        self.ip_input = QLineEdit(self.robot_ip)
-        self.ip_input.setMaximumWidth(150)
-        self.ip_input.setPlaceholderText("机器人IP地址")
-        self.ip_input.editingFinished.connect(lambda: config_set_robot_ip(self.ip_input.text().strip()))
-        status_layout.addWidget(ip_label, 0, 1)
-        status_layout.addWidget(self.ip_input, 0, 2)
         
         # 相机状态
         self.camera_status_label = QLabel("相机状态: 未连接")
@@ -836,112 +248,45 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         main_tab_layout = QVBoxLayout(main_tab)
         main_tab_layout.setSpacing(10)
         main_tab_layout.setContentsMargins(10, 10, 10, 10)
-        
-        # 功能按钮布局
-        button_layout = QGridLayout()
-        button_layout.setSpacing(10)
-        
-        BTN_HEIGHT = 40
-        
-        # 运行抓取任务按钮
-        self.run_task_btn = QPushButton("运行抓取任务")
-        self.run_task_btn.setDefault(True)
-        self.run_task_btn.clicked.connect(self.run_grasping_task)
-        self.run_task_btn.setMinimumHeight(BTN_HEIGHT)
-        button_layout.addWidget(self.run_task_btn, 0, 0, 1, 2)
-        
-        # 连接机器人按钮
-        self.connect_robot_btn = QPushButton("连接机器人")
-        self.connect_robot_btn.setDefault(True)
-        self.connect_robot_btn.clicked.connect(self.connect_robot)
-        self.connect_robot_btn.setMinimumHeight(BTN_HEIGHT)
-        button_layout.addWidget(self.connect_robot_btn, 1, 0, 1, 2)
-        
-        # 使能机器人按钮
-        self.enable_robot_btn = QPushButton("使能机器人")
-        self.enable_robot_btn.clicked.connect(self.enable_robot)
-        self.enable_robot_btn.setMinimumHeight(BTN_HEIGHT)
-        button_layout.addWidget(self.enable_robot_btn, 2, 0)
-        
-        # 下使能机器人按钮
-        self.disable_robot_btn = QPushButton("下使能机器人")
-        self.disable_robot_btn.clicked.connect(self.disable_robot)
-        self.disable_robot_btn.setMinimumHeight(BTN_HEIGHT)
-        button_layout.addWidget(self.disable_robot_btn, 2, 1)
-        
-        self.d435i_status_label = QLabel("D435i: 未连接")
-        self.d435i_status_label.setStyleSheet("color: gray;")
-        button_layout.addWidget(self.d435i_status_label, 3, 0, 1, 2)
 
-        self.d435i_connect_btn = QPushButton("D435i 连接")
-        self.d435i_connect_btn.clicked.connect(self.connect_d435i)
-        self.d435i_connect_btn.setMinimumHeight(BTN_HEIGHT)
-        button_layout.addWidget(self.d435i_connect_btn, 4, 0)
+        self.main_control = MainControlPanel(self.robot_ip)
+        # 连接信号到现有处理方法
+        self.main_control.connect_robot.connect(self.connect_robot)
+        self.main_control.enable_robot.connect(self.enable_robot)
+        self.main_control.disable_robot.connect(self.disable_robot)
+        self.main_control.connect_d435i.connect(self.connect_d435i)
+        self.main_control.disconnect_d435i.connect(self.disconnect_d435i)
+        self.main_control.connect_d405.connect(self.connect_d405)
+        self.main_control.disconnect_d405.connect(self.disconnect_d405)
+        self.main_control.run_grasp.connect(self.run_grasping_task)
+        self.main_control.get_pose.connect(self.get_current_position)
+        self.main_control.set_collision_level.connect(self.set_collision_level)
+        self.main_control.clear_error.connect(self.on_clear_error)
+        self.main_control.pause.connect(self.on_pause)
+        self.main_control.resume.connect(self.on_continue)
+        self.main_control.collision_level_changed.connect(self.on_collision_level_changed)
+        self.main_control.ip_changed.connect(lambda ip: ConfigService.instance().set_ip('robot_ip', ip))
+        main_tab_layout.addWidget(self.main_control)
 
-        self.d435i_disconnect_btn = QPushButton("D435i 断开")
-        self.d435i_disconnect_btn.clicked.connect(self.disconnect_d435i)
-        self.d435i_disconnect_btn.setMinimumHeight(BTN_HEIGHT)
-        self.d435i_disconnect_btn.setEnabled(False)
-        button_layout.addWidget(self.d435i_disconnect_btn, 4, 1)
+        # 向后兼容属性别名，供 mixins 和 _refresh_action_states 访问
+        self.ip_input = self.main_control.ip_input
+        self.run_task_btn = self.main_control.run_task_btn
+        self.connect_robot_btn = self.main_control.connect_robot_btn
+        self.enable_robot_btn = self.main_control.enable_robot_btn
+        self.disable_robot_btn = self.main_control.disable_robot_btn
+        self.d435i_status_label = self.main_control.d435i_status_label
+        self.d435i_connect_btn = self.main_control.d435i_connect_btn
+        self.d435i_disconnect_btn = self.main_control.d435i_disconnect_btn
+        self.d405_status_label = self.main_control.d405_status_label
+        self.d405_connect_btn = self.main_control.d405_connect_btn
+        self.d405_disconnect_btn = self.main_control.d405_disconnect_btn
+        self.get_pos_btn = self.main_control.get_pos_btn
+        self.collision_combo = self.main_control.collision_combo
+        self.collision_set_btn = self.main_control.collision_set_btn
+        self.clear_error_btn = self.main_control.clear_error_btn
+        self.pause_btn = self.main_control.pause_btn
+        self.continue_btn = self.main_control.continue_btn
 
-        self.d405_status_label = QLabel("D405: 未连接")
-        self.d405_status_label.setStyleSheet("color: gray;")
-        button_layout.addWidget(self.d405_status_label, 5, 0, 1, 2)
-
-        self.d405_connect_btn = QPushButton("D405 连接")
-        self.d405_connect_btn.clicked.connect(self.connect_d405)
-        self.d405_connect_btn.setMinimumHeight(BTN_HEIGHT)
-        button_layout.addWidget(self.d405_connect_btn, 6, 0)
-
-        self.d405_disconnect_btn = QPushButton("D405 断开")
-        self.d405_disconnect_btn.clicked.connect(self.disconnect_d405)
-        self.d405_disconnect_btn.setMinimumHeight(BTN_HEIGHT)
-        self.d405_disconnect_btn.setEnabled(False)
-        button_layout.addWidget(self.d405_disconnect_btn, 6, 1)
-        
-        self.get_pos_btn = QPushButton("获取位置")
-        self.get_pos_btn.clicked.connect(self.get_current_position)
-        self.get_pos_btn.setMinimumHeight(BTN_HEIGHT)
-        button_layout.addWidget(self.get_pos_btn, 7, 0)
-
-        collision_label = QLabel("碰撞等级:")
-        self.collision_combo = QComboBox()
-        self.collision_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.collision_combo.addItems([
-            "0-关闭碰撞检测",
-            "1-最低灵敏度",
-            "2-低灵敏度",
-            "3-中灵敏度",
-            "4-高灵敏度",
-            "5-最高灵敏度"
-        ])
-        self.collision_combo.setCurrentIndex(3)
-        button_layout.addWidget(collision_label, 8, 0)
-        button_layout.addWidget(self.collision_combo, 8, 1)
-
-        self.collision_set_btn = QPushButton("设置碰撞等级")
-        self.collision_set_btn.clicked.connect(self.set_collision_level)
-        self.collision_set_btn.setMinimumHeight(BTN_HEIGHT)
-        button_layout.addWidget(self.collision_set_btn, 9, 0, 1, 2)
-
-        self.clear_error_btn = QPushButton("清除故障")
-        self.clear_error_btn.clicked.connect(self.on_clear_error)
-        self.clear_error_btn.setMinimumHeight(BTN_HEIGHT)
-        button_layout.addWidget(self.clear_error_btn, 10, 0, 1, 2)
-
-        self.pause_btn = QPushButton("暂停")
-        self.pause_btn.clicked.connect(self.on_pause)
-        self.pause_btn.setMinimumHeight(BTN_HEIGHT)
-        self.pause_btn.setEnabled(False)
-        button_layout.addWidget(self.pause_btn, 11, 0)
-
-        self.continue_btn = QPushButton("继续")
-        self.continue_btn.clicked.connect(self.on_continue)
-        self.continue_btn.setMinimumHeight(BTN_HEIGHT)
-        self.continue_btn.setEnabled(False)
-        button_layout.addWidget(self.continue_btn, 11, 1)
-
-        main_tab_layout.addLayout(button_layout)
         self.tab_widget.addTab(self._wrap_in_scroll(main_tab), "主功能")
         
         # 参数设置选项卡
@@ -997,19 +342,11 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         grasp_flow_layout.setSpacing(10)
         
         # 抓取流程显示
-        self.flow_display_widget = QWidget()
-        self.flow_display_layout = QVBoxLayout()
-        self.flow_display_layout.setSpacing(5)
-        self.flow_display_layout.setContentsMargins(15, 15, 15, 15)
-        self.flow_display_widget.setLayout(self.flow_display_layout)
-        # 设置对象名称（必须在设置样式表之前）
-        self.flow_display_widget.setObjectName("flow_display_widget")
-        # 只设置边框和圆角，不设置背景色和最小高度，避免影响子控件
-        self.flow_display_widget.setStyleSheet("#flow_display_widget { border: 1px solid #42a5f5; border-radius: 6px; }")
-        grasp_flow_layout.addWidget(self.flow_display_widget)
+        self.flow_step_list = FlowStepList()
+        self.flow_step_list.step_clicked.connect(self.on_step_clicked)
+        self.flow_step_list.step_reordered.connect(self._on_steps_reordered)
+        grasp_flow_layout.addWidget(self.flow_step_list)
         
-        # 存储步骤标签
-        self.step_labels = []
         # 当前选中的步骤索引
         self.selected_step_index = -1
         
@@ -1064,7 +401,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         module_select_layout.setSpacing(10)
         module_select_layout.addWidget(QLabel("选择模块:"))
         self.module_combo = QComboBox()
-        self.module_combo.addItems(["相机识别", "直线运动", "力控圆弧", "关节旋转", "视觉伺服"])
+        self.module_combo.addItems(["相机识别", "直线运动", "力控圆弧", "力阈值移动", "关节旋转", "视觉伺服"])
         self.module_combo.currentIndexChanged.connect(self.on_module_combo_changed)
         module_select_layout.addWidget(self.module_combo)
         
@@ -1140,66 +477,15 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         fa_layout = QVBoxLayout(self.force_arc_params)
         fa_layout.setSpacing(10)
 
-        self.fa_mode = "coords"
-        fa_mode_layout = QHBoxLayout()
-        self.fa_coords_radio = QRadioButton("坐标模式")
-        self.fa_coords_radio.setChecked(True)
-        self.fa_point_radio = QRadioButton("点位模式")
-        fa_mode_layout.addWidget(self.fa_coords_radio)
-        fa_mode_layout.addWidget(self.fa_point_radio)
-        fa_mode_layout.addStretch()
-        fa_layout.addLayout(fa_mode_layout)
+        self.fa_mode = "point"
+        self.fa_center_mode = "point"
 
-        self.fa_point_combo = QComboBox()
-        self.fa_point_combo.hide()
-        fa_layout.addWidget(self.fa_point_combo)
-        self.fa_point_preview = QLabel("")
-        self.fa_point_preview.setStyleSheet("color: #666; font-size: 11px;")
-        self.fa_point_preview.hide()
-        fa_layout.addWidget(self.fa_point_preview)
-        self.fa_point_combo.currentTextChanged.connect(self._on_fa_point_selected)
-
-        self.fa_center_mode = "coords"
-        fa_center_mode_layout = QHBoxLayout()
-        self.fa_center_coords_radio = QRadioButton("圆心坐标模式")
-        self.fa_center_coords_radio.setChecked(True)
-        self.fa_center_point_radio = QRadioButton("圆心点位模式")
-        fa_center_mode_layout.addWidget(self.fa_center_coords_radio)
-        fa_center_mode_layout.addWidget(self.fa_center_point_radio)
-        fa_center_mode_layout.addStretch()
-        fa_layout.addLayout(fa_center_mode_layout)
-
+        fa_layout.addWidget(QLabel("圆心点位:"))
         self.fa_center_point_combo = QComboBox()
-        self.fa_center_point_combo.hide()
         fa_layout.addWidget(self.fa_center_point_combo)
         self.fa_center_point_preview = QLabel("")
         self.fa_center_point_preview.setStyleSheet("color: #666; font-size: 11px;")
-        self.fa_center_point_preview.hide()
         fa_layout.addWidget(self.fa_center_point_preview)
-
-        self.fa_center_widget = QWidget()
-        fa_center_layout = QGridLayout(self.fa_center_widget)
-        fa_center_layout.setSpacing(10)
-
-        fa_center_layout.addWidget(QLabel("圆心 X:"), 0, 0)
-        self.fa_center_x = QDoubleSpinBox()
-        self.fa_center_x.setRange(-1000, 1000)
-        self.fa_center_x.setValue(400)
-        fa_center_layout.addWidget(self.fa_center_x, 0, 1)
-
-        fa_center_layout.addWidget(QLabel("圆心 Y:"), 0, 2)
-        self.fa_center_y = QDoubleSpinBox()
-        self.fa_center_y.setRange(-1000, 1000)
-        self.fa_center_y.setValue(0)
-        fa_center_layout.addWidget(self.fa_center_y, 0, 3)
-
-        fa_center_layout.addWidget(QLabel("圆心 Z:"), 0, 4)
-        self.fa_center_z = QDoubleSpinBox()
-        self.fa_center_z.setRange(-1000, 1000)
-        self.fa_center_z.setValue(300)
-        fa_center_layout.addWidget(self.fa_center_z, 0, 5)
-        fa_layout.addWidget(self.fa_center_widget)
-        self.fa_center_coords_radio.toggled.connect(self._on_fa_center_mode_changed)
         self.fa_center_point_combo.currentTextChanged.connect(self._on_fa_center_point_selected)
 
         fa_params_widget = QWidget()
@@ -1295,7 +581,32 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         fa_params_layout.addWidget(self.fa_damping_rot, 4, 3)
         fa_layout.addWidget(fa_params_widget)
 
-        self.fa_coords_radio.toggled.connect(self._on_fa_mode_changed)
+        self.force_guard_params = QWidget()
+        fg_layout = QGridLayout(self.force_guard_params)
+        fg_layout.setSpacing(10)
+        fg_layout.addWidget(QLabel("方向轴:"), 0, 0)
+        self.fg_axis_combo = QComboBox()
+        self.fg_axis_combo.addItems(["X", "Y", "Z"])
+        self.fg_axis_combo.setCurrentText("Z")
+        fg_layout.addWidget(self.fg_axis_combo, 0, 1)
+        fg_layout.addWidget(QLabel("距离(mm):"), 0, 2)
+        self.fg_distance = QDoubleSpinBox()
+        self.fg_distance.setRange(-1000, 1000)
+        self.fg_distance.setValue(50)
+        self.fg_distance.setDecimals(2)
+        fg_layout.addWidget(self.fg_distance, 0, 3)
+        fg_layout.addWidget(QLabel("力上限(N):"), 1, 0)
+        self.fg_force_limit = QDoubleSpinBox()
+        self.fg_force_limit.setRange(0.1, 500)
+        self.fg_force_limit.setValue(20)
+        self.fg_force_limit.setDecimals(2)
+        fg_layout.addWidget(self.fg_force_limit, 1, 1)
+        fg_layout.addWidget(QLabel("速度(%):"), 1, 2)
+        self.fg_speed = QDoubleSpinBox()
+        self.fg_speed.setRange(1, 100)
+        self.fg_speed.setValue(20)
+        self.fg_speed.setDecimals(0)
+        fg_layout.addWidget(self.fg_speed, 1, 3)
 
         self.camera_params = QWidget()
         camera_param_layout = QGridLayout(self.camera_params)
@@ -1327,18 +638,22 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         flow_ops_layout.setSpacing(10)
         
         self.view_flow_btn = QPushButton("查看当前流程")
+        set_button_role(self.view_flow_btn, "secondary")
         self.view_flow_btn.clicked.connect(self.view_current_grasp_flow)
         flow_ops_layout.addWidget(self.view_flow_btn)
         
         self.save_flow_btn = QPushButton("保存流程")
+        set_button_role(self.save_flow_btn, "secondary")
         self.save_flow_btn.clicked.connect(self.save_grasp_flow)
         flow_ops_layout.addWidget(self.save_flow_btn)
         
         self.load_flow_btn = QPushButton("加载流程")
+        set_button_role(self.load_flow_btn, "secondary")
         self.load_flow_btn.clicked.connect(self.load_grasp_flow)
         flow_ops_layout.addWidget(self.load_flow_btn)
         
         self.run_flow_btn = QPushButton("执行流程")
+        set_button_role(self.run_flow_btn, "primary")
         self.run_flow_btn.setDefault(True)
         self.run_flow_btn.clicked.connect(self.run_grasp_flow)
         flow_ops_layout.addWidget(self.run_flow_btn)
@@ -1445,7 +760,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         modbus_ctrl_layout.addWidget(QLabel("监听端口:"), 0, 0)
         self.modbus_port_input = QLineEdit(str(get_modbus_port()))
         self.modbus_port_input.setMaximumWidth(100)
-        self.modbus_port_input.editingFinished.connect(lambda: config_set_modbus_port(int(self.modbus_port_input.text().strip() or 502)))
+        self.modbus_port_input.editingFinished.connect(lambda: ConfigService.instance().set('modbus_port', int(self.modbus_port_input.text().strip() or 502)))
         modbus_ctrl_layout.addWidget(self.modbus_port_input, 0, 1)
 
         self.modbus_start_btn = QPushButton("启动Modbus服务")
@@ -1518,13 +833,13 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         modbus_client_layout.addWidget(QLabel("小车 IP:"), 0, 0)
         self.cart_ip_input = QLineEdit(get_cart_ip())
         self.cart_ip_input.setMaximumWidth(150)
-        self.cart_ip_input.editingFinished.connect(lambda: config_set_cart_ip(self.cart_ip_input.text().strip()))
+        self.cart_ip_input.editingFinished.connect(lambda: ConfigService.instance().set_ip('cart_ip', self.cart_ip_input.text().strip()))
         modbus_client_layout.addWidget(self.cart_ip_input, 0, 1)
 
         modbus_client_layout.addWidget(QLabel("端口:"), 0, 2)
         self.cart_port_input = QLineEdit(str(get_cart_port()))
         self.cart_port_input.setMaximumWidth(80)
-        self.cart_port_input.editingFinished.connect(lambda: config_set_cart_port(int(self.cart_port_input.text().strip() or 502)))
+        self.cart_port_input.editingFinished.connect(lambda: ConfigService.instance().set('cart_port', int(self.cart_port_input.text().strip() or 502)))
         modbus_client_layout.addWidget(self.cart_port_input, 0, 3)
 
         self.cart_connect_btn = QPushButton("连接小车")
@@ -1844,7 +1159,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         low_fps_btn_layout.addWidget(self.d435i_low_fps_stop_btn)
 
         self.d435i_low_fps_status = QLabel("状态: 已停止")
-        self.d435i_low_fps_status.setStyleSheet("color: gray;")
+        apply_status_visual(self.d435i_low_fps_status, "已停止")
         low_fps_btn_layout.addWidget(self.d435i_low_fps_status)
         low_fps_btn_layout.addStretch()
         low_fps_layout.addLayout(low_fps_btn_layout)
@@ -1884,17 +1199,77 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("就绪")
+
+        self._set_status_visual(self.robot_status_label, "未连接")
+        self._set_status_visual(self.camera_status_label, "未连接")
+        self._refresh_action_states()
+
+    def on_collision_level_changed(self, level):
+        """碰撞等级下拉框变化时的回调"""
+        pass
+
+    def _set_status_visual(self, label, value):
+        apply_status_visual(label, value)
+
+    def _refresh_action_states(self):
+        robot_ready = bool(getattr(self.controller, "is_connected", False))
+        camera_ready = self.vision_d435i is not None or self.vision_d405 is not None
+        flow_running = bool(getattr(self, "_flow_running", False))
+        cmd_running = bool(getattr(self, "_cmd_running", False))
+
+        for attr in (
+            "enable_robot_btn", "disable_robot_btn", "get_pos_btn",
+            "collision_set_btn", "clear_error_btn", "run_flow_btn",
+        ):
+            if hasattr(self, attr):
+                getattr(self, attr).setEnabled(robot_ready and not flow_running and not cmd_running)
+
+        if hasattr(self, "run_task_btn"):
+            self.run_task_btn.setEnabled(robot_ready and camera_ready and not flow_running and not cmd_running)
+        if hasattr(self, "connect_robot_btn"):
+            self.connect_robot_btn.setEnabled(not robot_ready and not flow_running and not cmd_running)
+        if hasattr(self, "pause_btn"):
+            self.pause_btn.setEnabled(flow_running and not self.is_paused)
+        if hasattr(self, "continue_btn"):
+            self.continue_btn.setEnabled(flow_running and self.is_paused)
+
+    def _start_status_timer(self):
+        self._status_timer = QTimer(self)
+        self._status_timer.timeout.connect(self._poll_status)
+        self._status_timer.start(1000)
+        self._poll_status()
+
+    def _poll_status(self):
+        if self.controller:
+            last_time = self.controller.get_last_feed_time()
+            if last_time > 0 and time.time() - last_time < 2:
+                robot_status = "已连接"
+            else:
+                robot_status = "未连接"
+                self.controller.is_connected = False
+            self.update_status("robot", robot_status)
+
+        cameras = []
+        if self.vision_d435i and hasattr(self.vision_d435i, "camera") and self.vision_d435i.camera:
+            cameras.append("D435i")
+        if self.vision_d405 and hasattr(self.vision_d405, "camera") and self.vision_d405.camera:
+            cameras.append("D405")
+        camera_status = "已连接(" + "+".join(cameras) + ")" if cameras else "未连接"
+        self.update_status("camera", camera_status)
     
     def update_status(self, status_type, status_value):
         """更新状态显示"""
         if status_type == "robot":
             self.robot_status_label.setText(f"机器人状态: {status_value}")
+            self._set_status_visual(self.robot_status_label, status_value)
         elif status_type == "camera":
             self.camera_status_label.setText(f"相机状态: {status_value}")
+            self._set_status_visual(self.camera_status_label, status_value)
         elif status_type == "photo_position":
             self.photo_position_label.setText(f"拍照位置: {status_value}")
         elif status_type == "general":
             self.status_bar.showMessage(status_value)
+        self._refresh_action_states()
     
     def _on_calib_camera_changed(self, camera_type):
         self._load_calib_matrix(camera_type)
@@ -1956,11 +1331,26 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self._load_calib_matrix(camera_type)
 
     def closeEvent(self, event):
+        if hasattr(self, '_status_timer') and self._status_timer is not None:
+            self._status_timer.stop()
+        if hasattr(self, '_device_init_thread') and self._device_init_thread is not None:
+            self._device_init_thread.wait(3000)
+            self._device_init_thread = None
+        if hasattr(self, 'cam_test_worker') and self.cam_test_worker is not None:
+            self.cam_test_worker.stop()
+            self.cam_test_worker.wait(3000)
+            self.cam_test_worker = None
+        if hasattr(self, '_low_fps_worker') and self._low_fps_worker is not None:
+            self._low_fps_worker.stop()
+            self._low_fps_worker.wait(3000)
+            self._low_fps_worker = None
+        if hasattr(self, '_flow_thread') and self._flow_thread is not None and self._flow_thread.isRunning():
+            self._flow_thread.stop()
+            self._flow_thread.wait(3000)
+
         self.stop_modbus_server()
         self.disconnect_cart_modbus()
         self.stop_monitor_threads()
-        
-        self.status_thread.stop()
         
         # 关闭相机
         if self.vision_d435i is not None:

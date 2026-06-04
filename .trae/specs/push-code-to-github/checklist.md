@@ -1,0 +1,4 @@
+- [ ] .gitignore 包含 .trae/ 和临时测试文件排除规则
+- [ ] 所有源代码文件已暂存（排除 config.json、.trae/、临时测试文件）
+- [ ] 语义化 commit 已创建
+- [ ] 代码已推送到 GitHub

@@ -1,4 +1,0 @@
-- [x] 直线运动参数面板有Rx/Ry/Rz输入框
-- [x] offset保存为[x, y, z, rx, ry, rz] 6个值
-- [x] 执行时目标姿态旋转部分应用rx/ry/rz偏移
-- [x] 流程显示包含rx/ry/rz信息

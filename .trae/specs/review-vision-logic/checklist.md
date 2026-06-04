@@ -1,4 +1,0 @@
-- [x] `VisionSystem.__init__` 在相机初始化失败时抛出 RuntimeError
-- [x] `connect_camera` 在捕获 RuntimeError 时弹窗报错
-- [x] `convert_to_end_coords` 在 `T_cam2gripper` 为 None 时抛出 ValueError
-- [x] `capture_frames` 中已移除 `self.camera_available` 冗余标志检查

@@ -325,3 +325,166 @@ py::list postprocess_yolov8(py::list outputs, py::tuple original_size, double sc
 
     return detections;
 }
+
+py::list postprocess_yolo26(
+    py::list outputs,
+    py::tuple original_size,
+    double scale,
+    py::tuple offset,
+    py::tuple new_size,
+    int num_classes,
+    float conf_threshold
+) {
+    int orig_w = original_size[0].cast<int>();
+    int orig_h = original_size[1].cast<int>();
+
+    bool is_seg_model = (py::len(outputs) >= 2);
+
+    py::object proto_obj = py::none();
+    if (is_seg_model) {
+        proto_obj = outputs[1];
+    }
+
+    // Input shape: [1, 300, 38]: detection-first, no transpose needed
+    auto dets_raw = outputs[0].cast<py::array_t<float>>();
+    py::array_t<float> dets_obj;
+    if (dets_raw.ndim() == 3) {
+        // Remove batch dim: [1, 300, 38] -> [300, 38]
+        dets_obj = dets_raw.reshape({dets_raw.shape(1), dets_raw.shape(2)});
+    } else {
+        dets_obj = dets_raw;
+    }
+    auto dets = dets_obj.unchecked<2>();
+
+    py::ssize_t rows = dets.shape(0);
+    py::ssize_t cols = dets.shape(1);
+
+    double scale_val = scale;
+    int x_offset = offset[0].cast<int>();
+    int y_offset = offset[1].cast<int>();
+
+    std::vector<std::vector<double>> all_boxes;
+    std::vector<double> all_scores;
+    std::vector<int> all_class_ids;
+    std::vector<std::vector<float>> all_masks_coeff;
+
+    for (py::ssize_t i = 0; i < rows; ++i) {
+        // YOLO26 end-to-end: bbox is x1,y1,x2,y2 (corner format), not cx,cy,w,h
+        float x1_raw = dets(i, 0);
+        float y1_raw = dets(i, 1);
+        float x2_raw = dets(i, 2);
+        float y2_raw = dets(i, 3);
+
+        // score at index 4, class_id at index 5
+        float score = dets(i, 4);
+        int class_id = (int)dets(i, 5);
+
+        if (score <= conf_threshold) continue;
+
+        // Convert each corner independently from 640x640 to original image coordinates
+        int x1 = std::max(0, std::min(orig_w, (int)(((double)x1_raw - (double)x_offset) / scale_val)));
+        int y1 = std::max(0, std::min(orig_h, (int)(((double)y1_raw - (double)y_offset) / scale_val)));
+        int x2 = std::max(0, std::min(orig_w, (int)(((double)x2_raw - (double)x_offset) / scale_val)));
+        int y2 = std::max(0, std::min(orig_h, (int)(((double)y2_raw - (double)y_offset) / scale_val)));
+
+        std::vector<float> mask_coeff;
+        if (is_seg_model) {
+            // mask_coeff starts at index 6, 32 coefficients
+            int coeff_start = 6;
+            int coeff_end = coeff_start + 32;
+            if (coeff_end <= cols) {
+                for (int k = coeff_start; k < coeff_end; ++k) {
+                    mask_coeff.push_back(dets(i, k));
+                }
+            }
+        }
+
+        all_boxes.push_back({(double)x1, (double)y1, (double)x2, (double)y2});
+        all_scores.push_back((double)score);
+        all_class_ids.push_back(class_id);
+        all_masks_coeff.push_back(mask_coeff);
+    }
+
+    // No NMS: end-to-end model already sorted by confidence
+
+    py::list detections;
+    py::list masks_list;
+
+    if (!all_boxes.empty() && is_seg_model && !proto_obj.is_none()) {
+        py::ssize_t n = (py::ssize_t)all_boxes.size();
+
+        auto boxes_arr = py::array_t<double>({n, (py::ssize_t)4});
+        auto bbuf = boxes_arr.mutable_unchecked<2>();
+        for (py::ssize_t i = 0; i < n; ++i) {
+            bbuf(i, 0) = all_boxes[i][0];
+            bbuf(i, 1) = all_boxes[i][1];
+            bbuf(i, 2) = all_boxes[i][2];
+            bbuf(i, 3) = all_boxes[i][3];
+        }
+
+        int coeff_dim = (int)all_masks_coeff[0].size();
+        auto masks_coeff_arr = py::array_t<float>({n, (py::ssize_t)coeff_dim});
+        auto mcbuf = masks_coeff_arr.mutable_unchecked<2>();
+        for (py::ssize_t i = 0; i < n; ++i) {
+            for (int j = 0; j < coeff_dim; ++j) {
+                mcbuf(i, j) = all_masks_coeff[i][j];
+            }
+        }
+
+        py::object proto_arr = proto_obj;
+        auto proto_ndim = proto_obj.cast<py::array_t<float>>().ndim();
+        if (proto_ndim == 4) {
+            proto_arr = proto_obj.attr("__getitem__")(0);
+        }
+
+        masks_list = process_mask(
+            proto_arr.cast<py::array_t<float>>(),
+            masks_coeff_arr,
+            boxes_arr,
+            py::make_tuple(orig_h, orig_w),
+            scale_val,
+            offset,
+            new_size
+        );
+    }
+
+    for (size_t i = 0; i < all_boxes.size(); ++i) {
+        int x1 = (int)all_boxes[i][0];
+        int y1 = (int)all_boxes[i][1];
+        int x2 = (int)all_boxes[i][2];
+        int y2 = (int)all_boxes[i][3];
+        double score = all_scores[i];
+        int class_id = all_class_ids[i];
+
+        py::object mask = py::none();
+        if ((py::ssize_t)i < py::len(masks_list)) {
+            mask = masks_list[i];
+            auto marr = mask.cast<py::array_t<uint8_t>>();
+            auto mbuf = marr.unchecked<2>();
+            long long sum = 0;
+            for (int r = 0; r < mbuf.shape(0); ++r)
+                for (int c = 0; c < mbuf.shape(1); ++c)
+                    sum += mbuf(r, c);
+            if (sum == 0) {
+                auto new_mask = py::array_t<uint8_t>(orig_h * orig_w);
+                auto nbuf = new_mask.mutable_unchecked<1>();
+                for (int j = 0; j < orig_h * orig_w; ++j) nbuf(j) = 0;
+                for (int r = y1; r < y2 && r < orig_h; ++r)
+                    for (int c = x1; c < x2 && c < orig_w; ++c)
+                        nbuf(r * orig_w + c) = 255;
+                new_mask.resize({orig_h, orig_w});
+                mask = new_mask;
+            }
+        }
+
+        py::dict det;
+        det["bbox"] = py::make_tuple(x1, y1, x2, y2);
+        det["score"] = (float)score;
+        det["class_id"] = class_id;
+        det["class_name"] = "hook";
+        det["mask"] = mask;
+        detections.append(det);
+    }
+
+    return detections;
+}

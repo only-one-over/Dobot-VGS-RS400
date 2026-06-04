@@ -11,6 +11,7 @@ pybind11_add_module(dobot_core
     src/transforms.cpp
     src/nms.cpp
     src/yolo.cpp
+    src/depth_position.cpp
 )
 
 target_include_directories(dobot_core PRIVATE

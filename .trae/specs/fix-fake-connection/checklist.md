@@ -1,5 +1,0 @@
-- [x] Checkpoint 1: RobotMode响应验证逻辑存在
-- [x] Checkpoint 2: GetAngle验证逻辑存在
-- [x] Checkpoint 3: 实时反馈验证逻辑存在
-- [x] Checkpoint 4: 连接失败时显示详细错误原因
-- [x] Checkpoint 5: 所有验证失败都会回滚连接状态

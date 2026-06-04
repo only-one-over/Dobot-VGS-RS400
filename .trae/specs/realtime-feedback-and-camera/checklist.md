@@ -1,4 +1,0 @@
-- [x] 检查点1：RealTimeFeedback类正确解析30004端口实时反馈数据
-- [x] 检查点2：vision_system.py不再使用模拟数据
-- [x] 检查点3：GUI中集成实时状态显示
-- [x] 检查点4：相机失败时返回None, None而非模拟帧

@@ -6,10 +6,18 @@ from PyQt6.QtWidgets import (
 
 from config_manager import (
     get_points, get_point, set_point, add_point, delete_point, resolve_point,
+    ConfigService,
 )
 
 
 class PointManagementMixin:
+
+    def _get_point_combo_names(self):
+        names = list(get_points().keys())
+        for default_name in ("d435i", "d405", "current_pos"):
+            if default_name not in names:
+                names.append(default_name)
+        return names
 
     def _on_add_point(self):
         name, ok = QInputDialog.getText(self, "添加点位", "点位名称:")
@@ -18,7 +26,7 @@ class PointManagementMixin:
             if get_point(name):
                 QMessageBox.warning(self, "警告", f"点位 '{name}' 已存在")
                 return
-            add_point(name)
+            ConfigService.instance().add_point(name)
             self.refresh_points_table()
 
     def _on_delete_point(self):
@@ -34,7 +42,7 @@ class PointManagementMixin:
         if point_data and point_data.get("is_default", False):
             QMessageBox.warning(self, "警告", f"默认点位 '{name}' 不能删除")
             return
-        delete_point(name)
+        ConfigService.instance().delete_point(name)
         self.refresh_points_table()
 
     def refresh_points_table(self):
@@ -98,7 +106,7 @@ class PointManagementMixin:
                             combo.blockSignals(True)
                             combo.clear()
                             combo.addItem("")
-                            for other_name in points:
+                            for other_name in self._get_point_combo_names():
                                 if other_name != name:
                                     combo.addItem(other_name)
                             if relative_to:
@@ -154,7 +162,7 @@ class PointManagementMixin:
 
                 combo = QComboBox()
                 combo.addItem("")
-                for other_name in points:
+                for other_name in self._get_point_combo_names():
                     if other_name != name:
                         combo.addItem(other_name)
                 if relative_to:
@@ -193,7 +201,7 @@ class PointManagementMixin:
         if point_data is None:
             return
         point_data["coords"] = coords
-        set_point(name, point_data)
+        ConfigService.instance().set_point(name, point_data)
 
     def _on_point_relative_changed(self, row, checked):
         name_item = self.points_table.item(row, 0)
@@ -206,16 +214,7 @@ class PointManagementMixin:
         point_data["is_relative"] = checked
         if not checked:
             point_data["relative_to"] = None
-        set_point(name, point_data)
-        if checked and point_data.get("relative_to"):
-            resolved = resolve_point(name)
-            if resolved is not None:
-                for col_idx in range(6):
-                    spin = self.points_table.cellWidget(row, col_idx + 1)
-                    if spin:
-                        spin.blockSignals(True)
-                        spin.setValue(resolved[col_idx] if col_idx < len(resolved) else 0)
-                        spin.blockSignals(False)
+        ConfigService.instance().set_point(name, point_data)
 
     def _on_point_relative_to_changed(self, row, text):
         name_item = self.points_table.item(row, 0)
@@ -226,20 +225,11 @@ class PointManagementMixin:
         if point_data is None:
             return
         point_data["relative_to"] = text if text else None
-        set_point(name, point_data)
-        if text:
-            resolved = resolve_point(name)
-            if resolved is not None:
-                for col_idx in range(6):
-                    spin = self.points_table.cellWidget(row, col_idx + 1)
-                    if spin:
-                        spin.blockSignals(True)
-                        spin.setValue(resolved[col_idx] if col_idx < len(resolved) else 0)
-                        spin.blockSignals(False)
+        ConfigService.instance().set_point(name, point_data)
 
     def _refresh_point_combos(self):
         points = get_points()
-        point_names = list(points.keys())
+        point_names = self._get_point_combo_names()
         if hasattr(self, 'linear_point_combo'):
             current = self.linear_point_combo.currentText()
             self.linear_point_combo.blockSignals(True)
@@ -249,15 +239,6 @@ class PointManagementMixin:
             if idx >= 0:
                 self.linear_point_combo.setCurrentIndex(idx)
             self.linear_point_combo.blockSignals(False)
-        if hasattr(self, 'fa_point_combo'):
-            current = self.fa_point_combo.currentText()
-            self.fa_point_combo.blockSignals(True)
-            self.fa_point_combo.clear()
-            self.fa_point_combo.addItems(point_names)
-            idx = self.fa_point_combo.findText(current)
-            if idx >= 0:
-                self.fa_point_combo.setCurrentIndex(idx)
-            self.fa_point_combo.blockSignals(False)
         if hasattr(self, 'fa_center_point_combo'):
             current = self.fa_center_point_combo.currentText()
             self.fa_center_point_combo.blockSignals(True)
@@ -272,14 +253,32 @@ class PointManagementMixin:
         if not name:
             self.linear_point_preview.setText("")
             return
-        coords = resolve_point(name)
-        if coords and len(coords) >= 6:
-            self.linear_point_preview.setText(
-                f"X:{coords[0]:.2f} Y:{coords[1]:.2f} Z:{coords[2]:.2f} "
-                f"Rx:{coords[3]:.2f} Ry:{coords[4]:.2f} Rz:{coords[5]:.2f}"
+        self.linear_point_preview.setText(self._format_point_preview(name))
+
+    def _format_point_preview(self, name):
+        point = get_point(name)
+        if not point:
+            return ""
+        coords = point.get("coords", [0, 0, 0, 0, 0, 0])
+        resolved = resolve_point(name)
+        if point.get("is_relative", False):
+            base = point.get("relative_to") or "未选择"
+            text = (
+                f"偏移 X:{coords[0]:.2f} Y:{coords[1]:.2f} Z:{coords[2]:.2f} "
+                f"Rx:{coords[3]:.2f} Ry:{coords[4]:.2f} Rz:{coords[5]:.2f}; 基准: {base}"
             )
-        else:
-            self.linear_point_preview.setText("")
+            if resolved and len(resolved) >= 6:
+                text += (
+                    f" | 解析 X:{resolved[0]:.2f} Y:{resolved[1]:.2f} Z:{resolved[2]:.2f} "
+                    f"Rx:{resolved[3]:.2f} Ry:{resolved[4]:.2f} Rz:{resolved[5]:.2f}"
+                )
+            return text
+        if resolved and len(resolved) >= 6:
+            return (
+                f"X:{resolved[0]:.2f} Y:{resolved[1]:.2f} Z:{resolved[2]:.2f} "
+                f"Rx:{resolved[3]:.2f} Ry:{resolved[4]:.2f} Rz:{resolved[5]:.2f}"
+            )
+        return ""
 
     def _on_read_current_for_linear(self):
         if not self.controller.is_connected:
@@ -292,7 +291,7 @@ class PointManagementMixin:
                 add_point("current_pos")
                 point_data = get_point("current_pos")
             point_data["coords"] = list(current_pose[:6])
-            set_point("current_pos", point_data)
+            ConfigService.instance().set_point("current_pos", point_data)
             self.refresh_points_table()
             idx = self.linear_point_combo.findText("current_pos")
             if idx >= 0:

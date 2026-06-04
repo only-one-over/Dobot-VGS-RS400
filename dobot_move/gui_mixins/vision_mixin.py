@@ -1,6 +1,8 @@
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QMessageBox
 
+from ui_theme import apply_status_visual
+
 try:
     import pyrealsense2 as rs
 except ImportError:
@@ -43,6 +45,21 @@ else:
 
 class VisionMixin:
 
+    def _set_camera_status(self, camera_type, status):
+        label = self.d435i_status_label if camera_type == "D435i" else self.d405_status_label
+        label.setText(f"{camera_type}: {status}")
+        apply_status_visual(label, status)
+
+    def _stop_camera_workers_for(self, camera_type):
+        if (
+            hasattr(self, 'cam_test_worker')
+            and self.cam_test_worker is not None
+            and getattr(self.cam_test_worker, "cam_type", None) == camera_type
+        ):
+            self._stop_camera_test()
+        if camera_type == "D435i" and hasattr(self, '_low_fps_worker') and self._low_fps_worker is not None:
+            self.stop_d435i_low_fps()
+
     def _detect_camera_serials(self):
         try:
             ctx = rs.context()
@@ -71,25 +88,27 @@ class VisionMixin:
             serials = self._detect_camera_serials()
             serial = serials.get("D435i")
             self.vision_d435i = VisionSystem(camera_type="D435i", serial_number=serial)
-            self.d435i_status_label.setText("D435i: 已连接")
-            self.d435i_status_label.setStyleSheet("color: green; font-weight: bold;")
+            self._set_camera_status("D435i", "已连接")
             self.d435i_connect_btn.setEnabled(False)
             self.d435i_disconnect_btn.setEnabled(True)
+            if hasattr(self, "_refresh_action_states"):
+                self._refresh_action_states()
             QMessageBox.information(self, "成功", f"D435i 相机连接成功" + (f" (SN: {serial})" if serial else ""))
         except Exception as e:
-            self.d435i_status_label.setText("D435i: 连接失败")
-            self.d435i_status_label.setStyleSheet("color: red; font-weight: bold;")
+            self._set_camera_status("D435i", "连接失败")
             QMessageBox.critical(self, "错误", f"D435i 相机连接失败: {e}")
 
     def disconnect_d435i(self):
         try:
             if self.vision_d435i is not None:
+                self._stop_camera_workers_for("D435i")
                 self.vision_d435i.close()
                 self.vision_d435i = None
-                self.d435i_status_label.setText("D435i: 未连接")
-                self.d435i_status_label.setStyleSheet("color: gray;")
+                self._set_camera_status("D435i", "未连接")
                 self.d435i_connect_btn.setEnabled(True)
                 self.d435i_disconnect_btn.setEnabled(False)
+                if hasattr(self, "_refresh_action_states"):
+                    self._refresh_action_states()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"D435i 相机关闭失败: {e}")
 
@@ -101,25 +120,27 @@ class VisionMixin:
             serials = self._detect_camera_serials()
             serial = serials.get("D405")
             self.vision_d405 = VisionSystem(camera_type="D405", serial_number=serial)
-            self.d405_status_label.setText("D405: 已连接")
-            self.d405_status_label.setStyleSheet("color: green; font-weight: bold;")
+            self._set_camera_status("D405", "已连接")
             self.d405_connect_btn.setEnabled(False)
             self.d405_disconnect_btn.setEnabled(True)
+            if hasattr(self, "_refresh_action_states"):
+                self._refresh_action_states()
             QMessageBox.information(self, "成功", f"D405 相机连接成功" + (f" (SN: {serial})" if serial else ""))
         except Exception as e:
-            self.d405_status_label.setText("D405: 连接失败")
-            self.d405_status_label.setStyleSheet("color: red; font-weight: bold;")
+            self._set_camera_status("D405", "连接失败")
             QMessageBox.critical(self, "错误", f"D405 相机连接失败: {e}")
 
     def disconnect_d405(self):
         try:
             if self.vision_d405 is not None:
+                self._stop_camera_workers_for("D405")
                 self.vision_d405.close()
                 self.vision_d405 = None
-                self.d405_status_label.setText("D405: 未连接")
-                self.d405_status_label.setStyleSheet("color: gray;")
+                self._set_camera_status("D405", "未连接")
                 self.d405_connect_btn.setEnabled(True)
                 self.d405_disconnect_btn.setEnabled(False)
+                if hasattr(self, "_refresh_action_states"):
+                    self._refresh_action_states()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"D405 相机关闭失败: {e}")
 
@@ -132,6 +153,9 @@ class VisionMixin:
             QMessageBox.critical(self, "错误", f"打开实时反馈失败: {e}")
 
     def _start_camera_test(self):
+        if hasattr(self, 'cam_test_worker') and self.cam_test_worker is not None:
+            QMessageBox.warning(self, "警告", "相机测试已在运行")
+            return
         cam_type = self.cam_test_combo.currentText()
         if cam_type == "D435i" and self.vision_d435i is None:
             QMessageBox.warning(self, "警告", "D435i 相机未连接")
@@ -143,9 +167,10 @@ class VisionMixin:
         self.cam_test_start_btn.setEnabled(False)
         self.cam_test_stop_btn.setEnabled(True)
         vision = self.vision_d405 if cam_type == "D405" else self.vision_d435i
-        from gui_app import CameraTestWorker
+        from workers import CameraTestWorker
         self.cam_test_worker = CameraTestWorker(vision, cam_type, self.controller)
         self.cam_test_worker.result_ready.connect(self._on_camera_test_result)
+        self.cam_test_worker.finished.connect(self.cam_test_worker.deleteLater)
         self.cam_test_worker.start()
 
     def _stop_camera_test(self):
@@ -213,14 +238,15 @@ class VisionMixin:
         if hasattr(self, '_low_fps_worker') and self._low_fps_worker is not None:
             QMessageBox.warning(self, "警告", "低帧率识别已在运行")
             return
-        from gui_app import D435iLowFpsWorker
+        from workers import D435iLowFpsWorker
         self._low_fps_worker = D435iLowFpsWorker(self.vision_d435i, self.controller)
         self._low_fps_worker.low_fps_result.connect(self._on_low_fps_result)
+        self._low_fps_worker.finished.connect(self._low_fps_worker.deleteLater)
         self._low_fps_worker.start()
         self.d435i_low_fps_start_btn.setEnabled(False)
         self.d435i_low_fps_stop_btn.setEnabled(True)
         self.d435i_low_fps_status.setText("状态: 运行中")
-        self.d435i_low_fps_status.setStyleSheet("color: green; font-weight: bold;")
+        apply_status_visual(self.d435i_low_fps_status, "运行中")
 
     def stop_d435i_low_fps(self):
         if hasattr(self, '_low_fps_worker') and self._low_fps_worker is not None:
@@ -230,7 +256,7 @@ class VisionMixin:
         self.d435i_low_fps_start_btn.setEnabled(True)
         self.d435i_low_fps_stop_btn.setEnabled(False)
         self.d435i_low_fps_status.setText("状态: 已停止")
-        self.d435i_low_fps_status.setStyleSheet("color: gray;")
+        apply_status_visual(self.d435i_low_fps_status, "已停止")
 
     def _on_low_fps_result(self, result):
         status = result.get('status', 'unknown')
@@ -238,7 +264,7 @@ class VisionMixin:
             return
         if status == 'error':
             self.d435i_low_fps_status.setText(f"状态: 错误 - {result.get('error_msg', '')}")
-            self.d435i_low_fps_status.setStyleSheet("color: red; font-weight: bold;")
+            apply_status_visual(self.d435i_low_fps_status, "错误")
             return
 
         object_position = result.get('object_position')
@@ -246,7 +272,7 @@ class VisionMixin:
             cam_coords = result.get('cam_coords', [])
             conf = result.get('confidence', 0.0)
             self.d435i_low_fps_status.setText(f"状态: 检测到物体 (置信度={conf:.2f})")
-            self.d435i_low_fps_status.setStyleSheet("color: green; font-weight: bold;")
+            apply_status_visual(self.d435i_low_fps_status, "运行")
             if len(cam_coords) >= 3:
                 self.d435i_low_fps_cam_coords.setText(f"X: {cam_coords[0]:.1f}  Y: {cam_coords[1]:.1f}  Z: {cam_coords[2]:.1f}")
             end_coords = result.get('end_coords')
@@ -261,7 +287,7 @@ class VisionMixin:
                 self.d435i_low_fps_base_coords.setText("X: ---  Y: ---  Z: ---")
         else:
             self.d435i_low_fps_status.setText("状态: 未检测到物体")
-            self.d435i_low_fps_status.setStyleSheet("color: red; font-weight: bold;")
+            apply_status_visual(self.d435i_low_fps_status, "未检测到物体")
             self.d435i_low_fps_cam_coords.setText("X: ---  Y: ---  Z: ---")
             self.d435i_low_fps_end_coords.setText("X: ---  Y: ---  Z: ---")
             self.d435i_low_fps_base_coords.setText("X: ---  Y: ---  Z: ---")

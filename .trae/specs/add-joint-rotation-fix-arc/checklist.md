@@ -1,7 +1,0 @@
-- [x] 检查点1：MovC方法正确添加到dobot_api.py
-- [x] 检查点2：RelJointMovJ方法正确添加到dobot_api.py
-- [x] 检查点3：move_arc()和move_joint_relative()方法正确添加到robot_controller.py
-- [x] 检查点4：GUI运动编辑面板中新增"关节旋转"模块选项
-- [x] 检查点5：圆弧运动中间点和目标点计算逻辑正确
-- [x] 检查点6：关节旋转模块参数编辑功能正常
-- [x] 检查点7：流程执行能正确处理关节旋转和圆弧运动模块

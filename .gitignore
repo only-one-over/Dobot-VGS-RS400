@@ -16,3 +16,5 @@ cpp_core/build/
 *.onnx
 *.spec
 DobotControl.spec
+.trae/
+test_yolo26_*.py

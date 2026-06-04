@@ -1,7 +1,0 @@
-- [x] 各Tab页内容被 QScrollArea 包裹，窗口较小时可滚动
-- [x] QScrollArea 设置 widgetResizable=True
-- [x] robot_controller.py 新增 clear_error() 公开方法
-- [x] clear_error() 调用 ClearError() 后自动重新使能
-- [x] "主功能"Tab 有"清除故障"按钮
-- [x] 点击"清除故障"按钮能清除报警并显示结果
-- [x] 未连接时点击"清除故障"有提示

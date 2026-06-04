@@ -1,3 +1,0 @@
-- [ ] 检查点1：send_command()使用单次recv(1024)接收响应
-- [ ] 检查点2：connect()不读取欢迎消息，不自动RequestControl
-- [ ] 检查点3：dobot_api.py与dobot_move_boject的dobot_api.py一致

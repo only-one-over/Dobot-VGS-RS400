@@ -1,3 +1,0 @@
-- [x] 确认 robot_controller.py 中只存在一个 `get_current_pose` 方法（第549行版本）
-- [x] 确认保留的方法调用 `GetPose()` 而非 `GetPose(0)`
-- [x] 确认异常时 socket timeout 被正确恢复（`settimeout(None)`）

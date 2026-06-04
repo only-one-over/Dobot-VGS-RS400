@@ -1,2 +1,0 @@
-- [x] requirements.txt 包含 pyrealsense2、opencv-python、onnxruntime
-- [x] gui_app.py 导入失败时打印并提示需要安装的具体依赖

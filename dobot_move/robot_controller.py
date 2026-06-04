@@ -776,6 +776,65 @@ class DobotController:
         logger.info(" 运动完成")
         return True
 
+    def move_until_force_limit(self, axis, distance, force_limit, speed_percentage=20):
+        """Move along a user-coordinate axis until distance completes or TCP force exceeds limit."""
+        if not self.is_connected:
+            logger.error("机器人未连接，无法执行力阈值移动")
+            return False
+        if not self.is_enabled:
+            logger.error("机器人未使能，无法执行力阈值移动")
+            return False
+        if self.get_feed_data() is None:
+            logger.error("反馈数据不可用，无法监控力阈值")
+            return False
+
+        axis = str(axis).upper()
+        offsets = {
+            "X": [distance, 0, 0, 0, 0, 0],
+            "Y": [0, distance, 0, 0, 0, 0],
+            "Z": [0, 0, distance, 0, 0, 0],
+        }.get(axis)
+        if offsets is None:
+            logger.error(f"不支持的力阈值移动方向: {axis}")
+            return False
+        if force_limit <= 0:
+            logger.error(f"力上限必须大于0: {force_limit}")
+            return False
+
+        self.set_speed(int(speed_percentage))
+        response = self.dashboard.RelMovLUser(
+            offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
+            speed=int(speed_percentage)
+        )
+        logger.debug(f"力阈值移动响应: {response}")
+        response_code = self.parse_response_code(response)
+        if response_code != 0:
+            logger.error(f"力阈值移动指令被拒绝，响应码: {response_code}")
+            return False
+
+        timeout = min(max(abs(float(distance)) / 20.0 + 5.0, 5.0), 60.0)
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            current_force = self.get_current_force()
+            if current_force > force_limit:
+                logger.warning(f"力阈值触发: {current_force:.2f}N > {force_limit:.2f}N，停止当前运动")
+                self.dashboard.Stop()
+                return True
+
+            response = self.dashboard.RobotMode()
+            robot_mode = self.parse_robot_mode(response) if response else None
+            if robot_mode == 5:
+                logger.info("力阈值移动自然完成，未触发停止")
+                return True
+            if robot_mode == 9:
+                logger.error("力阈值移动过程中机器人报警")
+                return False
+            time.sleep(0.05)
+
+        logger.warning("力阈值移动等待超时，停止当前运动")
+        self.dashboard.Stop()
+        return True
+
     def move_to_initial_position(self):
         """移动到初始位置"""
         logger.info("\n" + "=" * 60)

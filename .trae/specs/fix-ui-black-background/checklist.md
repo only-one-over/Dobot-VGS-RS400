@@ -1,6 +1,0 @@
-- [x] QWidget 容器背景色为浅蓝色 (#f0f8ff)，非黑色
-- [x] QScrollArea 背景色为浅蓝色 (#f0f8ff)，非黑色
-- [x] QLineEdit 背景色为白色，边框与主题一致
-- [x] QTableWidget 背景色为白色，交替行颜色为浅蓝色
-- [x] QScrollBar 使用蓝色主题风格
-- [x] 界面启动后无黑色空白区域

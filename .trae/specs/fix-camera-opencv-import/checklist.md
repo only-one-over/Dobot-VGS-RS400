@@ -1,6 +1,0 @@
-- [x] gui_app.py 的视觉导入 try 块中包含 `import cv2`，CameraTestWorker 中 cv2 调用不会出现 NameError
-- [x] gui_app.py 的视觉导入 except 块逐个检测 pyrealsense2、cv2、onnxruntime，列出具体缺失的库及安装命令
-- [x] vision_system.py 的 `import cv2` 使用 try/except 包裹，失败时抛出包含 "opencv-python" 关键字的 ImportError
-- [x] depth_processor.py 的 `import cv2` 使用 try/except 包裹，设置 HAS_CV2 标志，与 pyrealsense2 导入方式一致
-- [x] depth_processor.py 的 process_depth_image 方法在 HAS_CV2 为 False 时给出明确提示而非崩溃
-- [x] opencv 已安装时，相机测试功能正常运行，无 NameError

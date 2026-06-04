@@ -1,0 +1,101 @@
+[
+  {
+    "type": "move",
+    "name": "\u79fb\u52a8\u5230\u521d\u59cb\u4f4d\u7f6e",
+    "params": {
+      "target": "initial_position",
+      "motion_type": "MovJ",
+      "speed": 20
+    }
+  },
+  {
+    "type": "camera",
+    "name": "\u8bc6\u522b\u7269\u4f53\u5e76\u8ba1\u7b97\u5750\u6807",
+    "params": {
+      "camera_type": "D435i"
+    }
+  },
+  {
+    "type": "move",
+    "name": "\u76f4\u7ebf\u8fd0\u52a8\u5230\u76ee\u6807",
+    "params": {
+      "target": "camera_detected",
+      "motion_type": "MovL",
+      "speed": 30,
+      "point_name": ""
+    }
+  },
+  {
+    "type": "visual_servo",
+    "name": "D405\u89c6\u89c9\u4f3a\u670d\u6293\u53d6",
+    "params": {
+      "target_type": "grasp_point",
+      "converge_threshold": 2.0,
+      "max_iterations": 60
+    }
+  },
+  {
+    "type": "force_guard_move",
+    "name": "\u529b\u9608\u503c\u65b9\u5411\u79fb\u52a8",
+    "params": {
+      "axis": "Z",
+      "distance": 50.0,
+      "force_limit": 20.0,
+      "speed": 20
+    }
+  },
+  {
+    "type": "force_arc",
+    "name": "\u529b\u63a7\u5706\u5f27\u8fd0\u52a8",
+    "params": {
+      "center": [
+        400,
+        0,
+        300
+      ],
+      "radius": 50,
+      "start_angle": 0,
+      "end_angle": 90,
+      "rotation_axis": "Z",
+      "num_waypoints": 30,
+      "speed": 20,
+      "fc_axes": {
+        "x": 0,
+        "y": 0,
+        "z": 0,
+        "rx": 1,
+        "ry": 1,
+        "rz": 1
+      },
+      "correction_gain": 0.3,
+      "deviation_pos": 100,
+      "deviation_rot": 36,
+      "damping_pos": 50,
+      "damping_rot": 5,
+      "mode": "coords",
+      "point_name": "",
+      "center_mode": "coords",
+      "center_point_name": ""
+    }
+  },
+  {
+    "type": "move",
+    "name": "\u76f4\u7ebf\u8fd0\u52a8\u5230\u76ee\u6807",
+    "params": {
+      "target": "camera_detected",
+      "motion_type": "MovL",
+      "speed": 30,
+      "point_name": ""
+    }
+  },
+  {
+    "type": "move",
+    "name": "\u76f4\u7ebf\u8fd0\u52a8\u5230\u76ee\u6807",
+    "params": {
+      "target": "camera_detected",
+      "motion_type": "MovL",
+      "speed": 30,
+      "point_name": ""
+    }
+  }
+]

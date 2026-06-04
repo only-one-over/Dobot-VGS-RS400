@@ -1,3 +1,0 @@
-- [x] gui_app.py 导入了 get_robot_ip 函数
-- [x] gui_app.py 导入了 set_robot_ip as config_set_robot_ip 函数
-- [x] gui_app.py 启动时不再出现 NameError: name 'get_robot_ip' is not defined

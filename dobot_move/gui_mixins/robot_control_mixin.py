@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import QMessageBox
 from config_manager import (
     set_photo_position as config_set_photo_position,
     set_robot_ip as config_set_robot_ip,
+    ConfigService,
 )
 from workers import MonitorThread, RobotCmdThread
 
@@ -56,8 +57,8 @@ class RobotControlMixin:
         self._is_paused_ref[0] = True
         self.controller.pause()
         self.statusBar().showMessage("流程已暂停")
-        self.pause_btn.setEnabled(False)
-        self.continue_btn.setEnabled(True)
+        if hasattr(self, "_refresh_action_states"):
+            self._refresh_action_states()
 
     def on_continue(self):
         if not self._flow_running:
@@ -67,8 +68,8 @@ class RobotControlMixin:
         self._is_paused_ref[0] = False
         self.controller.continue_motion()
         self.statusBar().showMessage("流程已继续")
-        self.pause_btn.setEnabled(True)
-        self.continue_btn.setEnabled(False)
+        if hasattr(self, "_refresh_action_states"):
+            self._refresh_action_states()
 
     def connect_robot(self):
         if self.controller.is_connected:
@@ -81,7 +82,7 @@ class RobotControlMixin:
             return
 
         self.controller.set_robot_ip(ip)
-        config_set_robot_ip(ip)
+        ConfigService.instance().set_ip('robot_ip', ip)
         self._run_cmd_thread("连接", self.controller.connect)
 
     def set_collision_level(self):
@@ -93,12 +94,21 @@ class RobotControlMixin:
         self._run_cmd_thread("设置碰撞等级", lambda: self.controller.set_collision_level(level))
 
     def _run_cmd_thread(self, cmd_name, cmd_func):
+        if getattr(self, "_cmd_running", False):
+            self.statusBar().showMessage("已有机器人命令正在执行，请稍候")
+            return
+        self._cmd_running = True
+        if hasattr(self, "_refresh_action_states"):
+            self._refresh_action_states()
         self.statusBar().showMessage(f"正在{cmd_name}...")
         self._cmd_thread = RobotCmdThread(cmd_name, cmd_func, self)
         self._cmd_thread.cmd_finished.connect(self._on_cmd_finished)
+        self._cmd_thread.finished.connect(self._cmd_thread.deleteLater)
         self._cmd_thread.start()
 
     def _on_cmd_finished(self, cmd_name, success):
+        self._cmd_running = False
+        self._cmd_thread = None
         if success:
             QMessageBox.information(self, "成功", f"{cmd_name}成功")
         else:
@@ -108,6 +118,8 @@ class RobotControlMixin:
             else:
                 QMessageBox.critical(self, "错误", f"{cmd_name}失败")
         self.statusBar().showMessage(f"{cmd_name}{'成功' if success else '失败'}")
+        if hasattr(self, "_refresh_action_states"):
+            self._refresh_action_states()
 
     def get_current_position(self):
         if not self.controller.is_connected:
@@ -154,11 +166,9 @@ class RobotControlMixin:
 
             if reply == QMessageBox.StandardButton.Yes:
                 self.controller.initial_pose = new_position
-                if config_set_photo_position(new_position):
-                    self.photo_position_label.setText(f"拍照位置: {new_position}")
-                    QMessageBox.information(self, "成功", "拍照位置已成功修改并保存")
-                else:
-                    QMessageBox.warning(self, "警告", "拍照位置已修改但保存失败")
+                ConfigService.instance().set('photo_position', new_position)
+                self.photo_position_label.setText(f"拍照位置: {new_position}")
+                QMessageBox.information(self, "成功", "拍照位置已成功修改并保存")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"修改拍照位置时出错: {e}")
 

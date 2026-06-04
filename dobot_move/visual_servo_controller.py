@@ -101,7 +101,6 @@ class VisualServoController:
             if error_mm < self.converge_threshold:
                 if log_callback:
                     log_callback(f"✅ 收敛成功! 最终误差={error_mm:.1f}mm, 迭代次数={i+1}")
-                self._update_points(object_position, current_pose)
                 return True, error_mm, i + 1
 
             gain, speed = self._adaptive_gain(error_mm)
@@ -129,14 +128,3 @@ class VisualServoController:
         if log_callback:
             log_callback(f"❌ 视觉伺服超时, 迭代次数={self.max_iterations}")
         return False, error_mm if 'error_mm' in dir() else -1.0, self.max_iterations
-
-    def _update_points(self, object_position, current_pose):
-        from config_manager import get_point, set_point
-
-        if 'camera_coords' in object_position:
-            end_coords = self.vision.convert_to_end_coords(object_position['camera_coords'])
-            base_coords = self.vision.convert_to_base_coords(end_coords, current_pose)
-            if base_coords is not None:
-                point_data = get_point("d435i") or {"coords": [0]*6, "is_relative": False, "relative_to": None, "offset": [0]*6, "is_default": True}
-                point_data["coords"] = list(base_coords) + list(current_pose[3:])
-                set_point("d435i", point_data)

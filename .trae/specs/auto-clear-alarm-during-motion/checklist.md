@@ -1,3 +1,0 @@
-- [x] _wait_for_motion_done 中 robot_mode==9 时自动调用 clear_error()
-- [x] 最大重试3次清除报警
-- [x] 清除后继续等待运动完成而非直接返回False

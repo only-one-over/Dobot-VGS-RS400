@@ -267,8 +267,62 @@ def resolve_point(name, visited=None):
         return list(point.get("coords", [0, 0, 0, 0, 0, 0]))
     base_coords = resolve_point(base_name, visited)
     if base_coords is None:
-        return list(point.get("coords", [0, 0, 0, 0, 0, 0]))
+        return None
+    coords = list(point.get("coords", [0, 0, 0, 0, 0, 0]))
     offset = point.get("offset", [0, 0, 0, 0, 0, 0])
-    resolved = [base_coords[i] + offset[i] for i in range(6)]
-    point["coords"] = list(resolved)
+    if all(abs(float(v)) < 1e-9 for v in coords) and any(abs(float(v)) > 1e-9 for v in offset):
+        coords = list(offset)
+    resolved = [base_coords[i] + coords[i] for i in range(6)]
     return resolved
+
+
+class ConfigService:
+    """Debounced config write service for UI layer."""
+    _instance = None
+
+    def __init__(self):
+        from PyQt6.QtCore import QTimer
+        self._pending = {}
+        self._timer = QTimer()
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(500)
+        self._timer.timeout.connect(self._flush_pending)
+
+    @classmethod
+    def instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def set(self, key, value):
+        self._pending[key] = value
+        self._timer.start()
+
+    def set_ip(self, key, value):
+        self.set(key, value)
+
+    def set_point(self, name, data):
+        self.flush()
+        set_point(name, data)
+
+    def add_point(self, name, coords=None, is_relative=False, relative_to=None, offset=None):
+        self.flush()
+        add_point(name, coords, is_relative, relative_to, offset)
+
+    def delete_point(self, name):
+        self.flush()
+        delete_point(name)
+
+    def flush(self):
+        if self._pending:
+            self._timer.stop()
+            self._flush_pending()
+
+    def _flush_pending(self):
+        if not self._pending:
+            return
+        config = load_config()
+        for key, value in self._pending.items():
+            config[key] = value
+        save_config(config)
+        self._pending.clear()

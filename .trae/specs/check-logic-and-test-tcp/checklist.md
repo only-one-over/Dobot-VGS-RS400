@@ -1,5 +1,0 @@
-- [x] 检查点1：tcp_test文件夹和测试脚本已创建
-- [x] 检查点2：测试脚本可以逐步执行TCP连接测试
-- [x] 检查点3：connect()不再自动调用enable_robot()
-- [x] 检查点4：RequestControl失败时检查RobotMode而非直接返回False
-- [x] 检查点5：GUI中使能/下使能按钮逻辑正确

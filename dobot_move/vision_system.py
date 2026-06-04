@@ -12,6 +12,7 @@ except ImportError:
     raise ImportError("缺少依赖 opencv-python，请执行: pip install opencv-python")
 import os
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 from config_manager import load_config, get_calibration, get_camera_handeye_matrix
@@ -30,6 +31,14 @@ from tracker import BYTETracker, STrack
 from kalman_filter_3d import KalmanFilter3D
 from depth_processor import DepthProcessor
 
+DEFAULT_PERFORMANCE_CONFIG = {
+    "capture_timeout_ms": 300,
+    "camera_test_detection_fps": 10,
+    "camera_test_display_fps": 10,
+    "low_fps_detection_fps": 5,
+    "performance_log_interval_frames": 30,
+}
+
 
 class VisionSystem:
     """视觉系统 - 用于识别物体并计算坐标"""
@@ -41,6 +50,16 @@ class VisionSystem:
         self.enable_tracking = enable_tracking
         self.enable_kalman = enable_kalman
         self.enable_depth_filter = enable_depth_filter
+        config = load_config()
+        performance_config = dict(DEFAULT_PERFORMANCE_CONFIG)
+        performance_config.update(config.get("performance", {}))
+        self.performance_config = performance_config
+        self.capture_timeout_ms = int(performance_config.get("capture_timeout_ms", 300))
+        self.performance_log_interval_frames = max(
+            1,
+            int(performance_config.get("performance_log_interval_frames", 30)),
+        )
+        self._perf_stats = {}
         self.camera_available = False
         self.pipeline = None
         self.profile = None
@@ -128,18 +147,33 @@ class VisionSystem:
             logger.debug(f"模型输入: {self.input_name}, 形状: {self.input_shape}")
 
             output_infos = self.session.get_outputs()
+            self.model_format = "yolov8"  # 默认格式
             if len(output_infos) >= 2:
                 self.is_seg_model = True
                 output_shape = output_infos[0].shape
                 if len(output_shape) == 3:
-                    self.num_classes = output_shape[1] - 4 - 32
-                logger.debug(f"模型输出: seg模式, num_classes={self.num_classes}")
+                    # YOLO26: [1, N, C] where N < C (e.g. [1, 300, 38])
+                    # YOLO11: [1, C, N] where C < N (e.g. [1, 37, 8400])
+                    dim1, dim2 = output_shape[1], output_shape[2]
+                    if dim1 < dim2:
+                        # YOLO11 format: [1, C, N]
+                        self.num_classes = dim1 - 4 - 32
+                    else:
+                        # YOLO26 format: [1, N, C]
+                        self.model_format = "yolo26"
+                        self.num_classes = 1  # will be inferred from detections
+                logger.debug(f"模型输出: seg模式, num_classes={self.num_classes}, model_format={self.model_format}")
             else:
                 self.is_seg_model = False
                 output_shape = output_infos[0].shape
                 if len(output_shape) == 3:
-                    self.num_classes = output_shape[1] - 4
-                logger.debug(f"模型输出: detect模式, num_classes={self.num_classes}")
+                    dim1, dim2 = output_shape[1], output_shape[2]
+                    if dim1 < dim2:
+                        self.num_classes = dim1 - 4
+                    else:
+                        self.model_format = "yolo26"
+                        self.num_classes = 1
+                logger.debug(f"模型输出: detect模式, num_classes={self.num_classes}, model_format={self.model_format}")
 
         except Exception as e:
             logger.warning(f"加载模型时出错(CUDA): {e}")
@@ -179,6 +213,32 @@ class VisionSystem:
             self.depth_processor = None
 
         self.last_valid_position = None
+
+    def _record_performance(self, scope, timings):
+        stats = self._perf_stats.setdefault(
+            scope,
+            {"count": 0, "totals": {}, "last_log": 0.0},
+        )
+        stats["count"] += 1
+        for key, value in timings.items():
+            stats["totals"][key] = stats["totals"].get(key, 0.0) + value
+
+        now = time.perf_counter()
+        if (
+            stats["count"] % self.performance_log_interval_frames != 0
+            or now - stats["last_log"] < 3.0
+        ):
+            return
+
+        count = max(1, stats["count"])
+        parts = [
+            f"{key}={total / count:.1f}ms"
+            for key, total in sorted(stats["totals"].items())
+        ]
+        logger.info("performance[%s] frames=%s %s", scope, stats["count"], " ".join(parts))
+        stats["count"] = 0
+        stats["totals"] = {}
+        stats["last_log"] = now
 
     def extract_mask_point_cloud_with_median_compensation(self, depth_image, mask, max_points=20000):
         mask_bool = mask > 127
@@ -277,58 +337,109 @@ class VisionSystem:
         return filtered_detections
 
     def calculate_object_position(self, depth_frame, color_frame, detections):
+        start = time.perf_counter()
         if not detections or len(detections) == 0:
-            logger.warning("❌ 未检测到物体")
+            logger.debug("no detection for position calculation")
             return None
 
         depth_image = np.asanyarray(depth_frame.get_data())
-        color_image = np.asanyarray(color_frame.get_data())
-
         det = detections[0]
-        mask = det['mask']
+        mask = det.get('mask')
 
         if mask is None:
-            logger.warning("❌ 掩码为None")
+            logger.debug("position calculation skipped: mask is None")
             return None
+
+        if DOBOT_CORE_AVAILABLE:
+            try:
+                cpp_start = time.perf_counter()
+                cpp_result = dobot_core.depth.calculate_object_position(
+                    depth_image,
+                    mask,
+                    det.get('bbox'),
+                    float(self.fx),
+                    float(self.fy),
+                    float(self.cx),
+                    float(self.cy),
+                    float(self.depth_scale),
+                    float(self.min_depth),
+                    float(self.max_depth),
+                )
+                self._record_performance(
+                    "depth_position",
+                    {"total": (time.perf_counter() - cpp_start) * 1000.0},
+                )
+                if cpp_result is None:
+                    return None
+                result = dict(cpp_result)
+                if "camera_coords" in result:
+                    result["camera_coords"] = list(result["camera_coords"])
+                return result
+            except Exception as e:
+                logger.debug("C++ depth position fallback: %s", e)
 
         mask_bool = mask > 127
-
         if not np.any(mask_bool):
-            logger.warning("❌ 掩码中没有有效像素")
+            logger.debug("position calculation skipped: empty mask")
             return None
 
-        _, compensation_info = self.extract_mask_point_cloud_with_median_compensation(depth_image, mask)
-
         y_coords, x_coords = np.where(mask_bool)
-
         if len(x_coords) == 0:
-            logger.warning("❌ 没有找到掩码区域的像素坐标")
+            logger.debug("position calculation skipped: no mask pixels")
             return None
 
         center_x = int(np.mean(x_coords))
         center_y = int(np.mean(y_coords))
-
         depth_value = depth_image[center_y, center_x]
-        depth_meters = depth_value * self.depth_scale
+        depth_meters = float(depth_value) * self.depth_scale
+        compensation_info = {
+            "compensated": False,
+            "median_depth": 0,
+            "valid_points": 0,
+            "invalid_points": 0,
+            "compensated_points": 0,
+        }
 
         if depth_value == 0 or depth_meters < self.min_depth or depth_meters > self.max_depth:
-            if compensation_info["compensated"] and compensation_info["median_depth"] > 0:
-                depth_meters = compensation_info["median_depth"]
-                logger.warning(f"⚠️  中心点深度无效，使用中位数补偿深度: {depth_meters:.3f}m")
+            bbox = det.get('bbox')
+            if bbox:
+                x1, y1, x2, y2 = [int(v) for v in bbox]
+                x1 = max(0, min(x1, depth_image.shape[1] - 1))
+                x2 = max(x1 + 1, min(x2, depth_image.shape[1]))
+                y1 = max(0, min(y1, depth_image.shape[0] - 1))
+                y2 = max(y1 + 1, min(y2, depth_image.shape[0]))
+                depth_region = depth_image[y1:y2, x1:x2]
+                mask_region = mask_bool[y1:y2, x1:x2]
+                valid_depths = depth_region[mask_region].astype(np.float32) * self.depth_scale
             else:
                 valid_depths = depth_image[mask_bool].astype(np.float32) * self.depth_scale
-                valid_depths = valid_depths[(valid_depths >= self.min_depth) & (valid_depths <= self.max_depth) & (valid_depths > 0)]
-                if len(valid_depths) > 0:
-                    depth_meters = np.median(valid_depths)
-                    logger.warning(f"⚠️  中心点深度无效，使用掩码区域中位数深度: {depth_meters:.3f}m")
+
+            valid_depths = valid_depths[
+                (valid_depths >= self.min_depth)
+                & (valid_depths <= self.max_depth)
+                & (valid_depths > 0)
+            ]
+            if len(valid_depths) > 0:
+                depth_meters = float(np.median(valid_depths))
+                compensation_info["median_depth"] = depth_meters
+                compensation_info["valid_points"] = int(len(valid_depths))
+            else:
+                _, compensation_info = self.extract_mask_point_cloud_with_median_compensation(depth_image, mask)
+                if compensation_info["compensated"] and compensation_info["median_depth"] > 0:
+                    depth_meters = float(compensation_info["median_depth"])
                 else:
-                    logger.error("❌ 没有有效的深度值")
+                    logger.debug("position calculation skipped: no valid depth")
                     return None
 
         logger.debug(f"📏 计算深度: {depth_meters:.3f}米")
 
         if depth_meters < self.min_depth or depth_meters > self.max_depth:
-            logger.warning(f"❌ 深度超出范围: {depth_meters:.3f}米 (有效范围: {self.min_depth}-{self.max_depth}米)")
+            logger.debug(
+                "depth out of range: %.3fm (valid %.3f-%.3fm)",
+                depth_meters,
+                self.min_depth,
+                self.max_depth,
+            )
             return None
 
         Z_mm = depth_meters * 1000.0
@@ -336,9 +447,10 @@ class VisionSystem:
         Y_mm = (center_y - self.cy) * Z_mm / self.fy
 
         logger.debug(f"📍 原始相机坐标: X={X_mm:.2f}, Y={Y_mm:.2f}, Z={Z_mm:.2f} mm")
-        logger.debug(f"📊 深度补偿信息: 补偿={compensation_info['compensated']}, 中位数深度={compensation_info['median_depth']:.3f}m, "
-              f"有效点={compensation_info['valid_points']}, 无效点={compensation_info['invalid_points']}, "
-              f"补偿点={compensation_info['compensated_points']}")
+        self._record_performance(
+            "depth_position",
+            {"total": (time.perf_counter() - start) * 1000.0},
+        )
 
         return {
             'center_x': center_x,
@@ -394,8 +506,11 @@ class VisionSystem:
             return None, None
         
         try:
-            frames = self.pipeline.wait_for_frames(timeout_ms=5000)
+            start = time.perf_counter()
+            frames = self.pipeline.wait_for_frames(timeout_ms=self.capture_timeout_ms)
+            wait_done = time.perf_counter()
             aligned_frames = self.align.process(frames)
+            align_done = time.perf_counter()
             depth_frame = aligned_frames.get_depth_frame()
             color_frame = aligned_frames.get_color_frame()
 
@@ -404,10 +519,20 @@ class VisionSystem:
 
             if self.depth_processor is not None:
                 depth_frame = self.depth_processor.process_frame(depth_frame)
+            filter_done = time.perf_counter()
+            self._record_performance(
+                "capture",
+                {
+                    "wait": (wait_done - start) * 1000.0,
+                    "align": (align_done - wait_done) * 1000.0,
+                    "depth_filter": (filter_done - align_done) * 1000.0,
+                    "total": (filter_done - start) * 1000.0,
+                },
+            )
 
             return depth_frame, color_frame
         except Exception as e:
-            logger.error(f"❌ 捕获帧失败: {e}")
+            logger.debug(f"❌ 捕获帧失败: {e}")
             return None, None
 
     def preprocess_image_yolov8(self, image, target_size=(640, 640)):
@@ -679,32 +804,134 @@ class VisionSystem:
 
         return detections
 
+    def _postprocess_yolo26_py(self, outputs, original_size, scale, offset, new_size, conf_threshold=0.25, iou_threshold=0.5):
+        """YOLO26 end-to-end 后处理，输出格式 [1, 300, 38]"""
+        detections = []
+        proto = None
+
+        if len(outputs) >= 2:
+            proto = outputs[1]
+
+        dets = outputs[0]
+
+        if len(dets.shape) == 3:
+            dets = dets[0]  # [300, 38]
+
+        all_boxes = []
+        all_scores = []
+        all_masks_coeff = []
+
+        for i in range(dets.shape[0]):
+            det = dets[i]
+
+            # YOLO26 format: x1,y1,x2,y2 + 1 score + 1 class_id + 32 mask_coeff
+            x1_raw, y1_raw, x2_raw, y2_raw = det[0:4]
+            score = det[4]
+            class_id = int(det[5])
+
+            if score < conf_threshold:
+                continue
+
+            # Convert from 640x640 to original image coordinates
+            orig_w, orig_h = original_size
+            x1_orig = (x1_raw - offset[0]) / scale
+            y1_orig = (y1_raw - offset[1]) / scale
+            x2_orig = (x2_raw - offset[0]) / scale
+            y2_orig = (y2_raw - offset[1]) / scale
+
+            x1 = int(max(0, min(orig_w, x1_orig)))
+            y1 = int(max(0, min(orig_h, y1_orig)))
+            x2 = int(max(0, min(orig_w, x2_orig)))
+            y2 = int(max(0, min(orig_h, y2_orig)))
+
+            mask_coeff = det[6:6 + 32] if self.is_seg_model else None
+
+            all_boxes.append([x1, y1, x2, y2])
+            all_scores.append(score)
+            all_masks_coeff.append(mask_coeff)
+
+        # No NMS needed for YOLO26 (end-to-end model)
+
+        # Process masks
+        if len(all_boxes) > 0 and proto is not None and self.is_seg_model:
+            boxes_arr = np.array(all_boxes)
+            masks_coeff_arr = np.array(all_masks_coeff)
+
+            if len(proto.shape) == 4:
+                proto = proto[0]  # [32, 160, 160]
+
+            masks = self.process_mask(proto, masks_coeff_arr, boxes_arr,
+                                      (original_size[1], original_size[0]), scale, offset, new_size)
+        else:
+            masks = []
+
+        # Build detection results
+        for i in range(len(all_boxes)):
+            x1, y1, x2, y2 = all_boxes[i]
+            score = all_scores[i]
+            mask = masks[i] if i < len(masks) else None
+
+            if mask is not None and np.sum(mask) == 0:
+                mask = np.zeros((original_size[1], original_size[0]), dtype=np.uint8)
+                mask[y1:y2, x1:x2] = 255
+
+            detections.append({
+                'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                'score': float(score),
+                'mask': mask,
+                'class_id': 0,
+                'class_name': self.class_names[0] if self.class_names else 'object',
+            })
+
+        return detections
+
     def postprocess_yolov8(self, outputs, original_size, scale, offset, new_size, conf_threshold=0.25, iou_threshold=0.5):
-        if DOBOT_CORE_AVAILABLE:
-            try:
-                return dobot_core.yolo.postprocess_yolov8(outputs, original_size, scale, offset, new_size, self.num_classes, conf_threshold, iou_threshold)
-            except Exception:
-                pass
-        return self._postprocess_yolov8_py(outputs, original_size, scale, offset, new_size, conf_threshold, iou_threshold)
+        if self.model_format == "yolo26":
+            if DOBOT_CORE_AVAILABLE:
+                try:
+                    result = dobot_core.yolo.postprocess_yolo26(outputs, original_size, scale, offset, new_size, self.num_classes, conf_threshold)
+                    if isinstance(result, dict) and "detections" in result:
+                        return result["detections"]
+                    return result
+                except Exception as e:
+                    logger.debug("C++ YOLO26 postprocess fallback: %s", e)
+            return self._postprocess_yolo26_py(outputs, original_size, scale, offset, new_size, conf_threshold, iou_threshold)
+        else:
+            if DOBOT_CORE_AVAILABLE:
+                try:
+                    return dobot_core.yolo.postprocess_yolov8(outputs, original_size, scale, offset, new_size, self.num_classes, conf_threshold, iou_threshold)
+                except Exception as e:
+                    logger.debug("C++ YOLOv8 postprocess fallback: %s", e)
+            return self._postprocess_yolov8_py(outputs, original_size, scale, offset, new_size, conf_threshold, iou_threshold)
 
     def run_detection(self, image):
-        """运行实例分割检测"""
+        """Run instance segmentation and record lightweight timing."""
         if self.session is None:
             return None
 
         try:
-            # 预处理图像
+            start = time.perf_counter()
             input_tensor, original_size, scale, offset, new_size = self.preprocess_image_yolov8(image)
+            preprocess_done = time.perf_counter()
 
-            # 运行推理
             outputs = self.session.run(None, {self.input_name: input_tensor})
+            inference_done = time.perf_counter()
 
-            # 后处理
             detections = self.postprocess_yolov8(outputs, original_size, scale, offset, new_size)
+            postprocess_done = time.perf_counter()
 
             if detections is not None:
-                logger.info(f"检测到 {len(detections)} 个目标")
+                logger.debug("detected %s target(s)", len(detections))
 
+            self._record_performance(
+                "detection",
+                {
+                    "preprocess": (preprocess_done - start) * 1000.0,
+                    "inference": (inference_done - preprocess_done) * 1000.0,
+                    "postprocess": (postprocess_done - inference_done) * 1000.0,
+                    "total": (postprocess_done - start) * 1000.0,
+                },
+            )
             return detections
 
         except Exception as e:

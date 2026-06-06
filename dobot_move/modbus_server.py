@@ -19,28 +19,30 @@ class DobotModbusServer:
         self._lock = threading.Lock()
 
         self._registers = {}
-        for addr in range(50001, 50050):
+        for addr in range(50001, 50061):
             self._registers[addr] = 0
 
         self._register_info = {
-            50001: ("命令(1=复位,2=回安全位,3=提钩)", "U16", "底盘写"),
-            50003: ("提钩使能(1/0)", "U16", "底盘写"),
-            50010: ("X目标位置(高16位)", "F32", "底盘写"),
-            50012: ("Y目标位置(高16位)", "F32", "底盘写"),
-            50014: ("Z目标位置(高16位)", "F32", "底盘写"),
-            50016: ("末端旋转角度(高16位)", "F32", "底盘写"),
-            50018: ("移动速度(高16位)", "F32", "底盘写"),
-            50030: ("状态(1空闲/2运行/3完成/4故障/5急停)", "U16", "机械臂写"),
-            50031: ("故障代码", "U16", "机械臂写"),
-            50032: ("在位标志(0/1)", "U16", "机械臂写"),
-            50040: ("当前X位置(高16位)", "F32", "机械臂写"),
-            50042: ("当前Y位置(高16位)", "F32", "机械臂写"),
-            50044: ("当前Z位置(高16位)", "F32", "机械臂写"),
+            50001: ("命令(1=复位/清报警,2=回安全位,3=执行目标位姿,9=软件急停)", "U16", "外部主站写"),
+            50010: ("目标X位置(高16位)", "F32", "外部主站写"),
+            50012: ("目标Y位置(高16位)", "F32", "外部主站写"),
+            50014: ("目标Z位置(高16位)", "F32", "外部主站写"),
+            50016: ("目标Rx姿态(高16位)", "F32", "外部主站写"),
+            50018: ("目标Ry姿态(高16位)", "F32", "外部主站写"),
+            50020: ("目标Rz姿态(高16位)", "F32", "外部主站写"),
+            50022: ("目标速度百分比(高16位)", "F32", "外部主站写"),
+            50030: ("状态(1空闲/2运行/3完成/4故障/5急停)", "U16", "本机程序写"),
+            50031: ("故障代码", "U16", "本机程序写"),
+            50032: ("在位标志(0/1)", "U16", "本机程序写"),
+            50033: ("急停状态(0/1)", "U16", "本机程序写"),
+            50040: ("当前X位置(高16位)", "F32", "本机程序写"),
+            50042: ("当前Y位置(高16位)", "F32", "本机程序写"),
+            50044: ("当前Z位置(高16位)", "F32", "本机程序写"),
         }
 
     def _build_context(self):
         min_addr = 50001
-        max_addr = 50050
+        max_addr = 50060
         count = max_addr - min_addr + 1
         values = [self._registers.get(min_addr + i, 0) for i in range(count)]
         block = ModbusSequentialDataBlock(min_addr, values)
@@ -106,11 +108,12 @@ class DobotModbusServer:
     def is_running(self):
         return self._running
 
-    def update_status_registers(self, status=1, fault_code=0, in_position=0, x=0.0, y=0.0, z=0.0):
+    def update_status_registers(self, status=1, fault_code=0, in_position=0, x=0.0, y=0.0, z=0.0, emergency=0):
         with self._lock:
             self._registers[50030] = int(status)
             self._registers[50031] = int(fault_code)
             self._registers[50032] = int(in_position)
+            self._registers[50033] = int(emergency)
 
             x_h, x_l = float_to_regs(x)
             self._registers[50040] = x_h
@@ -146,11 +149,12 @@ class DobotModbusServer:
                 y = regs_to_float(self._registers.get(50012, 0), self._registers.get(50013, 0))
                 z = regs_to_float(self._registers.get(50014, 0), self._registers.get(50015, 0))
                 rx = regs_to_float(self._registers.get(50016, 0), self._registers.get(50017, 0))
-                speed = regs_to_float(self._registers.get(50018, 0), self._registers.get(50019, 0))
-                hook_enable = self._registers.get(50003, 0)
+                ry = regs_to_float(self._registers.get(50018, 0), self._registers.get(50019, 0))
+                rz = regs_to_float(self._registers.get(50020, 0), self._registers.get(50021, 0))
+                speed = regs_to_float(self._registers.get(50022, 0), self._registers.get(50023, 0))
             except Exception:
                 return None
-        return {"x": x, "y": y, "z": z, "rx": rx, "speed": speed, "hook_enable": hook_enable}
+        return {"x": x, "y": y, "z": z, "rx": rx, "ry": ry, "rz": rz, "speed": speed or 30}
 
     def get_register_values(self):
         with self._lock:
@@ -164,8 +168,9 @@ class DobotModbusServer:
                     "direction": info[2] if info else "",
                 }
 
-            for base_addr, name in [(50010, "X目标"), (50012, "Y目标"), (50014, "Z目标"),
-                                     (50016, "旋转角度"), (50018, "速度"),
+            for base_addr, name in [(50010, "目标X"), (50012, "目标Y"), (50014, "目标Z"),
+                                     (50016, "目标Rx"), (50018, "目标Ry"), (50020, "目标Rz"),
+                                     (50022, "目标速度"),
                                      (50040, "当前X"), (50042, "当前Y"), (50044, "当前Z")]:
                 try:
                     val = regs_to_float(self._registers.get(base_addr, 0), self._registers.get(base_addr + 1, 0))

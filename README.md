@@ -23,12 +23,15 @@ Vision-Guided System for Dobot CR Series Robots with Intel RealSense D400 Depth 
 
 - 🎯 **Dual-Camera Collaboration** — D435i coarse positioning + D405 fine recognition (mask geometric center)
 - 🔄 **Real-Time Tracking** — D435i low-fps (5fps) continuous recognition, real-time target position update
-- 🧠 **YOLO Instance Segmentation** — YOLO11s-seg + ByteTrack multi-object tracking + 3D Kalman filter
+- 🧠 **YOLO Instance Segmentation** — YOLO11s-seg / YOLO26 end-to-end + ByteTrack multi-object tracking + 3D Kalman filter
 - 📐 **Hand-Eye Calibration** — Independent calibration for D435i/D405 dual cameras
 - 🎮 **Visual Servoing** — Iterative approach with adaptive gain, 2mm convergence threshold
 - 💪 **Force-Controlled Arc** — ArcTrajectoryPlanner + ForceFeedbackMonitor + ForceArcController
 - 🔌 **Modbus TCP** — Bidirectional communication, PC as Master/Server
 - ⚡ **C++ Acceleration** — Optional dobot_core pybind11 module for 5-20x speedup with Python fallback
+- 🔀 **Flow Step Editor** — Drag-and-drop step reordering with real-time status icons (pending/running/completed/failed)
+- 💾 **ConfigService** — Unified debounce config writing, prevents frequent disk I/O
+- 🎨 **PySide6 Compatible** — qt_compat.py abstraction layer for Qt framework independence
 
 ## Quick Start
 
@@ -107,6 +110,9 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 | Modbus Server | `modbus_server.py` | Modbus TCP Server |
 | Modbus Client | `modbus_client.py` | Modbus TCP Client (cart) |
 | Config Manager | `config_manager.py` | JSON config read/write |
+| Main Control Panel | `main_control_panel.py` | Main control panel widget with signal-based communication |
+| Flow Step List | `flow_step_list.py` | Flow step list with drag-and-drop and status icons |
+| Qt Compat | `qt_compat.py` | Qt framework compatibility layer (PySide6) |
 | Workers | `workers.py` | Device init, status update threads |
 | C++ Core | `cpp_core/` | pybind11 acceleration module |
 
@@ -163,6 +169,8 @@ Photo Position → D435i Coarse Recognition → Move Above D435i Target
 ## Configuration
 
 ### config.json
+
+Copy `dobot_move/config.example.json` to `dobot_move/config.json` and modify the values for your setup.
 
 Configuration file located at `dobot_move/config.json`:
 

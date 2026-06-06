@@ -18,3 +18,7 @@ cpp_core/build/
 DobotControl.spec
 .trae/
 test_yolo26_*.py
+dobot_move/config.json
+AGENTS.md
+PORTING_GUIDE.md
+dobot_move/alarm_history.json

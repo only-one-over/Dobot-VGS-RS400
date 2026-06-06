@@ -1,11 +1,10 @@
 import os
 import json
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QMessageBox, QLabel
+from qt_compat import QMessageBox
 
-from config_manager import resolve_point
-from flow_step_list import FlowStepList, STATUS_PENDING, STATUS_RUNNING, STATUS_COMPLETED, STATUS_FAILED
+from config_manager import get_grasp_flow_file
+from flow_step_list import STATUS_RUNNING, STATUS_COMPLETED, STATUS_FAILED
 
 
 class GraspFlowMixin:
@@ -48,29 +47,15 @@ class GraspFlowMixin:
                     "point_name": ""
                 }
             }
-        elif module_type == "力控圆弧":
-            center_point_name = self.fa_center_point_combo.currentText() if hasattr(self, "fa_center_point_combo") else ""
+        elif module_type == "圆弧运动":
             new_module = {
                 "type": "force_arc",
-                "name": "力控圆弧运动",
+                "name": "圆弧运动",
                 "params": {
-                    "center": [400, 0, 300],
-                    "radius": 50,
-                    "start_angle": 0,
-                    "end_angle": 90,
-                    "rotation_axis": "Z",
-                    "num_waypoints": 30,
-                    "speed": 20,
-                    "fc_axes": {"x": 0, "y": 0, "z": 0, "rx": 1, "ry": 1, "rz": 1},
-                    "correction_gain": 0.3,
-                    "deviation_pos": 100,
-                    "deviation_rot": 36,
-                    "damping_pos": 50,
-                    "damping_rot": 5,
-                    "mode": "point",
-                    "point_name": "",
-                    "center_mode": "point",
-                    "center_point_name": center_point_name
+                    "center_offset_z": 50,
+                    "sweep_angle": 90,
+                    "arc_direction": "ccw",
+                    "speed": 20
                 }
             }
         elif module_type == "力阈值移动":
@@ -82,6 +67,19 @@ class GraspFlowMixin:
                     "distance": 50.0,
                     "force_limit": 20.0,
                     "speed": 20
+                }
+            }
+        elif module_type == "相对移动":
+            new_module = {
+                "type": "relative_move",
+                "name": "相对移动",
+                "params": {
+                    "coord_system": "user",
+                    "motion_type": "linear",
+                    "offsets": [0, 0, 0, 0, 0, 0],
+                    "speed": 30,
+                    "acceleration": 20,
+                    "cp": 100
                 }
             }
         elif module_type == "关节旋转":
@@ -150,10 +148,12 @@ class GraspFlowMixin:
 
         if module_type == "直线运动":
             self.param_layout.addWidget(self.linear_params, 0, 0)
-        elif module_type == "力控圆弧":
+        elif module_type == "圆弧运动":
             self.param_layout.addWidget(self.force_arc_params, 0, 0)
         elif module_type == "力阈值移动":
             self.param_layout.addWidget(self.force_guard_params, 0, 0)
+        elif module_type == "相对移动":
+            self.param_layout.addWidget(self.relative_move_params, 0, 0)
         elif module_type == "关节旋转":
             self.param_layout.addWidget(self.joint_rotation_params, 0, 0)
         elif module_type == "夹爪开合":
@@ -184,39 +184,33 @@ class GraspFlowMixin:
             current_module["params"]["point_name"] = self.linear_point_combo.currentText()
             current_module["params"]["speed"] = int(self.linear_speed.value())
             QMessageBox.information(self, "成功", "直线运动参数已更新")
-        elif module_type == "力控圆弧" and current_module["type"] == "force_arc":
-            center_point_name = self.fa_center_point_combo.currentText()
-            if not center_point_name:
-                QMessageBox.warning(self, "警告", "请选择已有点位作为圆心")
-                return
-            current_module["params"]["mode"] = "point"
-            current_module["params"]["point_name"] = ""
-            current_module["params"]["center_mode"] = "point"
-            current_module["params"]["center_point_name"] = center_point_name
-            current_module["params"]["radius"] = self.fa_radius.value()
-            current_module["params"]["start_angle"] = self.fa_start_angle.value()
-            current_module["params"]["end_angle"] = self.fa_end_angle.value()
-            current_module["params"]["rotation_axis"] = self.fa_rotation_axis.currentText()
-            current_module["params"]["num_waypoints"] = int(self.fa_num_waypoints.value())
+        elif module_type == "圆弧运动" and current_module["type"] == "force_arc":
+            current_module["params"]["center_offset_z"] = self.fa_center_offset_z.value()
+            current_module["params"]["sweep_angle"] = self.fa_sweep_angle.value()
+            current_module["params"]["arc_direction"] = "cw" if self.fa_arc_direction.currentText() == "顺时针" else "ccw"
             current_module["params"]["speed"] = int(self.fa_speed.value())
-            current_module["params"]["fc_axes"] = {
-                "x": 0, "y": 0, "z": 0,
-                "rx": 1 if self.fa_fc_rx.currentText() == "开启" else 0,
-                "ry": 1 if self.fa_fc_ry.currentText() == "开启" else 0,
-                "rz": 1 if self.fa_fc_rz.currentText() == "开启" else 0
-            }
-            current_module["params"]["correction_gain"] = self.fa_correction_gain.value()
-            current_module["params"]["deviation_pos"] = self.fa_deviation_pos.value()
-            current_module["params"]["deviation_rot"] = self.fa_deviation_rot.value()
-            current_module["params"]["damping_pos"] = self.fa_damping_pos.value()
-            current_module["params"]["damping_rot"] = self.fa_damping_rot.value()
-            QMessageBox.information(self, "成功", "力控圆弧参数已更新")
+            for legacy_key in (
+                "fc_axes", "correction_gain", "deviation_pos", "deviation_rot",
+                "damping_pos", "damping_rot", "num_waypoints",
+            ):
+                current_module["params"].pop(legacy_key, None)
+            QMessageBox.information(self, "成功", "圆弧运动参数已更新")
         elif module_type == "力阈值移动" and current_module["type"] == "force_guard_move":
             current_module["params"]["axis"] = self.fg_axis_combo.currentText()
             current_module["params"]["distance"] = self.fg_distance.value()
             current_module["params"]["force_limit"] = self.fg_force_limit.value()
             current_module["params"]["speed"] = int(self.fg_speed.value())
             QMessageBox.information(self, "成功", "力阈值移动参数已更新")
+        elif module_type == "相对移动" and current_module["type"] == "relative_move":
+            coord_map = {"用户": "user", "工具": "tool", "关节": "joint"}
+            motion_map = {"直线": "linear", "关节": "joint"}
+            current_module["params"]["coord_system"] = coord_map.get(self.rel_coord_combo.currentText(), "user")
+            current_module["params"]["motion_type"] = motion_map.get(self.rel_motion_combo.currentText(), "linear")
+            current_module["params"]["offsets"] = [self.rel_offsets[i].value() for i in range(6)]
+            current_module["params"]["speed"] = int(self.rel_speed.value())
+            current_module["params"]["acceleration"] = int(self.rel_accel.value())
+            current_module["params"]["cp"] = int(self.rel_cp.value())
+            QMessageBox.information(self, "成功", "相对移动参数已更新")
         elif module_type == "关节旋转" and current_module["type"] == "joint_move":
             current_module["params"]["offsets"] = [self.joint_offsets[i].value() for i in range(6)]
             current_module["params"]["acceleration"] = int(self.joint_accel.value())
@@ -250,8 +244,9 @@ class GraspFlowMixin:
             module_type_text = {
                 "camera": "相机识别",
                 "move": "直线运动",
-                "force_arc": "力控圆弧",
+                "force_arc": "圆弧运动",
                 "force_guard_move": "力阈值移动",
+                "relative_move": "相对移动",
                 "joint_move": "关节旋转",
                 "visual_servo": "视觉伺服",
             }.get(module.get("type"))
@@ -271,10 +266,16 @@ class GraspFlowMixin:
                     self.linear_point_combo.setCurrentIndex(idx)
                 self.linear_speed.setValue(module["params"].get("speed", 30))
             elif module["type"] == "force_arc":
-                center_point_name = module["params"].get("center_point_name", "")
-                idx = self.fa_center_point_combo.findText(center_point_name)
+                p = module.get("params", {})
+                self.fa_center_offset_z.setValue(float(p.get("center_offset_z", p.get("radius", 50))))
+                self.fa_sweep_angle.setValue(float(p.get("sweep_angle", abs(float(p.get("end_angle", 90)) - float(p.get("start_angle", 0))))))
+                direction = p.get("arc_direction")
+                if direction is None:
+                    direction = "cw" if float(p.get("end_angle", 90)) < float(p.get("start_angle", 0)) else "ccw"
+                idx = self.fa_arc_direction.findText("顺时针" if direction == "cw" else "逆时针")
                 if idx >= 0:
-                    self.fa_center_point_combo.setCurrentIndex(idx)
+                    self.fa_arc_direction.setCurrentIndex(idx)
+                self.fa_speed.setValue(float(p.get("speed", 20)))
             elif module["type"] == "force_guard_move":
                 p = module.get("params", {})
                 idx = self.fg_axis_combo.findText(p.get("axis", "Z"))
@@ -283,25 +284,49 @@ class GraspFlowMixin:
                 self.fg_distance.setValue(float(p.get("distance", 50.0)))
                 self.fg_force_limit.setValue(float(p.get("force_limit", 20.0)))
                 self.fg_speed.setValue(float(p.get("speed", 20)))
+            elif module["type"] == "relative_move":
+                p = module.get("params", {})
+                coord_text = {"user": "用户", "tool": "工具", "joint": "关节"}.get(p.get("coord_system", "user"), "用户")
+                motion_text = {"linear": "直线", "joint": "关节"}.get(p.get("motion_type", "linear"), "直线")
+                idx = self.rel_coord_combo.findText(coord_text)
+                if idx >= 0:
+                    self.rel_coord_combo.setCurrentIndex(idx)
+                idx = self.rel_motion_combo.findText(motion_text)
+                if idx >= 0:
+                    self.rel_motion_combo.setCurrentIndex(idx)
+                offsets = p.get("offsets", [0, 0, 0, 0, 0, 0])
+                for i, spin in enumerate(self.rel_offsets):
+                    spin.setValue(float(offsets[i] if i < len(offsets) else 0))
+                self.rel_speed.setValue(float(p.get("speed", 30)))
+                self.rel_accel.setValue(float(p.get("acceleration", 20)))
+                self.rel_cp.setValue(float(p.get("cp", 100)))
 
     def save_grasp_flow(self):
         if not self.grasp_flow_modules:
             QMessageBox.warning(self, "警告", "抓取流程为空，无法保存")
             return
 
-        _module_dir = os.path.dirname(os.path.abspath(__file__))
-        file_path = os.path.join(_module_dir, "grasp_flow_modules.json")
+        for module in self.grasp_flow_modules:
+            if module.get("type") == "force_arc":
+                params = module.setdefault("params", {})
+                for legacy_key in (
+                    "fc_axes", "correction_gain", "deviation_pos", "deviation_rot",
+                    "damping_pos", "damping_rot", "num_waypoints",
+                ):
+                    params.pop(legacy_key, None)
+
+        file_path = get_grasp_flow_file()
 
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(self.grasp_flow_modules, f, indent=2)
+            self.view_current_grasp_flow()
             QMessageBox.information(self, "成功", f"抓取流程已保存到: {file_path}")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存抓取流程时出错: {e}")
 
     def load_grasp_flow(self):
-        _module_dir = os.path.dirname(os.path.abspath(__file__))
-        file_path = os.path.join(_module_dir, "grasp_flow_modules.json")
+        file_path = get_grasp_flow_file()
 
         if not os.path.exists(file_path):
             QMessageBox.warning(self, "警告", f"文件不存在: {file_path}")
@@ -337,6 +362,10 @@ class GraspFlowMixin:
 
     def _on_flow_log(self, msg):
         self.statusBar().showMessage(msg)
+        if "❌" in msg or "失败" in msg or "报警" in msg:
+            self.controller.record_alarm("流程执行", "", "报警", msg)
+            if hasattr(self, "_refresh_alarm_table"):
+                self._refresh_alarm_table()
 
     def _on_flow_module_progress(self, current, total, name):
         self.statusBar().showMessage(f"执行模块 {current}/{total}: {name}")
@@ -361,6 +390,9 @@ class GraspFlowMixin:
         if success:
             QMessageBox.information(self, "成功", "抓取流程执行完成")
         else:
+            self.controller.record_alarm("流程执行", "", "故障", "抓取流程执行失败", "查看状态栏和流程步骤，确认失败模块")
+            if hasattr(self, "_refresh_alarm_table"):
+                self._refresh_alarm_table()
             QMessageBox.warning(self, "失败", "抓取流程执行失败，请检查状态栏信息")
 
     def _on_steps_reordered(self, modules):

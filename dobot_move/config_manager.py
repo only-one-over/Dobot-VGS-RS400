@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(_MODULE_DIR, "config.json")
+GRASP_FLOW_FILE = os.path.join(_MODULE_DIR, "gui_mixins", "grasp_flow_modules.json")
 _config_cache = None
 _cache_valid = False
 
@@ -63,6 +64,10 @@ def set_photo_position(position):
     config = load_config()
     config['photo_position'] = position
     return save_config(config)
+
+
+def get_grasp_flow_file():
+    return GRASP_FLOW_FILE
 
 
 def get_robot_ip():
@@ -180,6 +185,13 @@ def get_camera_handeye_matrix(camera_type="D435i"):
 
 
 _DEFAULT_POINTS = {
+    "initial_point": {
+        "coords": [250, -150, 300, 0, 0, -68],
+        "is_relative": False,
+        "relative_to": None,
+        "offset": [0, 0, 0, 0, 0, 0],
+        "is_default": True,
+    },
     "d435i": {
         "coords": [0, 0, 0, 0, 0, 0],
         "is_relative": False,
@@ -201,12 +213,22 @@ def get_points():
     config = load_config()
     points = config.get("points", None)
     if points is None:
-        config["points"] = dict(_DEFAULT_POINTS)
+        config["points"] = {name: dict(data) for name, data in _DEFAULT_POINTS.items()}
+        config["points"]["initial_point"]["coords"] = list(
+            config.get("photo_position", _DEFAULT_POINTS["initial_point"]["coords"])
+        )
         save_config(config)
         points = config["points"]
+    changed = False
     for name, default_data in _DEFAULT_POINTS.items():
         if name not in points:
             points[name] = dict(default_data)
+            if name == "initial_point":
+                points[name]["coords"] = list(config.get("photo_position", default_data["coords"]))
+            changed = True
+    if changed:
+        config["points"] = points
+        save_config(config)
     return points
 
 
@@ -276,12 +298,19 @@ def resolve_point(name, visited=None):
     return resolved
 
 
+def get_initial_point():
+    pose = resolve_point("initial_point")
+    if pose and len(pose) >= 6:
+        return pose[:6]
+    return list(get_photo_position())
+
+
 class ConfigService:
     """Debounced config write service for UI layer."""
     _instance = None
 
     def __init__(self):
-        from PyQt6.QtCore import QTimer
+        from qt_compat import QTimer
         self._pending = {}
         self._timer = QTimer()
         self._timer.setSingleShot(True)

@@ -1,5 +1,4 @@
-from PyQt6.QtGui import QPixmap
-from PyQt6.QtWidgets import QMessageBox
+from qt_compat import QMessageBox, QPixmap
 
 from ui_theme import apply_status_visual
 

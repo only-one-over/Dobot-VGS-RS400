@@ -2,9 +2,21 @@
 # -*- coding: utf-8 -*-
 """Flow step list widget with drag-and-drop reordering and status icons."""
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame
-from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QByteArray
-from PyQt6.QtGui import QDrag, QPixmap, QPainter, QColor
+from qt_compat import (
+    QByteArray,
+    QColor,
+    QDrag,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMimeData,
+    QPainter,
+    QPixmap,
+    Qt,
+    QVBoxLayout,
+    QWidget,
+    pyqtSignal,
+)
 
 from ui_theme import FLOW_STEP_STYLE, FLOW_STEP_SELECTED_STYLE, FLOW_STEP_EMPTY_STYLE
 
@@ -17,10 +29,10 @@ STATUS_FAILED = "failed"
 
 # Status display config
 _STATUS_CONFIG = {
-    STATUS_PENDING:   {"icon": "⏳", "color": "#475569", "bg": "#f8fafc", "border": "#cbd5e1"},
-    STATUS_RUNNING:   {"icon": "▶", "color": "#1e40af", "bg": "#dbeafe", "border": "#60a5fa"},
-    STATUS_COMPLETED: {"icon": "✓", "color": "#166534", "bg": "#dcfce7", "border": "#86efac"},
-    STATUS_FAILED:    {"icon": "✗", "color": "#991b1b", "bg": "#fee2e2", "border": "#fca5a5"},
+    STATUS_PENDING:   {"icon": "⏳", "color": "#94a3b8", "bg": "#1e293b", "border": "#475569"},
+    STATUS_RUNNING:   {"icon": "▶", "color": "#93c5fd", "bg": "#1e3a8a", "border": "#3b82f6"},
+    STATUS_COMPLETED: {"icon": "✓", "color": "#86efac", "bg": "#064e3b", "border": "#22c55e"},
+    STATUS_FAILED:    {"icon": "✗", "color": "#fca5a5", "bg": "#450a0a", "border": "#ef4444"},
 }
 
 _MIME_TYPE = "application/x-flow-step-index"
@@ -141,7 +153,7 @@ class FlowStepList(QWidget):
 
         self.setAcceptDrops(True)
         self.setObjectName("flow_step_list")
-        self.setStyleSheet("#flow_step_list { border: 1px solid #42a5f5; border-radius: 6px; }")
+        self.setStyleSheet("#flow_step_list { border: 1px solid #334155; border-radius: 6px; }")
 
     def set_steps(self, modules: list[dict]):
         """Set the step list from module definitions."""
@@ -195,13 +207,18 @@ class FlowStepList(QWidget):
                 text += f" (直线运动, 点位: {point_name}, 速度: {module['params']['speed']}%)"
         elif module['type'] == "force_arc":
             p = module['params']
-            if p.get('center_mode') == 'point':
-                text += f" (力控圆弧, 圆心点位: {p.get('center_point_name', '')}, 半径: {p['radius']}mm, {p['start_angle']}°→{p['end_angle']}°, 轴: {p['rotation_axis']}, 增益: {p['correction_gain']})"
-                return text
-            text += f" (力控圆弧, 圆心: {p['center']}, 半径: {p['radius']}mm, {p['start_angle']}°→{p['end_angle']}°, 轴: {p['rotation_axis']}, 增益: {p['correction_gain']})"
+            offset = p.get('center_offset_z', p.get('radius', 50))
+            sweep = p.get('sweep_angle', abs(float(p.get('end_angle', 90)) - float(p.get('start_angle', 0))))
+            direction = "顺时针" if p.get('arc_direction') == 'cw' else "逆时针"
+            text += f" (圆弧运动, 上方距离: {offset}mm, 角度: {sweep}°, 方向: {direction})"
         elif module['type'] == "force_guard_move":
             p = module['params']
             text += f" (力阈值移动, 方向: {p.get('axis', 'Z')}, 距离: {p.get('distance', 0)}mm, 力上限: {p.get('force_limit', 0)}N, 速度: {p.get('speed', 20)}%)"
+        elif module['type'] == "relative_move":
+            p = module['params']
+            coord = {"user": "用户", "tool": "工具", "joint": "关节"}.get(p.get("coord_system", "user"), "用户")
+            motion = {"linear": "直线", "joint": "关节"}.get(p.get("motion_type", "linear"), "直线")
+            text += f" (相对移动, 坐标系: {coord}, 方式: {motion}, 偏移: {p.get('offsets', [0]*6)}, 速度: {p.get('speed', 30)}%)"
         elif module['type'] == "joint_move":
             offsets = module['params'].get('offsets', [0]*6)
             text += f" (关节旋转, 偏移: {offsets}, 速度: {module['params']['speed']}%)"

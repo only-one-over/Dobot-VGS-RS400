@@ -1,13 +1,8 @@
 import math
 
-from PyQt6.QtCore import QTimer
-from PyQt6.QtWidgets import QMessageBox
+from qt_compat import QMessageBox, QTimer
 
-from config_manager import (
-    set_photo_position as config_set_photo_position,
-    set_robot_ip as config_set_robot_ip,
-    ConfigService,
-)
+from config_manager import ConfigService
 from workers import MonitorThread, RobotCmdThread
 
 
@@ -39,15 +34,7 @@ class RobotControlMixin:
         if not self.controller.is_connected:
             QMessageBox.warning(self, "提示", "请先连接机器人")
             return
-        self.statusBar().showMessage("正在清除故障...")
-        try:
-            result = self.controller.clear_error()
-            if result:
-                self.statusBar().showMessage("✅ 故障已清除，机器人已重新使能")
-            else:
-                self.statusBar().showMessage("❌ 清除故障失败，请检查机器人状态")
-        except Exception as e:
-            self.statusBar().showMessage(f"❌ 清除故障出错: {e}")
+        self._run_cmd_thread("清除故障", self.controller.clear_error)
 
     def on_pause(self):
         if not self._flow_running:
@@ -126,51 +113,11 @@ class RobotControlMixin:
             QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
             return
 
-        current_pose = self.controller.get_current_pose()
+        current_pose = self.controller.get_current_pose_fast()
         if current_pose:
-            reply = QMessageBox.question(
-                self, "当前位置",
-                f"当前位置:\n{current_pose}\n\n是否将此位置设为拍照位置？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                self._fill_photo_position_inputs(current_pose)
+            QMessageBox.information(self, "当前位置", f"当前位置:\n{current_pose}")
         else:
             QMessageBox.critical(self, "错误", "获取位置失败")
-
-    def _fill_photo_position_inputs(self, pose):
-        for i, input_box in enumerate(self.photo_position_inputs):
-            if i < len(pose):
-                input_box.setValue(pose[i])
-
-    def _get_photo_from_current(self):
-        if not self.controller.is_connected:
-            QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
-            return
-        current_pose = self.controller.get_current_pose()
-        if current_pose:
-            self._fill_photo_position_inputs(current_pose)
-            QMessageBox.information(self, "成功", f"已将当前位置填入拍照位置:\n{current_pose}")
-        else:
-            QMessageBox.critical(self, "错误", "获取位置失败")
-
-    def set_photo_position(self):
-        try:
-            new_position = [float(input_box.value()) for input_box in self.photo_position_inputs]
-
-            reply = QMessageBox.question(
-                self, "确认", f"新的拍照位置: {new_position}\n确认修改？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes
-            )
-
-            if reply == QMessageBox.StandardButton.Yes:
-                self.controller.initial_pose = new_position
-                ConfigService.instance().set('photo_position', new_position)
-                self.photo_position_label.setText(f"拍照位置: {new_position}")
-                QMessageBox.information(self, "成功", "拍照位置已成功修改并保存")
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"修改拍照位置时出错: {e}")
 
     def update_battery_data(self, data):
         self.battery_label.setText(f"电池: {data['soc']}% | {data['voltage']:.1f}V | {data['current']:.1f}A | {data['status']}")

@@ -4,8 +4,7 @@
 import logging
 import time
 import numpy as np
-from PyQt6.QtCore import QThread, pyqtSignal
-from PyQt6.QtGui import QImage
+from qt_compat import QImage, QThread, pyqtSignal
 from config_manager import get_point, set_point, resolve_point
 from force_arc_controller import ForceArcController
 from visual_servo_controller import VisualServoController
@@ -118,30 +117,15 @@ class FlowThread(QThread):
                     self.msleep(100)
                 name = module.get("name", f"模块{i+1}")
                 self.flow_module_progress.emit(i + 1, total, name)
-                try:
-                    if hasattr(self.controller, 'dashboard') and self.controller.dashboard:
-                        mode = self.controller.dashboard.RobotMode()
-                        mode_val = int(str(mode)) if mode is not None else -1
-                        if mode_val == 9:
-                            self.flow_log.emit("⚠️ 检测到报警，自动清除...")
-                            self.controller.clear_error()
-                            time.sleep(0.5)
-                except Exception:
-                    pass
                 if module['type'] == "move":
                     if module['params']['target'] == "initial_position":
-                        if not self.controller.move_to_initial_position():
+                        if not self.controller.move_to_initial_position(verify_start_pose=False, verify_end_pose=False, wait_poll_interval=0.1):
                             self.flow_log.emit(f"❌ 模块{i+1}运动失败: 移动到初始位置失败")
                             self.flow_finished.emit(False)
                             return
                     elif module['params']['target'] == "camera_detected":
                         if base_coords is None:
                             self.flow_log.emit("❌ 相机未识别到物体坐标，请确保流程中先有相机识别步骤")
-                            self.flow_finished.emit(False)
-                            return
-                        current_pose = self.controller.get_current_pose()
-                        if not current_pose:
-                            self.flow_log.emit("❌ 无法获取当前机器人位姿")
                             self.flow_finished.emit(False)
                             return
                         if module['params']['motion_type'] == "MovL":
@@ -158,7 +142,10 @@ class FlowThread(QThread):
                             success = self.controller.move_to_point(
                                 resolved,
                                 move_type="MovL",
-                                speed_percentage=module['params']['speed']
+                                speed_percentage=module['params']['speed'],
+                                verify_start_pose=False,
+                                verify_end_pose=False,
+                                wait_poll_interval=0.1,
                             )
                             if not success:
                                 self.flow_log.emit(f"❌ 模块{i+1}直线运动失败")
@@ -166,49 +153,73 @@ class FlowThread(QThread):
                                 return
                 elif module['type'] == "force_arc":
                     if not self.controller.is_connected:
-                        self.flow_log.emit("❌ 机器人未连接，无法执行力控圆弧")
+                        self.flow_log.emit("❌ 机器人未连接，无法执行圆弧运动")
+                        self.flow_finished.emit(False)
+                        return
+                    if not self.controller.is_enabled:
+                        self.flow_log.emit("❌ 机器人未使能，无法执行圆弧运动")
                         self.flow_finished.emit(False)
                         return
                     try:
                         p = dict(module['params'])
-                        center_point_name = module['params'].get('center_point_name')
-                        if not center_point_name:
-                            self.flow_log.emit(f"❌ 模块{i+1}力控圆弧未指定圆心点位")
+                        current_pose = self.controller.get_current_pose_fast()
+                        if not current_pose or len(current_pose) < 6:
+                            self.flow_log.emit("❌ 无法获取当前机器人位姿，无法生成圆弧")
                             self.flow_finished.emit(False)
                             return
-                        center_resolved = resolve_point(center_point_name)
-                        if center_resolved is None:
-                            self.flow_log.emit(f"❌ 圆心点位 '{center_point_name}' 不存在或循环引用")
+
+                        center_offset_z = float(p.get('center_offset_z', p.get('radius', 50)))
+                        sweep_angle = float(p.get('sweep_angle', abs(float(p.get('end_angle', 90)) - float(p.get('start_angle', 0)))))
+                        arc_direction = p.get('arc_direction')
+                        if arc_direction is None:
+                            arc_direction = 'cw' if float(p.get('end_angle', 90)) < float(p.get('start_angle', 0)) else 'ccw'
+                        if center_offset_z <= 0 or sweep_angle <= 0:
+                            self.flow_log.emit(f"❌ 模块{i+1}圆弧距离和角度必须大于0")
                             self.flow_finished.emit(False)
                             return
-                        p['center'] = center_resolved[:3]
+
+                        center = [
+                            float(current_pose[0]),
+                            float(current_pose[1]),
+                            float(current_pose[2]) + center_offset_z,
+                        ]
+                        start_angle = -90.0
+                        end_angle = start_angle - sweep_angle if arc_direction == 'cw' else start_angle + sweep_angle
+                        base_orientation = [float(v) for v in current_pose[3:6]]
+                        rx_delta = -sweep_angle if arc_direction == 'cw' else sweep_angle
+                        orientation = [
+                            [base_orientation[0], base_orientation[1], base_orientation[2]],
+                            [base_orientation[0] + rx_delta / 2.0, base_orientation[1], base_orientation[2]],
+                            [base_orientation[0] + rx_delta, base_orientation[1], base_orientation[2]],
+                        ]
+                        direction_text = "顺时针" if arc_direction == 'cw' else "逆时针"
+                        self.flow_log.emit(
+                            f"↪️ 圆弧运动: 当前点={current_pose[:3]}, 圆心={center}, "
+                            f"距离={center_offset_z:.1f}mm, 角度={sweep_angle:.1f}°, "
+                            f"方向={direction_text}, Rx={base_orientation[0]:.1f}->{orientation[-1][0]:.1f}"
+                        )
                         fa_ctrl = ForceArcController()
                         fa_ctrl.set_dashboard(self.controller.dashboard)
-                        fa_ctrl.configure_force_control(
-                            deviation_pos=p['deviation_pos'],
-                            deviation_rot=p['deviation_rot'],
-                            controltype=1,
-                            damping={
-                                'x': p['damping_pos'], 'y': p['damping_pos'], 'z': p['damping_pos'],
-                                'rx': p['damping_rot'], 'ry': p['damping_rot'], 'rz': p['damping_rot']
-                            }
-                        )
                         fa_ctrl.configure_arc(
-                            center=p['center'],
-                            radius=p['radius'],
-                            start_angle=p['start_angle'],
-                            end_angle=p['end_angle'],
-                            rotation_axis=p['rotation_axis'],
-                            num_waypoints=p['num_waypoints'],
-                            speed_factor=p['speed']
+                            center=center,
+                            radius=center_offset_z,
+                            start_angle=start_angle,
+                            end_angle=end_angle,
+                            rotation_axis='X',
+                            num_waypoints=3,
+                            orientation=orientation,
+                            speed_factor=p.get('speed', 20)
                         )
-                        fa_ctrl.execute(
-                            fc_axes=p['fc_axes'],
-                            correction_gain=p['correction_gain']
-                        )
-                        self.flow_log.emit(f"✅ 模块{i+1}力控圆弧运动完成")
+                        fa_ctrl.execute()
+                        arc_length = abs(center_offset_z * np.deg2rad(sweep_angle))
+                        timeout = min(max(arc_length / 20.0 + 5.0, 5.0), 60.0)
+                        if not self.controller.wait_for_motion_completion(timeout=timeout, poll_interval=0.1):
+                            self.flow_log.emit(f"❌ 模块{i+1}圆弧运动等待完成失败")
+                            self.flow_finished.emit(False)
+                            return
+                        self.flow_log.emit(f"✅ 模块{i+1}圆弧运动完成")
                     except Exception as e:
-                        self.flow_log.emit(f"❌ 模块{i+1}力控圆弧运动失败: {e}")
+                        self.flow_log.emit(f"❌ 模块{i+1}圆弧运动失败: {e}")
                         self.flow_finished.emit(False)
                         return
                 elif module['type'] == "force_guard_move":
@@ -236,6 +247,40 @@ class FlowThread(QThread):
                         self.flow_finished.emit(False)
                         return
                     self.flow_log.emit(f"✅ 模块{i+1}力阈值移动完成")
+                elif module['type'] == "relative_move":
+                    if not self.controller.is_connected:
+                        self.flow_log.emit("❌ 机器人未连接，无法执行相对移动")
+                        self.flow_finished.emit(False)
+                        return
+                    if not self.controller.is_enabled:
+                        self.flow_log.emit("❌ 机器人未使能，无法执行相对移动")
+                        self.flow_finished.emit(False)
+                        return
+                    p = module.get('params', {})
+                    offsets = p.get('offsets', [0, 0, 0, 0, 0, 0])
+                    coord_system = p.get('coord_system', 'user')
+                    motion_type = p.get('motion_type', 'linear')
+                    speed = int(p.get('speed', 30))
+                    acceleration = int(p.get('acceleration', 20))
+                    cp = int(p.get('cp', 100))
+                    self.flow_log.emit(
+                        f"➡️ 相对移动: 坐标系={coord_system}, 方式={motion_type}, "
+                        f"偏移={offsets}, 速度={speed}%"
+                    )
+                    success = self.controller.move_relative(
+                        offsets=offsets,
+                        coord_system=coord_system,
+                        motion_type=motion_type,
+                        speed=speed,
+                        acceleration=acceleration,
+                        cp=cp,
+                        wait_poll_interval=0.1,
+                    )
+                    if not success:
+                        self.flow_log.emit(f"❌ 模块{i+1}相对移动失败")
+                        self.flow_finished.emit(False)
+                        return
+                    self.flow_log.emit(f"✅ 模块{i+1}相对移动完成")
                 elif module['type'] == "camera":
                     camera_type = module['params'].get('camera_type', 'D435i')
                     if camera_type == "D405":
@@ -285,7 +330,7 @@ class FlowThread(QThread):
                     self.flow_log.emit(f"✅ 最终结果: 置信度={best_confidence:.2f}")
 
                     end_coords = vision_to_use.convert_to_end_coords(object_position['camera_coords'])
-                    current_pose = self.controller.get_current_pose()
+                    current_pose = self.controller.get_current_pose_fast()
                     if not current_pose:
                         self.flow_log.emit("❌ 无法获取当前机器人位姿")
                         self.flow_finished.emit(False)
@@ -336,7 +381,9 @@ class FlowThread(QThread):
                     success = self.controller.move_joint_relative(
                         offsets,
                         a=acceleration,
-                        v=speed
+                        v=speed,
+                        verify_end_pose=False,
+                        wait_poll_interval=0.1,
                     )
                     if not success:
                         self.flow_log.emit(f"❌ 模块{i+1}关节旋转运动失败")
@@ -465,7 +512,7 @@ class CameraTestWorker(QThread):
                     if self.controller.is_connected and len(cam_coords) >= 3:
                         end_coords = self.vision.convert_to_end_coords(cam_coords)
                         result['end_coords'] = end_coords
-                        current_pose = self.controller.get_current_pose()
+                        current_pose = self.controller.get_current_pose_fast()
                         if current_pose:
                             base_coords = self.vision.convert_to_base_coords(end_coords, current_pose)
                             result['base_coords'] = base_coords
@@ -562,7 +609,7 @@ class D435iLowFpsWorker(QThread):
                     if self.controller.is_connected and len(cam_coords) >= 3:
                         end_coords = self.vision.convert_to_end_coords(cam_coords)
                         result['end_coords'] = end_coords
-                        current_pose = self.controller.get_current_pose()
+                        current_pose = self.controller.get_current_pose_fast()
                         if current_pose:
                             base_coords = self.vision.convert_to_base_coords(end_coords, current_pose)
                             result['base_coords'] = base_coords

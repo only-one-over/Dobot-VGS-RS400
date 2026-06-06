@@ -74,7 +74,7 @@ class VisualServoController:
                 continue
 
             end_coords = self.vision.convert_to_end_coords(object_position['camera_coords'])
-            current_pose = self.controller.get_current_pose()
+            current_pose = self.controller.get_current_pose_fast()
             if not current_pose:
                 if log_callback:
                     log_callback(f"🔄 迭代{i+1}: 无法获取位姿")

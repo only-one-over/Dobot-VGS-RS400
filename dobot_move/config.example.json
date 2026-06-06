@@ -1,0 +1,19 @@
+{
+  "photo_position": [0, 0, 0, 0, 0, 0],
+  "target_offset": [0, 0, 0],
+  "calibration": {
+    "D435i": {
+      "tool_base_calib_pose": [0, 0, 0, 0, 0, 0],
+      "cam_base_calib_pose": [0, 0, 0, 0, 0, 0]
+    },
+    "D405": {
+      "tool_base_calib_pose": [0, 0, 0, 0, 0, 0],
+      "cam_base_calib_pose": [0, 0, 0, 0, 0, 0]
+    }
+  },
+  "points": {},
+  "robot_ip": "192.168.5.1",
+  "modbus_port": 502,
+  "cart_ip": "192.168.5.2",
+  "cart_port": 502
+}

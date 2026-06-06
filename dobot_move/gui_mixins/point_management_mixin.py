@@ -1,11 +1,11 @@
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import (
+from qt_compat import (
+    Qt,
     QMessageBox, QInputDialog, QDoubleSpinBox, QCheckBox,
     QComboBox, QTableWidgetItem, QHBoxLayout, QWidget,
 )
 
 from config_manager import (
-    get_points, get_point, set_point, add_point, delete_point, resolve_point,
+    get_points, get_point, add_point, delete_point, resolve_point,
     ConfigService,
 )
 
@@ -14,10 +14,24 @@ class PointManagementMixin:
 
     def _get_point_combo_names(self):
         names = list(get_points().keys())
-        for default_name in ("d435i", "d405", "current_pos"):
+        for default_name in ("initial_point", "d435i", "d405", "current_pos"):
             if default_name not in names:
                 names.append(default_name)
         return names
+
+    def _set_point_edit_buttons(self, editing):
+        if hasattr(self, "edit_point_btn"):
+            self.edit_point_btn.setEnabled(not editing)
+        if hasattr(self, "save_point_btn"):
+            self.save_point_btn.setEnabled(editing)
+        if hasattr(self, "cancel_point_btn"):
+            self.cancel_point_btn.setEnabled(editing)
+        if hasattr(self, "read_point_btn"):
+            self.read_point_btn.setEnabled(editing)
+        if hasattr(self, "add_point_btn"):
+            self.add_point_btn.setEnabled(not editing)
+        if hasattr(self, "delete_point_btn"):
+            self.delete_point_btn.setEnabled(not editing)
 
     def _on_add_point(self):
         name, ok = QInputDialog.getText(self, "添加点位", "点位名称:")
@@ -49,186 +63,128 @@ class PointManagementMixin:
         self.points_table.blockSignals(True)
         points = get_points()
         table = self.points_table
-        old_row_count = table.rowCount()
-        new_row_count = len(points)
-
-        if old_row_count != new_row_count:
-            table.setRowCount(new_row_count)
+        table.setRowCount(len(points))
 
         for row, (name, data) in enumerate(points.items()):
             table.setRowHeight(row, 56)
-            coords = data.get("coords", [0]*6)
-            is_relative = data.get("is_relative", False)
+            coords = list(data.get("coords", [0] * 6))
+            is_relative = bool(data.get("is_relative", False))
             relative_to = data.get("relative_to", None)
-            is_default = data.get("is_default", False)
-
-            if row < old_row_count:
-                existing_name_item = table.item(row, 0)
-                existing_name = existing_name_item.text() if existing_name_item else None
-
-                if existing_name == name and not is_default and table.cellWidget(row, 1) is not None:
-                    x_spin = table.cellWidget(row, 1)
-                    y_spin = table.cellWidget(row, 2)
-                    z_spin = table.cellWidget(row, 3)
-                    rx_spin = table.cellWidget(row, 4)
-                    ry_spin = table.cellWidget(row, 5)
-                    rz_spin = table.cellWidget(row, 6)
-                    if all([x_spin, y_spin, z_spin, rx_spin, ry_spin, rz_spin]):
-                        x_spin.blockSignals(True)
-                        y_spin.blockSignals(True)
-                        z_spin.blockSignals(True)
-                        rx_spin.blockSignals(True)
-                        ry_spin.blockSignals(True)
-                        rz_spin.blockSignals(True)
-                        x_spin.setValue(coords[0])
-                        y_spin.setValue(coords[1])
-                        z_spin.setValue(coords[2])
-                        rx_spin.setValue(coords[3])
-                        ry_spin.setValue(coords[4])
-                        rz_spin.setValue(coords[5])
-                        x_spin.blockSignals(False)
-                        y_spin.blockSignals(False)
-                        z_spin.blockSignals(False)
-                        rx_spin.blockSignals(False)
-                        ry_spin.blockSignals(False)
-                        rz_spin.blockSignals(False)
-
-                        cb_widget = table.cellWidget(row, 7)
-                        if cb_widget:
-                            cb = cb_widget.findChild(QCheckBox)
-                            if cb:
-                                cb.blockSignals(True)
-                                cb.setChecked(is_relative)
-                                cb.blockSignals(False)
-
-                        combo = table.cellWidget(row, 8)
-                        if isinstance(combo, QComboBox):
-                            combo.blockSignals(True)
-                            combo.clear()
-                            combo.addItem("")
-                            for other_name in self._get_point_combo_names():
-                                if other_name != name:
-                                    combo.addItem(other_name)
-                            if relative_to:
-                                idx = combo.findText(relative_to)
-                                if idx >= 0:
-                                    combo.setCurrentIndex(idx)
-                            else:
-                                combo.setCurrentIndex(0)
-                            combo.setEnabled(is_relative)
-                            combo.blockSignals(False)
-                        continue
-
-                if existing_name == name and is_default:
-                    for col_idx in range(6):
-                        value = coords[col_idx] if col_idx < len(coords) else 0
-                        existing_item = table.item(row, col_idx + 1)
-                        if existing_item:
-                            existing_item.setText(f"{value:.2f}")
-                        else:
-                            item = QTableWidgetItem(f"{value:.2f}")
-                            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                            table.setItem(row, col_idx + 1, item)
-                    continue
+            editing = row == getattr(self, "_editing_point_row", -1)
 
             name_item = QTableWidgetItem(name)
-            if is_default:
-                name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             table.setItem(row, 0, name_item)
 
             for col_idx in range(6):
-                value = coords[col_idx] if col_idx < len(coords) else 0
-                if is_default:
-                    item = QTableWidgetItem(f"{value:.2f}")
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    table.setItem(row, col_idx + 1, item)
-                else:
-                    spin = QDoubleSpinBox()
-                    spin.setRange(-9999, 9999)
-                    spin.setDecimals(2)
-                    spin.setValue(value)
-                    spin.setStyleSheet("QDoubleSpinBox { padding: 0px 2px; font-size: 12px; } QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 14px; }")
-                    table.setCellWidget(row, col_idx + 1, spin)
+                spin = QDoubleSpinBox()
+                spin.setRange(-9999, 9999)
+                spin.setDecimals(2)
+                spin.setValue(coords[col_idx] if col_idx < len(coords) else 0)
+                spin.setEnabled(editing)
+                spin.setStyleSheet(
+                    "QDoubleSpinBox { padding: 0px 2px; font-size: 12px; } "
+                    "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 14px; }"
+                )
+                table.setCellWidget(row, col_idx + 1, spin)
 
-            if not is_default:
-                cb = QCheckBox()
-                cb.setChecked(is_relative)
-                cb_widget = QWidget()
-                cb_layout = QHBoxLayout(cb_widget)
-                cb_layout.addWidget(cb)
-                cb_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                cb_layout.setContentsMargins(0, 0, 0, 0)
-                table.setCellWidget(row, 7, cb_widget)
+            cb = QCheckBox()
+            cb.setChecked(is_relative)
+            cb.setEnabled(editing)
+            cb_widget = QWidget()
+            cb_layout = QHBoxLayout(cb_widget)
+            cb_layout.addWidget(cb)
+            cb_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cb_layout.setContentsMargins(0, 0, 0, 0)
+            table.setCellWidget(row, 7, cb_widget)
 
-                combo = QComboBox()
-                combo.addItem("")
-                for other_name in self._get_point_combo_names():
-                    if other_name != name:
-                        combo.addItem(other_name)
-                if relative_to:
-                    idx = combo.findText(relative_to)
-                    if idx >= 0:
-                        combo.setCurrentIndex(idx)
-                if not is_relative:
-                    combo.setEnabled(False)
-                table.setCellWidget(row, 8, combo)
-
-                cb.toggled.connect(lambda checked, r=row, c=combo: c.setEnabled(checked))
-                combo.currentTextChanged.connect(lambda text, r=row: self._on_point_relative_to_changed(r, text))
-                cb.toggled.connect(lambda checked, r=row: self._on_point_relative_changed(r, checked))
-
-                for col_idx in range(6):
-                    spin_widget = table.cellWidget(row, col_idx + 1)
-                    if spin_widget:
-                        spin_widget.valueChanged.connect(lambda val, r=row: self._on_point_coord_changed(r))
+            combo = QComboBox()
+            combo.addItem("")
+            for other_name in self._get_point_combo_names():
+                if other_name != name:
+                    combo.addItem(other_name)
+            if relative_to:
+                idx = combo.findText(relative_to)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            combo.setEnabled(editing and is_relative)
+            cb.toggled.connect(lambda checked, c=combo: c.setEnabled(checked))
+            table.setCellWidget(row, 8, combo)
 
         self.points_table.blockSignals(False)
+        self._set_point_edit_buttons(getattr(self, "_editing_point_row", -1) >= 0)
         self._refresh_point_combos()
 
-    def _on_point_coord_changed(self, row):
+    def _on_edit_point(self):
+        row = self.points_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "警告", "请先选择要修改的点位")
+            return
         name_item = self.points_table.item(row, 0)
         if name_item is None:
             return
-        name = name_item.text()
+        self._editing_point_row = row
+        self._editing_point_name = name_item.text()
+        self.refresh_points_table()
+        self.points_table.selectRow(row)
+
+    def _on_save_point_edit(self):
+        row = getattr(self, "_editing_point_row", -1)
+        name = getattr(self, "_editing_point_name", None)
+        if row < 0 or not name:
+            return
+
         coords = []
         for col_idx in range(6):
             spin = self.points_table.cellWidget(row, col_idx + 1)
-            if spin:
-                coords.append(spin.value())
-            else:
-                coords.append(0)
-        point_data = get_point(name)
-        if point_data is None:
-            return
+            coords.append(float(spin.value()) if spin else 0.0)
+
+        cb_widget = self.points_table.cellWidget(row, 7)
+        cb = cb_widget.findChild(QCheckBox) if cb_widget else None
+        combo = self.points_table.cellWidget(row, 8)
+        point_data = get_point(name) or {}
         point_data["coords"] = coords
+        point_data["is_relative"] = bool(cb.isChecked()) if cb else False
+        relative_to = combo.currentText() if point_data["is_relative"] and combo else ""
+        point_data["relative_to"] = relative_to or None
+        point_data.setdefault("offset", [0, 0, 0, 0, 0, 0])
+        point_data.setdefault("is_default", False)
         ConfigService.instance().set_point(name, point_data)
 
-    def _on_point_relative_changed(self, row, checked):
-        name_item = self.points_table.item(row, 0)
-        if name_item is None:
-            return
-        name = name_item.text()
-        point_data = get_point(name)
-        if point_data is None:
-            return
-        point_data["is_relative"] = checked
-        if not checked:
-            point_data["relative_to"] = None
-        ConfigService.instance().set_point(name, point_data)
+        if name == "initial_point":
+            resolved = resolve_point("initial_point")
+            if resolved and len(resolved) >= 6:
+                self.controller.initial_pose = resolved[:6]
+                self.update_status("photo_position", self.controller.initial_pose)
 
-    def _on_point_relative_to_changed(self, row, text):
-        name_item = self.points_table.item(row, 0)
-        if name_item is None:
+        self._editing_point_row = -1
+        self._editing_point_name = None
+        self.refresh_points_table()
+        QMessageBox.information(self, "成功", f"点位 '{name}' 已保存")
+
+    def _on_cancel_point_edit(self):
+        self._editing_point_row = -1
+        self._editing_point_name = None
+        self.refresh_points_table()
+
+    def _on_read_current_for_selected_point(self):
+        row = getattr(self, "_editing_point_row", -1)
+        if row < 0:
+            QMessageBox.warning(self, "警告", "请先点击修改点位")
             return
-        name = name_item.text()
-        point_data = get_point(name)
-        if point_data is None:
+        if not self.controller.is_connected:
+            QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
             return
-        point_data["relative_to"] = text if text else None
-        ConfigService.instance().set_point(name, point_data)
+        current_pose = self.controller.get_current_pose_fast()
+        if not current_pose or len(current_pose) < 6:
+            QMessageBox.critical(self, "错误", "获取当前点位失败")
+            return
+        for col_idx, value in enumerate(current_pose[:6]):
+            spin = self.points_table.cellWidget(row, col_idx + 1)
+            if spin:
+                spin.setValue(float(value))
 
     def _refresh_point_combos(self):
-        points = get_points()
         point_names = self._get_point_combo_names()
         if hasattr(self, 'linear_point_combo'):
             current = self.linear_point_combo.currentText()
@@ -239,15 +195,6 @@ class PointManagementMixin:
             if idx >= 0:
                 self.linear_point_combo.setCurrentIndex(idx)
             self.linear_point_combo.blockSignals(False)
-        if hasattr(self, 'fa_center_point_combo'):
-            current = self.fa_center_point_combo.currentText()
-            self.fa_center_point_combo.blockSignals(True)
-            self.fa_center_point_combo.clear()
-            self.fa_center_point_combo.addItems(point_names)
-            idx = self.fa_center_point_combo.findText(current)
-            if idx >= 0:
-                self.fa_center_point_combo.setCurrentIndex(idx)
-            self.fa_center_point_combo.blockSignals(False)
 
     def _on_linear_point_selected(self, name):
         if not name:
@@ -284,7 +231,7 @@ class PointManagementMixin:
         if not self.controller.is_connected:
             QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
             return
-        current_pose = self.controller.get_current_pose()
+        current_pose = self.controller.get_current_pose_fast()
         if current_pose and len(current_pose) >= 6:
             point_data = get_point("current_pos")
             if point_data is None:

@@ -4,11 +4,10 @@
 主功能控制面板 - 从 DobotMainWindow 的主功能选项卡中提取
 """
 
-from PyQt6.QtWidgets import (
+from qt_compat import (
     QWidget, QVBoxLayout, QGridLayout, QPushButton, QLabel, QComboBox,
-    QLineEdit,
+    QLineEdit, pyqtSignal,
 )
-from PyQt6.QtCore import pyqtSignal
 from ui_theme import apply_status_visual, set_button_role
 
 

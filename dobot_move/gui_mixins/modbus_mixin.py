@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QMessageBox, QTableWidgetItem
+from qt_compat import QMessageBox, QTableWidgetItem
 
 
 class ModbusMixin:
@@ -16,18 +16,18 @@ class ModbusMixin:
 
         result = self.controller.start_modbus(port=port)
         if result:
-            self.modbus_status_label.setText("状态: 运行中")
+            self.modbus_status_label.setText("状态: 从站运行中，等待外部主站连接")
             self.modbus_start_btn.setEnabled(False)
             self.modbus_stop_btn.setEnabled(True)
             self.modbus_port_input.setEnabled(False)
             self._modbus_refresh_timer.start(200)
             self._init_modbus_table()
         else:
-            QMessageBox.critical(self, "错误", "Modbus服务启动失败")
+            QMessageBox.critical(self, "错误", "Modbus从站服务启动失败")
 
     def stop_modbus_server(self):
         self.controller.stop_modbus()
-        self.modbus_status_label.setText("状态: 已停止")
+        self.modbus_status_label.setText("状态: 从站已停止")
         self.modbus_start_btn.setEnabled(True)
         self.modbus_stop_btn.setEnabled(False)
         self.modbus_port_input.setEnabled(True)
@@ -79,19 +79,6 @@ class ModbusMixin:
         self.modbus_duration_label.setText(f" 耗时: {stats['last_duration_ms']}ms")
         self.modbus_status_panel_label.setText(f" 状态: {'运行中' if stats['is_running'] else '停止'}")
 
-        cart = stats.get('cart_status', {})
-        if cart.get('connected'):
-            cart_status_text = "空闲" if cart.get('cart_status') == 1 else ("运行" if cart.get('cart_status') == 2 else "故障")
-            self.cart_info_label.setText(
-                f" 小车状态: {cart_status_text} | 故障码: {cart.get('fault_code', 0)}"
-                f" | 位置 X: {cart.get('x', 0)} Y: {cart.get('y', 0)} Z: {cart.get('z', 0)}"
-            )
-
-        if stats.get('client_connected'):
-            self.cart_status_label.setText(f"小车状态: 已连接 {stats.get('client_host', '')}")
-        else:
-            if not self.cart_connect_btn.isEnabled():
-                self.cart_status_label.setText("小车状态: 连接断开")
         if not self.controller.modbus_server:
             return
         reg_values = self.controller.modbus_server.get_register_values()

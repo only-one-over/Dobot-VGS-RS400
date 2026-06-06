@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QPushButton
+from qt_compat import QPushButton
 
 
 class JogMixin:

@@ -6,7 +6,7 @@ Vision-Guided System for Dobot CR Series Robots with Intel RealSense D400 Depth 
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-green.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-基于 Python + PyQt6 的越疆 CR 系列机械臂视觉定位控制系统。集成双 RealSense 深度相机（D435i + D405）、YOLO 实例分割、ByteTrack 目标跟踪、3D 卡尔曼滤波、手眼标定、视觉伺服和力控圆弧，实现从目标识别到精准定位的全自动化流程。
+基于 Python + PySide6 的越疆 CR 系列机械臂视觉定位控制系统。集成双 RealSense 深度相机（D435i + D405）、YOLO 实例分割、ByteTrack 目标跟踪、3D 卡尔曼滤波、手眼标定、视觉伺服和力控圆弧，实现从目标识别到精准定位的全自动化流程。
 
 ## Table of Contents
 
@@ -64,7 +64,7 @@ python build_cpp.py
 ### Verify Installation
 
 ```bash
-python -c "import PyQt6, numpy, cv2, pyrealsense2, onnxruntime; print('All dependencies OK')"
+python -c "import PySide6, numpy, cv2, pyrealsense2, onnxruntime; print('All dependencies OK')"
 
 # Optional: verify C++ module
 python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
@@ -74,7 +74,7 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                   GUI (PyQt6)                    │
+│                   GUI (PySide6)                    │
 │           DobotMainWindow + 7 Mixins             │
 ├─────────┬──────────┬──────────┬─────────────────┤
 │  Robot   │  Vision   │  Force   │   Modbus        │
@@ -93,7 +93,7 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 
 | Module | File | Description |
 |--------|------|-------------|
-| Main GUI | `gui_app.py` | PyQt6 main window with 7 Mixins |
+| Main GUI | `gui_app.py` | PySide6 main window with 7 Mixins |
 | Robot Controller | `robot_controller.py` | Motion control, state management |
 | Communication | `dobot_api.py` | TCP/IP Dashboard (29999) + Feedback (30004) |
 | Vision System | `vision_system.py` | YOLO inference, object detection, 3D positioning |

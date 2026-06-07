@@ -83,7 +83,7 @@ class PointManagementMixin:
                 spin.setValue(coords[col_idx] if col_idx < len(coords) else 0)
                 spin.setEnabled(editing)
                 spin.setStyleSheet(
-                    "QDoubleSpinBox { padding: 0px 2px; font-size: 12px; } "
+                    "QDoubleSpinBox { padding: 0px 2px; font-size: 12px; background: #111827; color: #e2e8f0; border: 1px solid #2a3550; border-radius: 4px; } "
                     "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 14px; }"
                 )
                 table.setCellWidget(row, col_idx + 1, spin)

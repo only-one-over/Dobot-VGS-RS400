@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 机器人抓取控制程序 - 图形界面版本
@@ -37,8 +37,7 @@ from gui_mixins import (
     JogMixin,
 )
 from visual_servo_controller import VisualServoController
-from theme import apply_theme
-from ui_theme import apply_status_visual, set_button_role
+from ui_theme import apply_theme, apply_status_visual, set_button_role, NAV_ICONS, card_style, metric_label_style, metric_title_style
 from flow_step_list import FlowStepList
 from main_control_panel import MainControlPanel
 
@@ -131,8 +130,8 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Dobot 机器人抓取控制系统")
-        self.setGeometry(100, 100, 800, 600)
+        self.setWindowTitle("Dobot VGS — 工业机器人仪表盘")
+        self.setGeometry(100, 100, 1200, 750)
         self.setMinimumSize(1100, 760)
         
         self.set_dark_theme()
@@ -179,8 +178,9 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         return scroll
 
     def _add_nav_page(self, text, widget):
-        """添加导航页：左侧按钮 + 右侧页面"""
-        btn = QPushButton(text)
+        """添加导航页：左侧图标按钮 + 右侧页面"""
+        icon_char = NAV_ICONS.get(text, "●")
+        btn = QPushButton(f"  {icon_char}  {text}")
         btn.setObjectName("sideNavButton")
         btn.setCheckable(True)
         idx = self.stacked_widget.count()
@@ -227,59 +227,142 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         
         # 主布局
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setSpacing(10)
-        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(12, 12, 12, 8)
         
-        # 状态显示区域
+        # ── 顶部状态仪表盘卡片 ──
         status_group = QGroupBox("系统状态")
         status_group.setObjectName("topStatusPanel")
-        status_layout = QGridLayout()
-        status_layout.setSpacing(10)
+        status_layout = QHBoxLayout()
+        status_layout.setSpacing(12)
+        status_layout.setContentsMargins(12, 10, 12, 10)
         
-        # 机器人状态
-        self.robot_status_label = QLabel("机器人状态: 未连接")
-        status_layout.addWidget(self.robot_status_label, 0, 0)
+        # 机器人状态卡片
+        robot_card = QFrame()
+        robot_card.setObjectName("statusCard")
+        robot_card.setStyleSheet(card_style("#3b82f6"))
+        robot_card_layout = QVBoxLayout(robot_card)
+        robot_card_layout.setSpacing(2)
+        robot_card_layout.setContentsMargins(10, 8, 10, 8)
+        robot_title = QLabel("机器人")
+        robot_title.setObjectName("cardTitle")
+        robot_title.setStyleSheet(metric_title_style())
+        self.robot_status_label = QLabel("未连接")
+        self.robot_status_label.setObjectName("cardValue")
+        self.robot_status_label.setStyleSheet(metric_label_style("#94a3b8"))
+        robot_card_layout.addWidget(robot_title)
+        robot_card_layout.addWidget(self.robot_status_label)
+        status_layout.addWidget(robot_card)
         
-        # 相机状态
-        self.camera_status_label = QLabel("相机状态: 未连接")
-        status_layout.addWidget(self.camera_status_label, 1, 0)
-        # 初始位置
-        self.photo_position_label = QLabel(f"初始位置: {self.controller.initial_pose}")
-        status_layout.addWidget(self.photo_position_label, 2, 0)
+        # 相机状态卡片
+        camera_card = QFrame()
+        camera_card.setObjectName("statusCard")
+        camera_card.setStyleSheet(card_style("#06b6d4"))
+        camera_card_layout = QVBoxLayout(camera_card)
+        camera_card_layout.setSpacing(2)
+        camera_card_layout.setContentsMargins(10, 8, 10, 8)
+        camera_title = QLabel("相机")
+        camera_title.setObjectName("cardTitle")
+        camera_title.setStyleSheet(metric_title_style())
+        self.camera_status_label = QLabel("未连接")
+        self.camera_status_label.setObjectName("cardValue")
+        self.camera_status_label.setStyleSheet(metric_label_style("#94a3b8"))
+        camera_card_layout.addWidget(camera_title)
+        camera_card_layout.addWidget(self.camera_status_label)
+        status_layout.addWidget(camera_card)
         
-        self.battery_label = QLabel("电池: 未连接")
-        status_layout.addWidget(self.battery_label, 2, 1, 1, 2)
+        # 初始位置卡片
+        pos_card = QFrame()
+        pos_card.setObjectName("statusCard")
+        pos_card.setStyleSheet(card_style("#8b5cf6"))
+        pos_card_layout = QVBoxLayout(pos_card)
+        pos_card_layout.setSpacing(2)
+        pos_card_layout.setContentsMargins(10, 8, 10, 8)
+        pos_title = QLabel("位置")
+        pos_title.setObjectName("cardTitle")
+        pos_title.setStyleSheet(metric_title_style())
+        self.photo_position_label = QLabel(f"{self.controller.initial_pose}")
+        self.photo_position_label.setObjectName("cardValue")
+        self.photo_position_label.setStyleSheet(metric_label_style("#8b5cf6"))
+        pos_card_layout.addWidget(pos_title)
+        pos_card_layout.addWidget(self.photo_position_label)
+        status_layout.addWidget(pos_card)
         
-        self.torque_label = QLabel("力矩: 未连接")
-        status_layout.addWidget(self.torque_label, 3, 0)
+        # 电池卡片
+        battery_card = QFrame()
+        battery_card.setObjectName("statusCard")
+        battery_card.setStyleSheet(card_style("#22c55e"))
+        battery_card_layout = QVBoxLayout(battery_card)
+        battery_card_layout.setSpacing(2)
+        battery_card_layout.setContentsMargins(10, 8, 10, 8)
+        battery_title = QLabel("BATTERY")
+        battery_title.setObjectName("cardTitle")
+        battery_title.setStyleSheet(metric_title_style())
+        self.battery_label = QLabel("未连接")
+        self.battery_label.setObjectName("cardValue")
+        self.battery_label.setStyleSheet(metric_label_style("#94a3b8"))
+        battery_card_layout.addWidget(battery_title)
+        battery_card_layout.addWidget(self.battery_label)
+        status_layout.addWidget(battery_card)
         
-        # 实时反馈按钮
+        # 力矩卡片
+        torque_card = QFrame()
+        torque_card.setObjectName("statusCard")
+        torque_card.setStyleSheet(card_style("#f59e0b"))
+        torque_card_layout = QVBoxLayout(torque_card)
+        torque_card_layout.setSpacing(2)
+        torque_card_layout.setContentsMargins(10, 8, 10, 8)
+        torque_title = QLabel("力矩")
+        torque_title.setObjectName("cardTitle")
+        torque_title.setStyleSheet(metric_title_style())
+        self.torque_label = QLabel("未连接")
+        self.torque_label.setObjectName("cardValue")
+        self.torque_label.setStyleSheet(metric_label_style("#94a3b8"))
+        torque_card_layout.addWidget(torque_title)
+        torque_card_layout.addWidget(self.torque_label)
+        status_layout.addWidget(torque_card)
+        
+        # 右侧操作区
+        right_actions = QVBoxLayout()
+        right_actions.setSpacing(6)
+        
         self.realtime_btn = QPushButton("实时反馈")
         self.realtime_btn.clicked.connect(self.open_realtime_feedback)
-        self.realtime_btn.setMinimumHeight(40)
-        status_layout.addWidget(self.realtime_btn, 3, 1, 1, 2)
+        self.realtime_btn.setMinimumHeight(36)
+        right_actions.addWidget(self.realtime_btn)
 
         self.emergency_stop_btn = QPushButton("急停")
         self.emergency_stop_btn.setObjectName("emergencyStopButton")
         self.emergency_stop_btn.setFixedSize(82, 82)
         self.emergency_stop_btn.clicked.connect(self.on_emergency_stop)
         self._update_emergency_stop_button()
-        status_layout.addWidget(self.emergency_stop_btn, 0, 3, 4, 1, Qt.AlignmentFlag.AlignCenter)
+        right_actions.addWidget(self.emergency_stop_btn, 0, Qt.AlignmentFlag.AlignCenter)
+        
+        status_layout.addLayout(right_actions)
         
         status_group.setLayout(status_layout)
         main_layout.addWidget(status_group)
         
-        # 左侧导航 + 右侧内容
+        # ── 左侧导航 + 右侧内容 ──
         content_layout = QHBoxLayout()
         content_layout.setSpacing(0)
         content_layout.setContentsMargins(0, 0, 0, 0)
 
         self.sidebar = QWidget()
         self.sidebar.setObjectName("sideNav")
-        self.sidebar.setFixedWidth(140)
+        self.sidebar.setFixedWidth(160)
         sidebar_layout = QVBoxLayout(self.sidebar)
-        sidebar_layout.setSpacing(4)
-        sidebar_layout.setContentsMargins(8, 8, 8, 8)
+        sidebar_layout.setSpacing(2)
+        sidebar_layout.setContentsMargins(6, 12, 6, 12)
+        
+        # 侧边栏标题
+        nav_header = QLabel("DOBOT VGS")
+        nav_header.setStyleSheet(
+            "color: #3b82f6; font-size: 11pt; font-weight: 900; "
+            "letter-spacing: 1px; padding: 8px 10px 12px 10px; "
+            "background: transparent; border: none;"
+        )
+        sidebar_layout.addWidget(nav_header)
         sidebar_layout.addStretch(0)
 
         self.stacked_widget = QStackedWidget()
@@ -452,7 +535,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.linear_point_combo = QComboBox()
         linear_layout.addWidget(self.linear_point_combo)
         self.linear_point_preview = QLabel("")
-        self.linear_point_preview.setStyleSheet("color: #666; font-size: 11px;")
+        self.linear_point_preview.setStyleSheet("color: #64748b; font-size: 11px;")
         linear_layout.addWidget(self.linear_point_preview)
         self.linear_point_combo.currentTextChanged.connect(self._on_linear_point_selected)
 
@@ -711,12 +794,12 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         
         self.battery_chart_widget = QWidget()
         self.battery_chart_widget.setMinimumHeight(300)
-        self.battery_chart_widget.setStyleSheet("border: 1px solid #3b82f6; border-radius: 6px;")
+        self.battery_chart_widget.setStyleSheet("border: 1px solid #2a3550; border-radius: 8px;")
         
         # 简单的图表占位
         chart_label = QLabel("电池历史数据图表")
         chart_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        chart_label.setStyleSheet("font-size: 14px; color: #e2e8f0;")
+        chart_label.setStyleSheet("font-size: 14px; color: #64748b;")
         chart_layout = QVBoxLayout(self.battery_chart_widget)
         chart_layout.addWidget(chart_label)
         
@@ -795,28 +878,21 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         # 实时通信状态面板
         status_panel = QFrame()
         status_panel.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
-        status_panel.setStyleSheet("""
-            QFrame {
-                background-color: #1e293b;
-                border: 1px solid #3b82f6;
-                border-radius: 6px;
-                padding: 8px;
-            }
-        """)
+        status_panel.setStyleSheet(card_style("#3b82f6"))
         status_panel_layout = QHBoxLayout(status_panel)
         status_panel_layout.setSpacing(15)
-        status_panel_layout.setContentsMargins(10, 5, 10, 5)
+        status_panel_layout.setContentsMargins(12, 8, 12, 8)
 
         self.modbus_cycle_label = QLabel(" 周期: 0")
-        self.modbus_cycle_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #e2e8f0;")
+        self.modbus_cycle_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #93c5fd; background: transparent;")
         status_panel_layout.addWidget(self.modbus_cycle_label)
 
         self.modbus_duration_label = QLabel(" 耗时: 0ms")
-        self.modbus_duration_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #e2e8f0;")
+        self.modbus_duration_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #93c5fd; background: transparent;")
         status_panel_layout.addWidget(self.modbus_duration_label)
 
         self.modbus_status_panel_label = QLabel(" 状态: 停止")
-        self.modbus_status_panel_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #e2e8f0;")
+        self.modbus_status_panel_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #93c5fd; background: transparent;")
         status_panel_layout.addWidget(self.modbus_status_panel_label)
 
         status_panel_layout.addStretch()
@@ -876,20 +952,13 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         
         cart_data_panel = QFrame()
         cart_data_panel.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
-        cart_data_panel.setStyleSheet("""
-            QFrame {
-                background-color: #1e293b;
-                border: 1px solid #22c55e;
-                border-radius: 6px;
-                padding: 8px;
-            }
-        """)
+        cart_data_panel.setStyleSheet(card_style("#22c55e"))
         cart_data_layout = QHBoxLayout(cart_data_panel)
         cart_data_layout.setSpacing(15)
-        cart_data_layout.setContentsMargins(10, 5, 10, 5)
+        cart_data_layout.setContentsMargins(12, 8, 12, 8)
 
         self.cart_info_label = QLabel(" 小车状态: --- | 故障码: --- | 位置 X: --- Y: --- Z: ---")
-        self.cart_info_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #86efac;")
+        self.cart_info_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #86efac; background: transparent;")
         cart_data_layout.addWidget(self.cart_info_label)
         cart_data_layout.addStretch()
         cart_data_panel.setVisible(False)
@@ -1107,7 +1176,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         # 左侧: 画面显示
         self.cam_test_image_label = QLabel("等待测试...")
         self.cam_test_image_label.setFixedSize(640, 480)
-        self.cam_test_image_label.setStyleSheet("background-color: black; color: white; font-size: 16px;")
+        self.cam_test_image_label.setStyleSheet("background-color: #0b0f1a; color: #64748b; font-size: 16px; border: 1px solid #2a3550; border-radius: 8px;")
         self.cam_test_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         cam_test_content.addWidget(self.cam_test_image_label)
 
@@ -1116,27 +1185,27 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         coord_layout = QVBoxLayout(coord_group)
 
         self.cam_test_status_label = QLabel("状态: 未开始")
-        self.cam_test_status_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #e2e8f0;")
+        self.cam_test_status_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #93c5fd;")
         coord_layout.addWidget(self.cam_test_status_label)
 
         coord_layout.addWidget(QLabel("相机坐标 (mm):"))
         self.cam_test_cam_coords = QLabel("X: ---  Y: ---  Z: ---")
-        self.cam_test_cam_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #e2e8f0;")
+        self.cam_test_cam_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
         coord_layout.addWidget(self.cam_test_cam_coords)
 
         coord_layout.addWidget(QLabel("末端坐标 (mm):"))
         self.cam_test_end_coords = QLabel("X: ---  Y: ---  Z: ---")
-        self.cam_test_end_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #e2e8f0;")
+        self.cam_test_end_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
         coord_layout.addWidget(self.cam_test_end_coords)
 
         coord_layout.addWidget(QLabel("基座坐标 (mm):"))
         self.cam_test_base_coords = QLabel("X: ---  Y: ---  Z: ---")
-        self.cam_test_base_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #e2e8f0;")
+        self.cam_test_base_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
         coord_layout.addWidget(self.cam_test_base_coords)
 
         coord_layout.addWidget(QLabel("置信度"))
         self.cam_test_confidence = QLabel("---")
-        self.cam_test_confidence.setStyleSheet("font-family: monospace; font-size: 13px; color: #e2e8f0;")
+        self.cam_test_confidence.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
         coord_layout.addWidget(self.cam_test_confidence)
 
         # D405 专用
@@ -1144,15 +1213,15 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         d405_layout = QVBoxLayout(self.cam_test_d405_group)
         d405_layout.addWidget(QLabel("抓取坐标 (mm):"))
         self.cam_test_handle_coords = QLabel("X: ---  Y: ---  Z: ---")
-        self.cam_test_handle_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #e2e8f0;")
+        self.cam_test_handle_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
         d405_layout.addWidget(self.cam_test_handle_coords)
         d405_layout.addWidget(QLabel("钩尖坐标 (mm):"))
         self.cam_test_tip_coords = QLabel("X: ---  Y: ---  Z: ---")
-        self.cam_test_tip_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #e2e8f0;")
+        self.cam_test_tip_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
         d405_layout.addWidget(self.cam_test_tip_coords)
         d405_layout.addWidget(QLabel("铁钩长度:"))
         self.cam_test_hook_length = QLabel("--- mm")
-        self.cam_test_hook_length.setStyleSheet("font-family: monospace; font-size: 13px; color: #e2e8f0;")
+        self.cam_test_hook_length.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
         d405_layout.addWidget(self.cam_test_hook_length)
         self.cam_test_d405_group.setVisible(False)
         coord_layout.addWidget(self.cam_test_d405_group)
@@ -1292,13 +1361,26 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
     def update_status(self, status_type, status_value):
         """更新状态显示。"""
         if status_type == "robot":
-            self.robot_status_label.setText(f"机器人状态: {status_value}")
+            self.robot_status_label.setText(f"{status_value}")
             self._set_status_visual(self.robot_status_label, status_value)
+            # 更新卡片值颜色
+            if any(k in status_value for k in ("已连接", "运行", "成功", "connected", "running")):
+                self.robot_status_label.setStyleSheet(metric_label_style("#22c55e"))
+            elif any(k in status_value for k in ("错误", "失败", "报警", "error", "failed")):
+                self.robot_status_label.setStyleSheet(metric_label_style("#ef4444"))
+            else:
+                self.robot_status_label.setStyleSheet(metric_label_style("#94a3b8"))
         elif status_type == "camera":
-            self.camera_status_label.setText(f"相机状态: {status_value}")
+            self.camera_status_label.setText(f"{status_value}")
             self._set_status_visual(self.camera_status_label, status_value)
+            if any(k in status_value for k in ("已连接", "运行", "成功", "connected", "running")):
+                self.camera_status_label.setStyleSheet(metric_label_style("#22c55e"))
+            elif any(k in status_value for k in ("错误", "失败", "error", "failed")):
+                self.camera_status_label.setStyleSheet(metric_label_style("#ef4444"))
+            else:
+                self.camera_status_label.setStyleSheet(metric_label_style("#94a3b8"))
         elif status_type == "photo_position":
-            self.photo_position_label.setText(f"初始位置: {status_value}")
+            self.photo_position_label.setText(f"{status_value}")
         elif status_type == "general":
             self.status_bar.showMessage(status_value)
         self._refresh_action_states()

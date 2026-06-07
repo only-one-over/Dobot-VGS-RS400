@@ -190,7 +190,7 @@ class VisionMixin:
 
         if status == 'error':
             self.cam_test_status_label.setText(f"状态: 错误 - {result.get('error_msg', '')}")
-            self.cam_test_status_label.setStyleSheet("font-weight: bold; font-size: 14px; color: red;")
+            self.cam_test_status_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #fca5a5;")
             return
 
         q_img = result.get('q_image')
@@ -205,7 +205,7 @@ class VisionMixin:
             conf = result.get('confidence', 0.0)
             source = result.get('source', 'unknown')
             self.cam_test_status_label.setText(f"状态: 检测到物体 ({source})")
-            self.cam_test_status_label.setStyleSheet("font-weight: bold; font-size: 14px; color: green;")
+            self.cam_test_status_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #86efac;")
             if len(cam_coords) >= 3:
                 self.cam_test_cam_coords.setText(f"X: {cam_coords[0]:.1f}  Y: {cam_coords[1]:.1f}  Z: {cam_coords[2]:.1f}")
             self.cam_test_confidence.setText(f"{conf:.3f}")
@@ -224,7 +224,7 @@ class VisionMixin:
 
         else:
             self.cam_test_status_label.setText("状态: 未检测到物体")
-            self.cam_test_status_label.setStyleSheet("font-weight: bold; font-size: 14px; color: red;")
+            self.cam_test_status_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #fca5a5;")
             self.cam_test_cam_coords.setText("X: ---  Y: ---  Z: ---")
             self.cam_test_end_coords.setText("X: ---  Y: ---  Z: ---")
             self.cam_test_base_coords.setText("X: ---  Y: ---  Z: ---")

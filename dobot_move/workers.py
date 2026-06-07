@@ -349,8 +349,7 @@ class FlowThread(QThread):
                         self.flow_finished.emit(False)
                         return
 
-                    target_type = module['params'].get('target_type', 'grasp_point')
-                    converge_threshold = module['params'].get('converge_threshold', 2.0)
+                    converge_threshold = module['params'].get('converge_threshold', 3.0)
                     max_iterations = module['params'].get('max_iterations', 60)
 
                     servo_ctrl = VisualServoController(
@@ -364,7 +363,6 @@ class FlowThread(QThread):
                         self.flow_log.emit(msg)
 
                     success, final_error, iterations = servo_ctrl.servo_to_target(
-                        target_type=target_type,
                         log_callback=servo_log,
                     )
 

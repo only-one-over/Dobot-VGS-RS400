@@ -847,6 +847,34 @@ class DobotController:
             logger.warning("  运动完成，但位置有偏差")
             return True
 
+    def servo_p(self, pose, t=0.05, aheadtime=50, gain=500):
+        """ServoP 伺服运动 — 按固定周期下发目标位姿，不等待运动完成
+
+        Args:
+            pose: 目标位姿 [X, Y, Z, Rx, Ry, Rz]
+            t: 该点位的运行时间(秒)，默认0.05，范围[0.004, 3600.0]
+            aheadtime: 类似PID的D项，默认50，范围[20.0, 100.0]
+            gain: 类似PID的P项，默认500，范围[200.0, 1000.0]
+
+        Returns:
+            bool: 指令是否发送成功
+        """
+        if not self.is_connected or not self.is_enabled:
+            logger.error(" 机器人未连接或未使能，无法执行ServoP")
+            return False
+
+        try:
+            x, y, z, rx, ry, rz = pose[:6]
+            response = self.dashboard.ServoP(x, y, z, rx, ry, rz, t=t, aheadtime=aheadtime, gain=gain)
+            response_code = self.parse_response_code(response)
+            if response_code != 0:
+                logger.warning(f" ServoP响应码: {response_code}")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f" ServoP异常: {e}")
+            return False
+
     def move_joint_relative(self, offsets, a=20, v=50, cp=100, verify_end_pose=True, wait_poll_interval=0.1):
         """关节相对运动"""
         if not self.is_enabled:

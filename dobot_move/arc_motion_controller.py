@@ -1,12 +1,14 @@
 import logging
 import re
-from dobot_api import DobotApiDashboard
+
 from arc_trajectory_planner import ArcTrajectoryPlanner
+from dobot_api import DobotApiDashboard
 
 logger = logging.getLogger(__name__)
 
 
-class ForceArcController:
+class ArcMotionController:
+    """Generate and execute a native Dobot Arc motion."""
 
     def __init__(self, ip=None, dashboard_port=29999):
         self.ip = ip
@@ -27,22 +29,27 @@ class ForceArcController:
         return result
 
     def disconnect(self):
-        if not self._external_dashboard:
-            if self.dashboard is not None:
-                self.dashboard.close()
+        if not self._external_dashboard and self.dashboard is not None:
+            self.dashboard.close()
 
     def configure_arc(self, center, radius, start_angle, end_angle, rotation_axis='Z',
-                      num_waypoints=50, orientation=None, speed_factor=20):
+                      num_waypoints=3, orientation=None, speed_factor=20):
+        # Dobot Arc needs current pose + one middle pose + one end pose.
         num_waypoints = 3
         self.planner = ArcTrajectoryPlanner(
-            center=center, radius=radius, start_angle=start_angle, end_angle=end_angle,
-            rotation_axis=rotation_axis, num_waypoints=num_waypoints, orientation=orientation
+            center=center,
+            radius=radius,
+            start_angle=start_angle,
+            end_angle=end_angle,
+            rotation_axis=rotation_axis,
+            num_waypoints=num_waypoints,
+            orientation=orientation,
         )
         self.waypoints = self.planner.generate_waypoints()
         self.speed_factor = speed_factor
         if self.waypoints:
             logger.info(
-                "圆弧轨迹: center=%s radius=%.2f angle=%.2f->%.2f axis=%s waypoints=%d first=%s mid=%s last=%s",
+                "arc trajectory: center=%s radius=%.2f angle=%.2f->%.2f axis=%s waypoints=%d first=%s mid=%s last=%s",
                 [round(float(v), 3) for v in center],
                 float(radius),
                 float(start_angle),
@@ -74,9 +81,9 @@ class ForceArcController:
 
     def execute(self, set_speed=True):
         if self.dashboard is None:
-            raise RuntimeError("ForceArcController dashboard is not configured")
+            raise RuntimeError("ArcMotionController dashboard is not configured")
         if not self.waypoints:
-            raise RuntimeError("Force arc waypoints are empty")
+            raise RuntimeError("Arc motion waypoints are empty")
         if set_speed:
             self._check_response("SpeedFactor", self.dashboard.SpeedFactor(self._i(self.speed_factor)))
         mid = self.waypoints[len(self.waypoints) // 2]

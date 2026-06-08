@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 越疆机器人控制模块
@@ -10,7 +10,6 @@ import socket
 import logging
 from contextlib import contextmanager
 from modbus_server import DobotModbusServer
-from modbus_client import DobotModbusClient
 import math
 import threading
 import numpy as np
@@ -56,26 +55,16 @@ class DobotController:
         self._feed_error_count = 0
         self.clear_error_retry_count = 0
         self.modbus_server = None
-        self.modbus_client = None
         self._modbus_thread = None
         self._modbus_event = threading.Event()
         self._modbus_cycle_count = 0
         self._modbus_last_duration = 0.0
         self.auto_hook_mode = False
-        self._cart_status_data = {}
         self._modbus_status_override = None
         self._last_fault_code = 0
         self._robot_alarm_recorded = False
         self.software_emergency_active = False
         self.alarm_history = AlarmHistory()
-
-        self.force_monitor_enabled = False
-        self.force_threshold = 30.0
-        self.force_monitor_thread = None
-        self._force_monitor_running = False
-        self.force_trigger_callback = None
-        self.last_force_value = 0.0
-        self.force_triggered = False
 
         self._motion_owner = None
         self._motion_lock = threading.Lock()
@@ -410,7 +399,6 @@ class DobotController:
         if self.dashboard:
             self.dashboard.close()
         self.stop_modbus()
-        self.stop_modbus_client()
         self.is_connected = False
         self._last_speed_factor = None
         logger.info(" 已断开连接")
@@ -1154,67 +1142,6 @@ class DobotController:
             return False
         return True
 
-    def move_until_force_limit(self, axis, distance, force_limit, speed_percentage=20):
-        """Move along a user-coordinate axis until distance completes or TCP force exceeds limit."""
-        if not self.is_connected:
-            logger.error("机器人未连接，无法执行力阈值移动")
-            return False
-        if not self.is_enabled:
-            logger.error("机器人未使能，无法执行力阈值移动")
-            return False
-        if self.get_feed_data() is None:
-            logger.error("反馈数据不可用，无法监控力阈值")
-            return False
-
-        axis = str(axis).upper()
-        offsets = {
-            "X": [distance, 0, 0, 0, 0, 0],
-            "Y": [0, distance, 0, 0, 0, 0],
-            "Z": [0, 0, distance, 0, 0, 0],
-        }.get(axis)
-        if offsets is None:
-            logger.error(f"不支持的力阈值移动方向: {axis}")
-            return False
-        if force_limit <= 0:
-            logger.error(f"力上限必须大于0: {force_limit}")
-            return False
-
-        self.set_speed(int(speed_percentage))
-        response = self.dashboard.RelMovLUser(
-            offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-            speed=int(speed_percentage)
-        )
-        logger.debug(f"力阈值移动响应: {response}")
-        response_code = self.parse_response_code(response)
-        if response_code != 0:
-            logger.error(f"力阈值移动指令被拒绝，响应码: {response_code}")
-            return False
-
-        timeout = min(max(abs(float(distance)) / 20.0 + 5.0, 5.0), 60.0)
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            current_force = self.get_current_force()
-            if current_force > force_limit:
-                logger.warning(f"力阈值触发: {current_force:.2f}N > {force_limit:.2f}N，停止当前运动")
-                self.dashboard.Stop()
-                return True
-
-            robot_mode = self.get_robot_mode_fast(
-                max_age=float(get_performance_config().get("pose_cache_max_age", 0.3)),
-                fallback=True,
-            )
-            if robot_mode == 5:
-                logger.info("力阈值移动自然完成，未触发停止")
-                return True
-            if robot_mode == 9:
-                logger.error("力阈值移动过程中机器人报警")
-                return False
-            time.sleep(0.05)
-
-        logger.warning("力阈值移动等待超时，停止当前运动")
-        self.dashboard.Stop()
-        return True
-
     def move_to_initial_position(self, verify_start_pose=True, verify_end_pose=True, wait_poll_interval=0.05):
         """移动到初始位置"""
         self.initial_pose = get_initial_point()
@@ -1340,8 +1267,6 @@ class DobotController:
                 if self.modbus_server and self.modbus_server.is_running():
                     self.modbus_server.check_commands()
                     self._update_modbus_status()
-                if self.modbus_client and self.modbus_client.is_connected():
-                    self._cart_status_data = self.modbus_client.read_cart_status()
             except Exception as e:
                 logger.error(f" Modbus周期异常: {e}")
 
@@ -1352,35 +1277,12 @@ class DobotController:
             wait_time = max(0, 0.2 - elapsed)
             self._modbus_event.wait(wait_time)
 
-    def start_modbus_client(self, host, port=502):
-        """连接小车 Modbus 服务器（PC作为Master）"""
-        if self.modbus_client and self.modbus_client.is_connected():
-            logger.info(" Modbus客户端已连接小车")
-            return True
-        self.modbus_client = DobotModbusClient()
-        return self.modbus_client.connect(host, port)
-
-    def stop_modbus_client(self):
-        """断开小车 Modbus 连接"""
-        if self.modbus_client:
-            self.modbus_client.disconnect()
-            self.modbus_client = None
-
-    def get_cart_status(self):
-        """获取小车Modbus状态"""
-        if not self.modbus_client or not self.modbus_client.is_connected():
-            return {"connected": False, "cart_status": 0, "fault_code": 0, "x": 0.0, "y": 0.0, "z": 0.0}
-        return self.modbus_client.read_cart_status()
-
     def get_modbus_stats(self):
         return {
             "cycle_count": self._modbus_cycle_count,
             "last_duration_ms": round(self._modbus_last_duration, 1),
             "is_running": self.modbus_server is not None and self.modbus_server.is_running(),
             "port": self.modbus_server._port if hasattr(self.modbus_server, '_port') else 502,
-            "client_connected": self.modbus_client is not None and self.modbus_client.is_connected(),
-            "client_host": self.modbus_client._host if self.modbus_client else "",
-            "cart_status": dict(self._cart_status_data) if self._cart_status_data else {},
         }
 
     def _update_modbus_status(self):
@@ -1681,72 +1583,7 @@ class DobotController:
         finally:
             self.release_motion("modbus")
 
-    def set_force_threshold(self, threshold):
-        """设置力控阈值"""
-        if threshold >= 0:
-            self.force_threshold = threshold
-            logger.info(f" 力控阈值已设置为: {threshold}N")
-            return True
-        return False
-
-    def get_current_force(self):
-        """获取当前TCP受力合力"""
-        data = self.get_feed_data()
-        if data is None:
-            return 0.0
-        try:
-            tcp_force = data["ActualTCPForce"][0]
-            fx, fy, fz = float(tcp_force[0]), float(tcp_force[1]), float(tcp_force[2])
-            resultant = math.sqrt(fx*fx + fy*fy + fz*fz)
-            self.last_force_value = resultant
-            return resultant
-        except Exception as e:
-            logger.error(f" 获取受力失败: {e}")
-            return 0.0
-
-    def set_force_trigger_callback(self, callback):
-        """设置力控触发回调函数"""
-        self.force_trigger_callback = callback
-
-    def start_force_monitor(self):
-        """启动力控监控线程"""
-        if self._force_monitor_running:
-            logger.info(" 力控监控已在运行")
-            return True
-
-        self._force_monitor_running = True
-        self.force_monitor_thread = threading.Thread(target=self._force_monitor_loop, daemon=True)
-        self.force_monitor_thread.start()
-        logger.info(" 力控监控已启动")
-        return True
-
-    def stop_force_monitor(self):
-        """停止力控监控线程"""
-        self._force_monitor_running = False
-        if self.force_monitor_thread and self.force_monitor_thread.is_alive():
-            self.force_monitor_thread.join(timeout=1.0)
-        self.force_monitor_thread = None
-        logger.info(" 力控监控已停止")
-
-    def _force_monitor_loop(self):
-        """力控监控循环"""
-        while self._force_monitor_running:
-            if self.force_monitor_enabled and self.is_connected:
-                current_force = self.get_current_force()
-                if current_force > self.force_threshold and not self.force_triggered:
-                    logger.warning(f" ⚠️ 力控触发! 当前受力: {current_force:.2f}N > 阈值: {self.force_threshold}N")
-                    self.force_triggered = True
-                    if self.force_trigger_callback:
-                        try:
-                            self.force_trigger_callback(current_force)
-                        except Exception as e:
-                            logger.error(f" 力控回调执行失败: {e}")
-                elif current_force <= self.force_threshold * 0.9:
-                    self.force_triggered = False
-            time.sleep(0.05)
-
     def close(self):
         self.stop_feedback()
-        self.stop_force_monitor()
         if self.dashboard:
             self.dashboard.close()

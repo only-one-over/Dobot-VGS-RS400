@@ -96,28 +96,6 @@ def set_robot_ip(ip):
     return save_config(config)
 
 
-def get_cart_ip():
-    config = load_config()
-    return config.get('cart_ip', "192.168.5.2")
-
-
-def set_cart_ip(ip):
-    config = load_config()
-    config['cart_ip'] = ip
-    return save_config(config)
-
-
-def get_cart_port():
-    config = load_config()
-    return config.get('cart_port', 502)
-
-
-def set_cart_port(port):
-    config = load_config()
-    config['cart_port'] = port
-    return save_config(config)
-
-
 def get_modbus_port():
     config = load_config()
     return config.get('modbus_port', 502)

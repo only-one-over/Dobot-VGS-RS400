@@ -36,33 +36,6 @@ class ModbusMixin:
         self.modbus_duration_label.setText(" 耗时: 0ms")
         self.modbus_status_panel_label.setText(" 状态: 停止")
 
-    def connect_cart_modbus(self):
-        host = self.cart_ip_input.text().strip()
-        try:
-            port = int(self.cart_port_input.text().strip())
-        except ValueError:
-            QMessageBox.warning(self, "警告", "请输入有效的小车端口号")
-            return
-
-        result = self.controller.start_modbus_client(host, port)
-        if result:
-            self.cart_connect_btn.setEnabled(False)
-            self.cart_disconnect_btn.setEnabled(True)
-            self.cart_ip_input.setEnabled(False)
-            self.cart_port_input.setEnabled(False)
-            self.cart_status_label.setText(f"小车状态: 已连接 {host}:{port}")
-        else:
-            QMessageBox.critical(self, "错误", f"连接小车 Modbus 失败: {host}:{port}")
-
-    def disconnect_cart_modbus(self):
-        self.controller.stop_modbus_client()
-        self.cart_connect_btn.setEnabled(True)
-        self.cart_disconnect_btn.setEnabled(False)
-        self.cart_ip_input.setEnabled(True)
-        self.cart_port_input.setEnabled(True)
-        self.cart_status_label.setText("小车状态: 未连接")
-        self.cart_info_label.setText(" 小车状态: --- | 故障码: --- | 位置 X: --- Y: --- Z: ---")
-
     def _init_modbus_table(self):
         if not self.controller.modbus_server:
             return

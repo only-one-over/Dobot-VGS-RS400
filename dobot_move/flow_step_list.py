@@ -205,15 +205,12 @@ class FlowStepList(QWidget):
             if module['params'].get('motion_type') == "MovL":
                 point_name = module['params'].get('point_name', '')
                 text += f" (直线运动, 点位: {point_name}, 速度: {module['params']['speed']}%)"
-        elif module['type'] == "force_arc":
+        elif module['type'] in ("arc_motion", "force_arc"):
             p = module['params']
             offset = p.get('center_offset_z', p.get('radius', 50))
             sweep = p.get('sweep_angle', abs(float(p.get('end_angle', 90)) - float(p.get('start_angle', 0))))
             direction = "顺时针" if p.get('arc_direction') == 'cw' else "逆时针"
             text += f" (圆弧运动, 上方距离: {offset}mm, 角度: {sweep}°, 方向: {direction})"
-        elif module['type'] == "force_guard_move":
-            p = module['params']
-            text += f" (力阈值移动, 方向: {p.get('axis', 'Z')}, 距离: {p.get('distance', 0)}mm, 力上限: {p.get('force_limit', 0)}N, 速度: {p.get('speed', 20)}%)"
         elif module['type'] == "relative_move":
             p = module['params']
             coord = {"user": "用户", "tool": "工具", "joint": "关节"}.get(p.get("coord_system", "user"), "用户")

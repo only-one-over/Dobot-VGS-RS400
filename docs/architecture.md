@@ -1,8 +1,8 @@
-# Architecture
+﻿# Architecture
 
 ## Project Overview
 
-This project is a Dobot vision-guided robot control application. It provides a PyQt6 desktop UI for connecting to a Dobot robot, operating dual RealSense cameras, detecting targets with YOLO/ONNX Runtime, converting camera detections into robot coordinates, editing grasp-flow modules, and executing motion/force-control workflows.
+This project is a Dobot vision-guided robot control application. It provides a PyQt6 desktop UI for connecting to a Dobot robot, operating dual RealSense cameras, detecting targets with YOLO/ONNX Runtime, converting camera detections into robot coordinates, editing grasp-flow modules, and executing motion, native arc, relative-move, and visual-servo workflows.
 
 The repository also includes an optional C++/pybind11 module named `dobot_core` for hot vision paths such as YOLO post-processing, depth position calculation, non-maximum suppression, and coordinate transforms. The Python application should continue to work when the native module is not built.
 
@@ -33,11 +33,11 @@ The repository also includes an optional C++/pybind11 module named `dobot_core` 
 
 - `gui_app.py`: owns the `QApplication` entrypoint, `DobotMainWindow`, tab composition, UI lifecycle, status refresh, and signal wiring.
 - `main_control_panel.py`: provides the primary control widget for robot connection, camera connection, grasp execution, collision level, pause/resume, and error clearing.
-- `gui_mixins/`: separates feature behavior for robot control, vision, Modbus, point management, force arc, grasp flow, and jog control.
-- `workers.py`: runs slow or repeated work outside the UI thread, including device initialization, feedback monitoring, flow execution, camera test display, and D435i low-FPS recognition.
-- `robot_controller.py`: coordinates Dobot Dashboard/Feedback APIs, motion commands, safety state, Modbus integration, force monitor state, and pose parsing.
+- `gui_mixins/`: separates feature behavior for robot control, vision, Modbus slave service, point management, grasp flow, and jog control.
+- `workers.py`: runs slow or repeated work outside the UI thread, including flow execution, camera test display, robot command workers, and D435i low-FPS recognition.
+- `robot_controller.py`: coordinates Dobot Dashboard/Feedback APIs, motion commands, safety state, Modbus slave integration, motion ownership, safety state, and pose parsing.
 - `vision_system.py`: owns camera startup, RealSense frame capture, ONNX model loading, YOLO post-processing, tracking, depth processing, smoothing, and coordinate conversion.
-- `config_manager.py`: centralizes reads/writes for `dobot_move/config.json`, including robot/cart IPs, Modbus port, calibration, points, and hand-eye matrices.
+- `config_manager.py`: centralizes reads/writes for `dobot_move/config.json`, including robot IP, Modbus slave port, calibration, points, and hand-eye matrices.
 - `cpp_core/`: mirrors selected Python vision math in native code for performance. It must preserve input/output contracts used by `vision_system.py`.
 
 ## Data Flow
@@ -48,7 +48,7 @@ The repository also includes an optional C++/pybind11 module named `dobot_core` 
 4. Camera operations create `VisionSystem` instances for D435i and/or D405.
 5. `VisionSystem` captures RealSense frames, runs ONNX inference, tracks targets, estimates depth, and converts camera coordinates through hand-eye calibration.
 6. Detected base coordinates update default points such as `d435i` and `d405` through `config_manager.py`.
-7. `FlowThread` executes configured modules from `grasp_flow_modules.json`, resolving points and coordinating robot motion, vision detection, visual servoing, and force-control operations.
+7. `FlowThread` executes configured modules from `grasp_flow_modules.json`, resolving points and coordinating robot motion, vision detection, visual servoing, relative moves, and native arc operations.
 8. UI updates are returned through Qt signals to keep the main thread responsive.
 
 ## Dependencies

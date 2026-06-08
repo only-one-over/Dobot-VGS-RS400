@@ -13,7 +13,5 @@
   },
   "points": {},
   "robot_ip": "192.168.5.1",
-  "modbus_port": 502,
-  "cart_ip": "192.168.5.2",
-  "cart_port": 502
+  "modbus_port": 502
 }

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import logging
@@ -10,7 +10,7 @@ from typing import Optional
 import numpy as np
 from qt_compat import QImage, QThread, pyqtSignal
 from config_manager import get_point, set_point, resolve_point, get_performance_config
-from force_arc_controller import ForceArcController
+from arc_motion_controller import ArcMotionController
 from visual_servo_controller import VisualServoController
 
 try:
@@ -19,53 +19,6 @@ except ImportError:
     cv2 = None
 
 logger = logging.getLogger(__name__)
-
-
-class DeviceInitThread(QThread):
-    init_finished = pyqtSignal(object)
-    init_progress = pyqtSignal(str)
-    init_error = pyqtSignal(str)
-
-    def run(self):
-        battery = None
-
-        self.init_progress.emit("正在连接电池监控...")
-        try:
-            from battery_monitor import BatteryMonitor
-            battery = BatteryMonitor()
-            battery.connect()
-        except Exception as e:
-            self.init_error.emit(f"电池监控连接失败: {e}")
-            battery = None
-
-        self.init_finished.emit(battery)
-
-
-class MonitorThread(QThread):
-    data_updated = pyqtSignal(object)
-    error_occurred = pyqtSignal(str)
-
-    def __init__(self, device, read_fn, interval=200):
-        super().__init__()
-        self._device = device
-        self._read_fn = read_fn
-        self._interval = interval
-        self._running = True
-
-    def run(self):
-        while self._running:
-            if self._device.is_connected:
-                try:
-                    result = self._read_fn()
-                    if result is not None:
-                        self.data_updated.emit(result)
-                except Exception as e:
-                    self.error_occurred.emit(str(e))
-            self.msleep(self._interval)
-
-    def stop(self):
-        self._running = False
-        self.wait(3000)
 
 
 class RobotCmdThread(QThread):
@@ -109,6 +62,13 @@ class FlowRunContext:
         return True
 
 
+def normalize_module_type(module: dict) -> dict:
+    """Keep saved flows compatible after renaming force_arc to arc_motion."""
+    if module.get("type") == "force_arc":
+        module["type"] = "arc_motion"
+    return module
+
+
 def validate_grasp_flow_modules(modules: list) -> list:
     """Validate grasp flow module configuration before execution.
 
@@ -118,6 +78,7 @@ def validate_grasp_flow_modules(modules: list) -> list:
     has_camera_before = set()  # camera types seen so far
 
     for i, module in enumerate(modules):
+        normalize_module_type(module)
         step = i + 1
         name = module.get("name", f"模块{step}")
         mtype = module.get("type", "")
@@ -138,7 +99,7 @@ def validate_grasp_flow_modules(modules: list) -> list:
                 if not get_point("initial_point"):
                     errors.append(f"第{step}步「{name}」：初始位置点位 initial_point 不存在")
 
-        elif mtype == "force_arc":
+        elif mtype == "arc_motion":
             center_offset_z = float(params.get('center_offset_z', params.get('radius', 0)))
             sweep_angle = float(params.get('sweep_angle', 0))
             if center_offset_z <= 0:
@@ -225,11 +186,12 @@ class FlowThread(QThread):
                             return
                         self.msleep(100)
 
+                    module = normalize_module_type(module)
                     name = module.get("name", f"模块{i+1}")
                     self.flow_module_progress.emit(i + 1, total, name)
 
                     # --- Feedback health check before motion modules ---
-                    if module['type'] in ("move", "force_arc", "force_guard_move", "relative_move", "joint_move"):
+                    if module['type'] in ("move", "arc_motion", "relative_move", "joint_move"):
                         fb = self.controller.get_feedback_health(max_age=pose_cache_max_age)
                         if fb["health"] == "disconnected":
                             self._fail_module(ctx, i, name, f"反馈缓存断流({stale_fail_age:.1f}s)")
@@ -271,7 +233,7 @@ class FlowThread(QThread):
                         wait_elapsed = 0.0
                         ctx.increment_motion_generation()
 
-                    elif module['type'] == "force_arc":
+                    elif module['type'] == "arc_motion":
                         if not self.controller.is_connected:
                             self._fail_module(ctx, i, name, "机器人未连接，无法执行圆弧运动")
                             return
@@ -314,7 +276,7 @@ class FlowThread(QThread):
                                 f"距离={center_offset_z:.1f}mm, 角度={sweep_angle:.1f}°, "
                                 f"方向={direction_text}, Rx={base_orientation[0]:.1f}->{orientation[-1][0]:.1f}"
                             )
-                            fa_ctrl = ForceArcController()
+                            fa_ctrl = ArcMotionController()
                             fa_ctrl.set_dashboard(self.controller.dashboard)
                             self.controller.set_speed(p.get('speed', 20))
                             fa_ctrl.configure_arc(
@@ -341,34 +303,6 @@ class FlowThread(QThread):
                         except Exception as e:
                             self._fail_module(ctx, i, name, f"圆弧运动失败: {e}")
                             return
-                        ctx.increment_motion_generation()
-
-                    elif module['type'] == "force_guard_move":
-                        if not self.controller.is_connected:
-                            self._fail_module(ctx, i, name, "机器人未连接，无法执行力阈值移动")
-                            return
-                        p = module.get('params', {})
-                        axis = p.get('axis', 'Z')
-                        distance = float(p.get('distance', 50.0))
-                        force_limit = float(p.get('force_limit', 20.0))
-                        speed = int(p.get('speed', 20))
-                        self.flow_log.emit(
-                            f"➡️ 力阈值移动: 方向={axis}, 距离={distance:.1f}mm, "
-                            f"力上限={force_limit:.1f}N, 速度={speed}%"
-                        )
-                        cmd_start = time.perf_counter()
-                        success = self.controller.move_until_force_limit(
-                            axis=axis,
-                            distance=distance,
-                            force_limit=force_limit,
-                            speed_percentage=speed,
-                        )
-                        cmd_elapsed = time.perf_counter() - cmd_start
-                        wait_elapsed = 0.0
-                        if not success:
-                            self._fail_module(ctx, i, name, "力阈值移动失败")
-                            return
-                        self.flow_log.emit(f"✅ 模块{i+1}力阈值移动完成")
                         ctx.increment_motion_generation()
 
                     elif module['type'] == "relative_move":
@@ -542,7 +476,7 @@ class FlowThread(QThread):
 
                     module_elapsed = time.perf_counter() - module_start
                     # For non-motion modules, cmd_elapsed equals total module time
-                    if module['type'] not in ("move", "force_arc", "force_guard_move", "relative_move", "joint_move"):
+                    if module['type'] not in ("move", "arc_motion", "relative_move", "joint_move"):
                         cmd_elapsed = module_elapsed
                     ctx.module_timings.append((i + 1, name, module_elapsed, camera_elapsed, cmd_elapsed, wait_elapsed))
                     logger.info("flow module %s/%s finished: %s total=%.3fs camera=%.3fs cmd=%.3fs wait=%.3fs", i + 1, total, name, module_elapsed, camera_elapsed, cmd_elapsed, wait_elapsed)

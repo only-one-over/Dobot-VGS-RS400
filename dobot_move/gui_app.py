@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 机器人抓取控制程序 - 图形界面版本
@@ -25,14 +25,13 @@ from qt_compat import (
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from robot_controller import DobotController
-from config_manager import get_robot_ip, get_cart_ip, get_cart_port, get_modbus_port, get_grasp_flow_file, ConfigService
-from workers import DeviceInitThread, MonitorThread, RobotCmdThread, FlowThread, CameraTestWorker, D435iLowFpsWorker
+from config_manager import get_robot_ip, get_modbus_port, get_grasp_flow_file, ConfigService
+from workers import RobotCmdThread, FlowThread, CameraTestWorker, D435iLowFpsWorker
 from gui_mixins import (
     RobotControlMixin,
     VisionMixin,
     ModbusMixin,
     PointManagementMixin,
-    ForceArcMixin,
     GraspFlowMixin,
     JogMixin,
 )
@@ -125,7 +124,7 @@ _DEFAULT_GRASP_FLOW_MODULES = [
     }
 ]
 
-class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManagementMixin, ForceArcMixin, GraspFlowMixin, JogMixin, QMainWindow):
+class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManagementMixin, GraspFlowMixin, JogMixin, QMainWindow):
     """机器人控制GUI"""
     
     def __init__(self):
@@ -140,8 +139,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.controller = DobotController(self.robot_ip)
         self.vision_d435i = None
         self.vision_d405 = None
-        self.battery = None
-        self.battery_thread = None
         
         file_path = get_grasp_flow_file()
         if os.path.exists(file_path):
@@ -165,8 +162,8 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self._start_status_timer()
         if HANDEYE_AVAILABLE:
             self._load_calib_matrix("D435i")
-        self.statusBar().showMessage("正在初始化设备连接...")
-        QTimer.singleShot(100, self._deferred_init)
+        self.statusBar().showMessage("正在初始化状态监控...")
+        QTimer.singleShot(100, self.start_monitor_threads)
 
     @staticmethod
     def _wrap_in_scroll(widget):
@@ -198,22 +195,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         for i, btn in enumerate(self.sidebar.findChildren(QPushButton)):
             btn.setChecked(i == index)
 
-    def _deferred_init(self):
-        self._device_init_thread = DeviceInitThread()
-        self._device_init_thread.init_progress.connect(
-            lambda msg: self.statusBar().showMessage(msg))
-        self._device_init_thread.init_error.connect(
-            lambda msg: logger.warning(msg))
-        self._device_init_thread.init_finished.connect(self._on_device_initFinished)
-        self._device_init_thread.finished.connect(lambda: setattr(self, "_device_init_thread", None))
-        self._device_init_thread.finished.connect(self._device_init_thread.deleteLater)
-        self._device_init_thread.start()
-    
-    def _on_device_initFinished(self, battery):
-        self.battery = battery
-        self.start_monitor_threads()
-        self.statusBar().showMessage("设备初始化完成")
-    
     def set_dark_theme(self):
         """设置深色主题"""
         apply_theme(self)
@@ -287,24 +268,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         pos_card_layout.addWidget(pos_title)
         pos_card_layout.addWidget(self.photo_position_label)
         status_layout.addWidget(pos_card)
-        
-        # 电池卡片
-        battery_card = QFrame()
-        battery_card.setObjectName("statusCard")
-        battery_card.setStyleSheet(card_style("#22c55e"))
-        battery_card_layout = QVBoxLayout(battery_card)
-        battery_card_layout.setSpacing(2)
-        battery_card_layout.setContentsMargins(10, 8, 10, 8)
-        battery_title = QLabel("BATTERY")
-        battery_title.setObjectName("cardTitle")
-        battery_title.setStyleSheet(metric_title_style())
-        self.battery_label = QLabel("未连接")
-        self.battery_label.setObjectName("cardValue")
-        self.battery_label.setStyleSheet(metric_label_style("#94a3b8"))
-        battery_card_layout.addWidget(battery_title)
-        battery_card_layout.addWidget(self.battery_label)
-        status_layout.addWidget(battery_card)
-        
         # 力矩卡片
         torque_card = QFrame()
         torque_card.setObjectName("statusCard")
@@ -508,7 +471,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         module_select_layout.setSpacing(10)
         module_select_layout.addWidget(QLabel("选择模块:"))
         self.module_combo = QComboBox()
-        self.module_combo.addItems(["相机识别", "直线运动", "圆弧运动", "相对移动", "力阈值移动", "关节旋转", "视觉伺服"])
+        self.module_combo.addItems(["相机识别", "直线运动", "圆弧运动", "相对移动", "关节旋转", "视觉伺服"])
         self.module_combo.currentIndexChanged.connect(self.on_module_combo_changed)
         module_select_layout.addWidget(self.module_combo)
         
@@ -628,8 +591,8 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.rel_cp.setDecimals(0)
         rel_layout.addWidget(self.rel_cp, 3, 5)
         
-        self.force_arc_params = QWidget()
-        fa_layout = QVBoxLayout(self.force_arc_params)
+        self.arc_motion_params = QWidget()
+        fa_layout = QVBoxLayout(self.arc_motion_params)
         fa_layout.setSpacing(10)
 
         fa_params_widget = QWidget()
@@ -672,34 +635,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         fa_params_layout.addWidget(self.fa_speed, 1, 3)
 
         fa_layout.addWidget(fa_params_widget)
-
-        self.force_guard_params = QWidget()
-        fg_layout = QGridLayout(self.force_guard_params)
-        fg_layout.setSpacing(10)
-        fg_layout.addWidget(QLabel("方向轴"), 0, 0)
-        self.fg_axis_combo = QComboBox()
-        self.fg_axis_combo.addItems(["X", "Y", "Z"])
-        self.fg_axis_combo.setCurrentText("Z")
-        fg_layout.addWidget(self.fg_axis_combo, 0, 1)
-        fg_layout.addWidget(QLabel("距离(mm):"), 0, 2)
-        self.fg_distance = QDoubleSpinBox()
-        self.fg_distance.setRange(-1000, 1000)
-        self.fg_distance.setValue(50)
-        self.fg_distance.setDecimals(2)
-        fg_layout.addWidget(self.fg_distance, 0, 3)
-        fg_layout.addWidget(QLabel("力上限(N):"), 1, 0)
-        self.fg_force_limit = QDoubleSpinBox()
-        self.fg_force_limit.setRange(0.1, 500)
-        self.fg_force_limit.setValue(20)
-        self.fg_force_limit.setDecimals(2)
-        fg_layout.addWidget(self.fg_force_limit, 1, 1)
-        fg_layout.addWidget(QLabel("速度(%):"), 1, 2)
-        self.fg_speed = QDoubleSpinBox()
-        self.fg_speed.setRange(1, 100)
-        self.fg_speed.setValue(20)
-        self.fg_speed.setDecimals(0)
-        fg_layout.addWidget(self.fg_speed, 1, 3)
-
         self.camera_params = QWidget()
         camera_param_layout = QGridLayout(self.camera_params)
         camera_param_layout.setSpacing(10)
@@ -763,52 +698,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         point_tab_layout.setContentsMargins(10, 10, 10, 10)
         point_tab_layout.addWidget(point_mgmt_group)
         self._add_nav_page("点位管理", self._wrap_in_scroll(point_tab))
-
-        # 电池电量显示选项卡
-        battery_tab = QWidget()
-        battery_tab_layout = QVBoxLayout(battery_tab)
-        battery_tab_layout.setSpacing(10)
-        battery_tab_layout.setContentsMargins(10, 10, 10, 10)
-        
-        # 电池数据显示
-        battery_data_group = QGroupBox("电池实时数据")
-        battery_data_layout = QGridLayout()
-        battery_data_layout.setSpacing(10)
-        
-        self.battery_voltage_label = QLabel("电压: -- V")
-        self.battery_current_label = QLabel("电流: -- A")
-        self.battery_temperature_label = QLabel("温度: -- °C")
-        self.battery_level_label = QLabel("电量: --%")
-        
-        battery_data_layout.addWidget(self.battery_voltage_label, 0, 0)
-        battery_data_layout.addWidget(self.battery_current_label, 0, 1)
-        battery_data_layout.addWidget(self.battery_temperature_label, 1, 0)
-        battery_data_layout.addWidget(self.battery_level_label, 1, 1)
-        
-        battery_data_group.setLayout(battery_data_layout)
-        battery_tab_layout.addWidget(battery_data_group)
-        
-        # 电池历史数据图表
-        battery_chart_group = QGroupBox("电池历史数据")
-        battery_chart_layout = QVBoxLayout()
-        
-        self.battery_chart_widget = QWidget()
-        self.battery_chart_widget.setMinimumHeight(300)
-        self.battery_chart_widget.setStyleSheet("border: 1px solid #2a3550; border-radius: 8px;")
-        
-        # 简单的图表占位
-        chart_label = QLabel("电池历史数据图表")
-        chart_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        chart_label.setStyleSheet("font-size: 14px; color: #64748b;")
-        chart_layout = QVBoxLayout(self.battery_chart_widget)
-        chart_layout.addWidget(chart_label)
-        
-        battery_chart_layout.addWidget(self.battery_chart_widget)
-        battery_chart_group.setLayout(battery_chart_layout)
-        battery_tab_layout.addWidget(battery_chart_group)
-        
-        self._add_nav_page("电池电量", self._wrap_in_scroll(battery_tab))
-        
         # 机器人力控显示选项卡
         torque_tab = QWidget()
         torque_tab_layout = QVBoxLayout(torque_tab)
@@ -912,57 +801,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         
         reg_group.setLayout(reg_layout)
         modbus_layout.addWidget(reg_group)
-
-        # 旧客户端连接面板保留为内部对象，默认隐藏，当前通讯模式为本机PC做从站。
-        modbus_client_group = QGroupBox("旧客户端连接")
-        modbus_client_layout = QGridLayout()
-        modbus_client_layout.setSpacing(10)
-
-        modbus_client_layout.addWidget(QLabel("小车 IP:"), 0, 0)
-        self.cart_ip_input = QLineEdit(get_cart_ip())
-        self.cart_ip_input.setMaximumWidth(150)
-        self.cart_ip_input.editingFinished.connect(lambda: ConfigService.instance().set_ip('cart_ip', self.cart_ip_input.text().strip()))
-        modbus_client_layout.addWidget(self.cart_ip_input, 0, 1)
-
-        modbus_client_layout.addWidget(QLabel("端口:"), 0, 2)
-        self.cart_port_input = QLineEdit(str(get_cart_port()))
-        self.cart_port_input.setMaximumWidth(80)
-        self.cart_port_input.editingFinished.connect(lambda: ConfigService.instance().set('cart_port', int(self.cart_port_input.text().strip() or 502)))
-        modbus_client_layout.addWidget(self.cart_port_input, 0, 3)
-
-        self.cart_connect_btn = QPushButton("连接小车")
-        self.cart_connect_btn.setMinimumHeight(40)
-        self.cart_connect_btn.clicked.connect(self.connect_cart_modbus)
-        modbus_client_layout.addWidget(self.cart_connect_btn, 0, 4)
-
-        self.cart_disconnect_btn = QPushButton("断开小车")
-        self.cart_disconnect_btn.setMinimumHeight(40)
-        self.cart_disconnect_btn.clicked.connect(self.disconnect_cart_modbus)
-        self.cart_disconnect_btn.setEnabled(False)
-        modbus_client_layout.addWidget(self.cart_disconnect_btn, 0, 5)
-
-        self.cart_status_label = QLabel("小车状态: 未连接")
-        modbus_client_layout.addWidget(self.cart_status_label, 1, 0, 1, 6)
-
-        modbus_client_group.setLayout(modbus_client_layout)
-        modbus_client_group.setVisible(False)
-        modbus_layout.addWidget(modbus_client_group)
-
-        # 小车数据面板
-        
-        cart_data_panel = QFrame()
-        cart_data_panel.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
-        cart_data_panel.setStyleSheet(card_style("#22c55e"))
-        cart_data_layout = QHBoxLayout(cart_data_panel)
-        cart_data_layout.setSpacing(15)
-        cart_data_layout.setContentsMargins(12, 8, 12, 8)
-
-        self.cart_info_label = QLabel(" 小车状态: --- | 故障码: --- | 位置 X: --- Y: --- Z: ---")
-        self.cart_info_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #86efac; background: transparent;")
-        cart_data_layout.addWidget(self.cart_info_label)
-        cart_data_layout.addStretch()
-        cart_data_panel.setVisible(False)
-        modbus_layout.addWidget(cart_data_panel)
 
         self._add_nav_page("Modbus 通信", self._wrap_in_scroll(modbus_tab))
 
@@ -1536,9 +1374,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
     def closeEvent(self, event):
         if hasattr(self, '_status_timer') and self._status_timer is not None:
             self._status_timer.stop()
-        if hasattr(self, '_device_init_thread') and self._device_init_thread is not None:
-            self._device_init_thread.wait(3000)
-            self._device_init_thread = None
         if hasattr(self, 'cam_test_worker') and self.cam_test_worker is not None:
             self.cam_test_worker.stop()
             self.cam_test_worker.wait(3000)
@@ -1552,7 +1387,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             self._flow_thread.wait(3000)
 
         self.stop_modbus_server()
-        self.disconnect_cart_modbus()
         self.stop_monitor_threads()
         
         # 关闭相机

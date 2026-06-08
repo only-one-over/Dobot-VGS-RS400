@@ -1,4 +1,4 @@
-# Dobot-VGS-RS400
+﻿# Dobot-VGS-RS400
 
 Vision-Guided System for Dobot CR Series Robots with Intel RealSense D400 Depth Cameras
 
@@ -6,7 +6,7 @@ Vision-Guided System for Dobot CR Series Robots with Intel RealSense D400 Depth 
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-green.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-基于 Python + PySide6 的越疆 CR 系列机械臂视觉定位控制系统。集成双 RealSense 深度相机（D435i + D405）、YOLO 实例分割、ByteTrack 目标跟踪、3D 卡尔曼滤波、手眼标定、视觉伺服和力控圆弧，实现从目标识别到精准定位的全自动化流程。
+基于 Python + PySide6 的越疆 CR 系列机械臂视觉定位控制系统。集成双 RealSense 深度相机（D435i + D405）、YOLO 实例分割、ByteTrack 目标跟踪、3D 卡尔曼滤波、手眼标定、视觉伺服和普通圆弧运动，实现从目标识别到精准定位的全自动化流程。
 
 ## Table of Contents
 
@@ -26,8 +26,8 @@ Vision-Guided System for Dobot CR Series Robots with Intel RealSense D400 Depth 
 - 🧠 **YOLO Instance Segmentation** — YOLO11s-seg / YOLO26 end-to-end + ByteTrack multi-object tracking + 3D Kalman filter
 - 📐 **Hand-Eye Calibration** — Independent calibration for D435i/D405 dual cameras
 - 🎮 **Visual Servoing** — Iterative approach with adaptive gain, 2mm convergence threshold
-- 💪 **Force-Controlled Arc** — ArcTrajectoryPlanner + ForceFeedbackMonitor + ForceArcController
-- 🔌 **Modbus TCP** — Bidirectional communication, PC as Master/Server
+- ↪ **Native Arc Motion** — ArcTrajectoryPlanner + ArcMotionController using Dobot Arc()
+- 🔌 **Modbus TCP** — local PC runs as Modbus TCP slave/server for an external master PC
 - ⚡ **C++ Acceleration** — Optional dobot_core pybind11 module for 5-20x speedup with Python fallback
 - 🔀 **Flow Step Editor** — Drag-and-drop step reordering with real-time status icons (pending/running/completed/failed)
 - 💾 **ConfigService** — Unified debounce config writing, prevents frequent disk I/O
@@ -103,12 +103,9 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 | Hand-Eye Calibration | `hand_eye_calib.py` | Calibration matrix management |
 | Coordinate Transform | `transform_utils.py` | euler2rot / pose2matrix |
 | Visual Servo | `visual_servo_controller.py` | Iterative visual servo control |
-| Force Arc | `force_arc_controller.py` | Force + arc trajectory combined control |
-| Force Feedback | `force_feedback_monitor.py` | Force sensor monitoring thread |
-| Arc Planner | `arc_trajectory_planner.py` | Arc waypoint generation |
-| Battery Monitor | `battery_monitor.py` | CAN bus battery monitoring |
-| Modbus Server | `modbus_server.py` | Modbus TCP Server |
-| Modbus Client | `modbus_client.py` | Modbus TCP Client (cart) |
+| Arc Motion | `arc_motion_controller.py` | Native Dobot Arc() motion control | Force sensor monitoring thread |
+| Arc Planner | `arc_trajectory_planner.py` | Arc waypoint generation | CAN bus battery monitoring |
+| Modbus Server | `modbus_server.py` | Modbus TCP Server | Modbus TCP Client (cart) |
 | Config Manager | `config_manager.py` | JSON config read/write |
 | Main Control Panel | `main_control_panel.py` | Main control panel widget with signal-based communication |
 | Flow Step List | `flow_step_list.py` | Flow step list with drag-and-drop and status icons |
@@ -163,7 +160,7 @@ In the Vision tab, D435i low-fps (5fps) continuous recognition is available:
 Photo Position → D435i Coarse Recognition → Move Above D435i Target
 → Visual Servo Approach → D405 Fine Recognition (Mask Geometric Center)
 → Calculate Target Point → Move to Target Position
-→ Force-Controlled Arc (optional) → Lift → Place
+→ Native Arc Motion or Relative Move (optional) → Lift → Place
 ```
 
 ## Configuration
@@ -181,9 +178,7 @@ Configuration file located at `dobot_move/config.json`:
 | `target_offset` | float[3] | Target offset (dx,dy,dz) mm | `[0, 0, 0]` |
 | `calibration.D435i` | object | D435i hand-eye calibration params | See below |
 | `calibration.D405` | object | D405 hand-eye calibration params | See below |
-| `points` | object | Point table | See below |
-| `cart_ip` | string | Cart IP address | `"192.168.5.2"` |
-| `cart_port` | int | Cart Modbus port | `502` |
+| `points` | object | Point table | See below | Cart IP address | `"192.168.5.2"` | Cart Modbus port | `502` |
 | `modbus_port` | int | Local Modbus server port | `502` |
 
 #### Hand-Eye Calibration

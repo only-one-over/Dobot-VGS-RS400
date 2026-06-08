@@ -1,7 +1,7 @@
 [
   {
     "type": "move",
-    "name": "\u79fb\u52a8\u5230\u521d\u59cb\u4f4d\u7f6e",
+    "name": "移动到初始位置",
     "params": {
       "target": "initial_position",
       "motion_type": "MovJ",
@@ -9,33 +9,20 @@
     }
   },
   {
-    "type": "move",
-    "name": "\u76f4\u7ebf\u8fd0\u52a8\u5230\u76ee\u6807",
+    "type": "camera",
+    "name": "识别物体并计算坐标",
     "params": {
-      "target": "camera_detected",
-      "motion_type": "MovL",
-      "speed": 30,
-      "point_name": ""
+      "camera_type": "D435i"
     }
   },
   {
     "type": "move",
-    "name": "\u76f4\u7ebf\u8fd0\u52a8\u5230\u76ee\u6807",
+    "name": "直线运动到目标",
     "params": {
       "target": "camera_detected",
       "motion_type": "MovL",
       "speed": 30,
-      "point_name": ""
-    }
-  },
-  {
-    "type": "move",
-    "name": "\u76f4\u7ebf\u8fd0\u52a8\u5230\u76ee\u6807",
-    "params": {
-      "target": "camera_detected",
-      "motion_type": "MovL",
-      "speed": 30,
-      "point_name": ""
+      "point_name": "d435i"
     }
   }
 ]

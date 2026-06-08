@@ -3,7 +3,7 @@ import math
 from qt_compat import QMessageBox, QTimer
 
 from config_manager import ConfigService
-from workers import MonitorThread, RobotCmdThread
+from workers import RobotCmdThread
 
 
 class RobotControlMixin:
@@ -119,9 +119,6 @@ class RobotControlMixin:
         else:
             QMessageBox.critical(self, "错误", "获取位置失败")
 
-    def update_battery_data(self, data):
-        self.battery_label.setText(f"电池: {data['soc']}% | {data['voltage']:.1f}V | {data['current']:.1f}A | {data['status']}")
-
     def update_torque_data(self, data):
         if data is None:
             return
@@ -150,14 +147,6 @@ class RobotControlMixin:
             pass
 
     def start_monitor_threads(self):
-        if self.battery and self.battery.is_connected:
-            def read_battery():
-                self.battery.read_data()
-                return self.battery.get_data()
-            self.battery_thread = MonitorThread(self.battery, read_battery)
-            self.battery_thread.data_updated.connect(self.update_battery_data)
-            self.battery_thread.start()
-
         self._torque_timer = QTimer()
         self._torque_timer.timeout.connect(self._read_torque_from_controller)
         self._torque_timer.start(200)
@@ -192,7 +181,5 @@ class RobotControlMixin:
                 pass
 
     def stop_monitor_threads(self):
-        if self.battery_thread:
-            self.battery_thread.stop()
         if hasattr(self, '_torque_timer') and self._torque_timer:
             self._torque_timer.stop()

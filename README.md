@@ -1,6 +1,6 @@
-﻿# Dobot-VGS-RS400
+# Dobot-VGS-RS400
 
-Vision-Guided System for Dobot CR Series Robots with Intel RealSense D400 Depth Cameras
+基于 Intel RealSense D400 深度相机的越疆 CR 系列机械臂视觉引导系统
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-green.svg)]()
@@ -8,47 +8,47 @@ Vision-Guided System for Dobot CR Series Robots with Intel RealSense D400 Depth 
 
 基于 Python + PySide6 的越疆 CR 系列机械臂视觉定位控制系统。集成双 RealSense 深度相机（D435i + D405）、YOLO 实例分割、ByteTrack 目标跟踪、3D 卡尔曼滤波、手眼标定、视觉伺服和普通圆弧运动，实现从目标识别到精准定位的全自动化流程。
 
-## Table of Contents
+## 目录
 
-- [Features](#features)
-- [Quick Start](#quick-start)
-- [Architecture](#architecture)
-- [Usage](#usage)
-- [Configuration](#configuration)
-- [C++ Acceleration](#c-acceleration)
-- [FAQ](#faq)
-- [License](#license)
+- [功能特性](#功能特性)
+- [快速开始](#快速开始)
+- [架构](#架构)
+- [使用方法](#使用方法)
+- [配置](#配置)
+- [C++ 加速](#c-加速)
+- [常见问题](#常见问题)
+- [许可证](#许可证)
 
-## Features
+## 功能特性
 
-- 🎯 **Dual-Camera Collaboration** — D435i coarse positioning + D405 fine recognition (mask geometric center)
-- 🔄 **Real-Time Tracking** — D435i low-fps (5fps) continuous recognition, real-time target position update
-- 🧠 **YOLO Instance Segmentation** — YOLO11s-seg / YOLO26 end-to-end + ByteTrack multi-object tracking + 3D Kalman filter
-- 📐 **Hand-Eye Calibration** — Independent calibration for D435i/D405 dual cameras
-- 🎮 **Visual Servoing** — Iterative approach with adaptive gain, 2mm convergence threshold
-- ↪ **Native Arc Motion** — ArcTrajectoryPlanner + ArcMotionController using Dobot Arc()
-- 🔌 **Modbus TCP** — local PC runs as Modbus TCP slave/server for an external master PC
-- ⚡ **C++ Acceleration** — Optional dobot_core pybind11 module for 5-20x speedup with Python fallback
-- 🔀 **Flow Step Editor** — Drag-and-drop step reordering with real-time status icons (pending/running/completed/failed)
-- 💾 **ConfigService** — Unified debounce config writing, prevents frequent disk I/O
-- 🎨 **PySide6 Compatible** — qt_compat.py abstraction layer for Qt framework independence
+- 🎯 **双相机协作** — D435i 粗定位 + D405 精细识别（掩码几何中心）
+- 🔄 **实时跟踪** — D435i 低帧率（5fps）连续识别，实时更新目标位置
+- 🧠 **YOLO 实例分割** — YOLO11s-seg / YOLO26 端到端 + ByteTrack 多目标跟踪 + 3D Kalman 滤波
+- 📐 **手眼标定** — D435i/D405 双相机独立标定
+- 🎮 **视觉伺服** — 自适应增益迭代逼近，2mm 收敛阈值
+- ↪ **原生圆弧运动** — ArcTrajectoryPlanner + ArcMotionController，使用 Dobot Arc()
+- 🔌 **Modbus TCP** — 本地 PC 作为 Modbus TCP 从站/服务器，供外部主站 PC 访问
+- ⚡ **C++ 加速** — 可选 dobot_core pybind11 模块，5-20 倍加速，Python 回退
+- 🔀 **流程步骤编辑器** — 拖拽排序步骤，实时状态图标（待执行/执行中/已完成/失败）
+- 💾 **ConfigService** — 统一防抖配置写入，避免频繁磁盘 I/O
+- 🎨 **PySide6 兼容** — qt_compat.py 抽象层，实现 Qt 框架无关性
 
-## Quick Start
+## 快速开始
 
-### Prerequisites
+### 前置条件
 
-- Python 3.10+ (3.12 recommended)
+- Python 3.10+（推荐 3.12）
 - Intel RealSense SDK 2.0
-- CMake 3.15+ & C++17 compiler (optional, for C++ acceleration)
+- CMake 3.15+ 和 C++17 编译器（可选，用于 C++ 加速）
 
-### Installation
+### 安装
 
 ```bash
-# 1. Clone the repository
+# 1. 克隆仓库
 git clone https://github.com/only-one-over/Dobot-VGS-RS400.git
 cd Dobot-VGS-RS400
 
-# 2. Create virtual environment & install dependencies
+# 2. 创建虚拟环境并安装依赖
 python -m venv .venv
 # Windows
 .venv\Scripts\activate
@@ -56,134 +56,134 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 3. (Optional) Build C++ acceleration module
+# 3. （可选）构建 C++ 加速模块
 pip install pybind11 cmake
 python build_cpp.py
 ```
 
-### Verify Installation
+### 验证安装
 
 ```bash
 python -c "import PySide6, numpy, cv2, pyrealsense2, onnxruntime; print('All dependencies OK')"
 
-# Optional: verify C++ module
+# 可选：验证 C++ 模块
 python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 ```
 
-## Architecture
+## 架构
 
 ```
 ┌─────────────────────────────────────────────────┐
 │                   GUI (PySide6)                    │
 │           DobotMainWindow + 7 Mixins             │
 ├─────────┬──────────┬──────────┬─────────────────┤
-│  Robot   │  Vision   │  Force   │   Modbus        │
-│ Control  │  System   │  Arc     │   Comm          │
+│  机器人   │  视觉     │  力控     │   Modbus        │
+│  控制     │  系统     │  圆弧    │   通信          │
 ├─────────┼──────────┼──────────┼─────────────────┤
 │DobotApi │VisionSys │ForceArc  │ ModbusServer    │
 │Dashboard│ +Tracker │+FBMonitor│ ModbusClient    │
 │Feedback │ +Kalman3D│+ArcPlanner│                │
 ├─────────┴──────────┴──────────┴─────────────────┤
-│          dobot_core (C++ pybind11, optional)      │
-│     transforms / nms / yolo (post-processing)     │
+│          dobot_core (C++ pybind11, 可选)           │
+│     transforms / nms / yolo (后处理)               │
 └─────────────────────────────────────────────────┘
 ```
 
-### Core Modules
+### 核心模块
 
-| Module | File | Description |
-|--------|------|-------------|
-| Main GUI | `gui_app.py` | PySide6 main window with 7 Mixins |
-| Robot Controller | `robot_controller.py` | Motion control, state management |
-| Communication | `dobot_api.py` | TCP/IP Dashboard (29999) + Feedback (30004) |
-| Vision System | `vision_system.py` | YOLO inference, object detection, 3D positioning |
-| Object Tracking | `tracker.py` | ByteTrack multi-object tracking |
-| 3D Filter | `kalman_filter_3d.py` | 6-state 3D Kalman filter |
-| Depth Processing | `depth_processor.py` | 4-level RealSense depth filter chain |
-| Hand-Eye Calibration | `hand_eye_calib.py` | Calibration matrix management |
-| Coordinate Transform | `transform_utils.py` | euler2rot / pose2matrix |
-| Visual Servo | `visual_servo_controller.py` | Iterative visual servo control |
-| Arc Motion | `arc_motion_controller.py` | Native Dobot Arc() motion control | Force sensor monitoring thread |
-| Arc Planner | `arc_trajectory_planner.py` | Arc waypoint generation | CAN bus battery monitoring |
-| Modbus Server | `modbus_server.py` | Modbus TCP Server | Modbus TCP Client (cart) |
-| Config Manager | `config_manager.py` | JSON config read/write |
-| Main Control Panel | `main_control_panel.py` | Main control panel widget with signal-based communication |
-| Flow Step List | `flow_step_list.py` | Flow step list with drag-and-drop and status icons |
-| Qt Compat | `qt_compat.py` | Qt framework compatibility layer (PySide6) |
-| Workers | `workers.py` | Device init, status update threads |
-| C++ Core | `cpp_core/` | pybind11 acceleration module |
+| 模块 | 文件 | 描述 |
+|------|------|------|
+| 主界面 | `gui_app.py` | PySide6 主窗口 + 7 个 Mixin |
+| 机器人控制器 | `robot_controller.py` | 运动控制、状态管理 |
+| 通信 | `dobot_api.py` | TCP/IP Dashboard (29999) + Feedback (30004) |
+| 视觉系统 | `vision_system.py` | YOLO 推理、目标检测、3D 定位 |
+| 目标跟踪 | `tracker.py` | ByteTrack 多目标跟踪 |
+| 3D 滤波 | `kalman_filter_3d.py` | 6 状态 3D Kalman 滤波器 |
+| 深度处理 | `depth_processor.py` | 4 级 RealSense 深度滤波链 |
+| 手眼标定 | `hand_eye_calib.py` | 标定矩阵管理 |
+| 坐标变换 | `transform_utils.py` | euler2rot / pose2matrix |
+| 视觉伺服 | `visual_servo_controller.py` | 迭代视觉伺服控制 |
+| 圆弧运动 | `arc_motion_controller.py` | 原生 Dobot Arc() 运动控制 | 力传感器监测线程 |
+| 圆弧规划 | `arc_trajectory_planner.py` | 圆弧航点生成 | CAN 总线电池监测 |
+| Modbus 服务器 | `modbus_server.py` | Modbus TCP 服务器 | Modbus TCP 客户端（小车） |
+| 配置管理 | `config_manager.py` | JSON 配置读写 |
+| 主控面板 | `main_control_panel.py` | 主控面板组件，基于信号通信 |
+| 流程步骤列表 | `flow_step_list.py` | 流程步骤列表，支持拖拽排序和状态图标 |
+| Qt 兼容层 | `qt_compat.py` | Qt 框架兼容层（PySide6） |
+| 工作线程 | `workers.py` | 设备初始化、状态更新线程 |
+| C++ 核心 | `cpp_core/` | pybind11 加速模块 |
 
-### Hardware Requirements
+### 硬件要求
 
-| Device | Model | Notes |
-|--------|-------|-------|
-| Robot Arm | Dobot CR5 / CR10 / CRA series | TCP/IP protocol control |
-| Mid-range Camera | Intel RealSense D435i | Coarse positioning, depth 0.5-2.2m |
-| Close-range Camera | Intel RealSense D405 | Fine recognition, depth 0.07-0.8m |
-| Force Sensor | Built-in 6-axis force sensor | Dobot FT series |
-| Network | Ethernet | Robot IP default 192.168.1.50 |
+| 设备 | 型号 | 备注 |
+|------|------|------|
+| 机械臂 | Dobot CR5 / CR10 / CRA 系列 | TCP/IP 协议控制 |
+| 中距相机 | Intel RealSense D435i | 粗定位，深度 0.5-2.2m |
+| 近距相机 | Intel RealSense D405 | 精细识别，深度 0.07-0.8m |
+| 力传感器 | 内置六轴力传感器 | Dobot FT 系列 |
+| 网络 | 以太网 | 机器人 IP 默认 192.168.1.50 |
 
-## Usage
+## 使用方法
 
-### Launch the Application
+### 启动应用
 
 ```bash
 cd dobot_move
 python gui_app.py
 ```
 
-### First-Time Setup
+### 首次设置
 
-1. **Connect Robot** — Enter robot IP in GUI, click "Connect"
-2. **Enable Robot** — After connection, click "Enable"
-3. **Hand-Eye Calibration** (if recalibration needed):
-   - Switch to "Hand-Eye Calibration" tab
-   - Enter tool point pose and camera origin pose on calibration board
-   - Click "Calculate" to generate calibration matrix
-4. **Connect Camera** — Click "Connect Camera", select D435i or D405
-5. **Test Vision** — Click "Camera Test" to verify detection
-6. **Run Grasp Flow** — Start automated grasp in "Grasp Flow" tab
+1. **连接机器人** — 在界面中输入机器人 IP，点击"连接"
+2. **使能机器人** — 连接成功后，点击"使能"
+3. **手眼标定**（如需重新标定）：
+   - 切换到"手眼标定"选项卡
+   - 输入标定板上的工具点位姿和相机原点位姿
+   - 点击"计算"生成标定矩阵
+4. **连接相机** — 点击"连接相机"，选择 D435i 或 D405
+5. **测试视觉** — 点击"相机测试"验证检测效果
+6. **运行抓取流程** — 在"抓取流程"选项卡中启动自动抓取
 
-### D435i Low-FPS Real-Time Recognition
+### D435i 低帧率实时识别
 
-In the Vision tab, D435i low-fps (5fps) continuous recognition is available:
+在视觉选项卡中，可使用 D435i 低帧率（5fps）连续识别：
 
-1. Connect D435i camera
-2. Click "Start" in the "D435i Low-FPS Recognition" area
-3. System continuously detects at 5fps, updating `d435i` point coordinates in real-time
-4. GUI displays current camera coords, end-effector coords, base coords
-5. Click "Stop" to close recognition
+1. 连接 D435i 相机
+2. 在"D435i 低帧率识别"区域点击"启动"
+3. 系统以 5fps 持续检测，实时更新 `d435i` 点位坐标
+4. 界面显示当前相机坐标、末端坐标、基座坐标
+5. 点击"停止"关闭识别
 
-### Grasp Flow
+### 抓取流程
 
 ```
-Photo Position → D435i Coarse Recognition → Move Above D435i Target
-→ Visual Servo Approach → D405 Fine Recognition (Mask Geometric Center)
-→ Calculate Target Point → Move to Target Position
-→ Native Arc Motion or Relative Move (optional) → Lift → Place
+拍照位 → D435i 粗识别 → 移动至 D435i 目标上方
+→ 视觉伺服逼近 → D405 精细识别（掩码几何中心）
+→ 计算目标点 → 移动至目标位置
+→ 原生圆弧运动或相对移动（可选） → 抬升 → 放置
 ```
 
-## Configuration
+## 配置
 
 ### config.json
 
-Copy `dobot_move/config.example.json` to `dobot_move/config.json` and modify the values for your setup.
+将 `dobot_move/config.example.json` 复制为 `dobot_move/config.json`，并根据实际环境修改配置值。
 
-Configuration file located at `dobot_move/config.json`:
+配置文件位于 `dobot_move/config.json`：
 
-| Field | Type | Description | Example |
-|-------|------|-------------|---------|
-| `robot_ip` | string | Robot IP address | `"192.168.1.50"` |
-| `photo_position` | float[6] | Photo position (x,y,z,rx,ry,rz) mm/deg | `[900.98, -403.82, 166.76, -83.92, 1.30, -89.06]` |
-| `target_offset` | float[3] | Target offset (dx,dy,dz) mm | `[0, 0, 0]` |
-| `calibration.D435i` | object | D435i hand-eye calibration params | See below |
-| `calibration.D405` | object | D405 hand-eye calibration params | See below |
-| `points` | object | Point table | See below | Cart IP address | `"192.168.5.2"` | Cart Modbus port | `502` |
-| `modbus_port` | int | Local Modbus server port | `502` |
+| 字段 | 类型 | 描述 | 示例 |
+|------|------|------|------|
+| `robot_ip` | string | 机器人 IP 地址 | `"192.168.1.50"` |
+| `photo_position` | float[6] | 拍照位 (x,y,z,rx,ry,rz) mm/deg | `[900.98, -403.82, 166.76, -83.92, 1.30, -89.06]` |
+| `target_offset` | float[3] | 目标偏移 (dx,dy,dz) mm | `[0, 0, 0]` |
+| `calibration.D435i` | object | D435i 手眼标定参数 | 见下方 |
+| `calibration.D405` | object | D405 手眼标定参数 | 见下方 |
+| `points` | object | 点位表 | 见下方 | 小车 IP 地址 | `"192.168.5.2"` | 小车 Modbus 端口 | `502` |
+| `modbus_port` | int | 本地 Modbus 服务器端口 | `502` |
 
-#### Hand-Eye Calibration
+#### 手眼标定
 
-Each camera's calibration data contains two fields:
+每个相机的标定数据包含两个字段：
 
 ```json
 {
@@ -192,12 +192,12 @@ Each camera's calibration data contains two fields:
 }
 ```
 
-- `tool_base_calib_pose`: Tool point pose on calibration board relative to base
-- `cam_base_calib_pose`: Camera origin pose relative to base
+- `tool_base_calib_pose`：标定板上工具点相对于基座的位姿
+- `cam_base_calib_pose`：相机原点相对于基座的位姿
 
-The system calculates the hand-eye matrix: `T_cam2gripper = inv(T_tool2base) @ T_cam2base`
+系统计算手眼矩阵：`T_cam2gripper = inv(T_tool2base) @ T_cam2base`
 
-#### Point Table
+#### 点位表
 
 ```json
 {
@@ -211,19 +211,19 @@ The system calculates the hand-eye matrix: `T_cam2gripper = inv(T_tool2base) @ T
 }
 ```
 
-| Field | Description |
-|-------|-------------|
-| `coords` | Absolute coordinates (mm, deg) |
-| `is_relative` | Whether this is a relative point |
-| `relative_to` | Reference point name (for relative points) |
-| `offset` | Relative offset |
-| `is_default` | System default point (cannot be deleted) |
+| 字段 | 描述 |
+|------|------|
+| `coords` | 绝对坐标 (mm, deg) |
+| `is_relative` | 是否为相对点位 |
+| `relative_to` | 参考点名称（用于相对点位） |
+| `offset` | 相对偏移 |
+| `is_default` | 系统默认点位（不可删除） |
 
-Two default points: `d435i` (D435i recognition target center) and `d405` (D405 recognition target center), automatically updated by the vision system.
+两个默认点位：`d435i`（D435i 识别目标中心）和 `d405`（D405 识别目标中心），由视觉系统自动更新。
 
-## C++ Acceleration
+## C++ 加速
 
-### Module Structure
+### 模块结构
 
 ```
 cpp_core/
@@ -244,7 +244,7 @@ cpp_core/
 ```python
 import dobot_core
 
-# Coordinate transforms
+# 坐标变换
 R = dobot_core.transforms.euler2rot(rx, ry, rz, degree=True)  # → 3x3 numpy array
 T = dobot_core.transforms.pose2matrix(x, y, z, rx, ry, rz)    # → 4x4 numpy array
 p = dobot_core.transforms.transform_point(matrix, point)       # → 3D numpy array
@@ -252,59 +252,59 @@ p = dobot_core.transforms.transform_point(matrix, point)       # → 3D numpy ar
 # NMS
 keep = dobot_core.nms.nms(boxes, scores, iou_threshold=0.5)   # → list[int]
 
-# YOLOv8 post-processing
+# YOLOv8 后处理
 dets = dobot_core.yolo.postprocess_yolov8(outputs, original_size, scale,
        offset, new_size, num_classes, conf_threshold, iou_threshold)
 masks = dobot_core.yolo.process_mask(protos, masks_in, bboxes, shape,
         scale, offset, new_size, threshold)
 ```
 
-### Fallback
+### 回退
 
-When `dobot_core` is unavailable (not compiled or unsupported platform), the program automatically falls back to pure Python implementation. No functionality is affected.
+当 `dobot_core` 不可用时（未编译或不支持的平台），程序自动回退到纯 Python 实现，不影响任何功能。
 
-### Build
+### 构建
 
 ```bash
 pip install pybind11 cmake
 python build_cpp.py
 ```
 
-## FAQ
+## 常见问题
 
-### Missing dependency opencv-python
+### 缺少依赖 opencv-python
 ```bash
 pip install opencv-python
 ```
 
-### Camera connection failed
-- Confirm RealSense camera is connected via USB
-- Confirm Intel RealSense SDK 2.0 is installed
-- Check `pyrealsense2` version matches SDK version
-- Specify serial number when using multiple cameras
+### 相机连接失败
+- 确认 RealSense 相机已通过 USB 连接
+- 确认已安装 Intel RealSense SDK 2.0
+- 检查 `pyrealsense2` 版本是否与 SDK 版本匹配
+- 使用多台相机时需指定序列号
 
-### Robot connection failed
-- Confirm robot and PC are on the same network segment
-- Check `robot_ip` in `config.json`
-- Confirm robot is powered on and network is reachable (`ping 192.168.1.50`)
+### 机器人连接失败
+- 确认机器人与 PC 在同一网段
+- 检查 `config.json` 中的 `robot_ip`
+- 确认机器人已开机且网络可达（`ping 192.168.1.50`）
 
-### C++ module build failed
-- Confirm CMake 3.15+ and C++17 compiler are installed
-- Windows requires Visual Studio Build Tools
-- Not building C++ module does not affect usage — program falls back to Python
+### C++ 模块构建失败
+- 确认已安装 CMake 3.15+ 和 C++17 编译器
+- Windows 需要安装 Visual Studio Build Tools
+- 不构建 C++ 模块不影响使用——程序会回退到 Python
 
-### YOLO model detection is poor
-- Confirm `best.onnx` model file exists in `dobot_move/` directory
-- Check lighting conditions, avoid strong reflections
-- If changing detection target, retrain model and replace `best.onnx`
-- Note: new model's class count and mask coefficient dimensions must match hardcoded values (1 class, 32 mask_coeff)
+### YOLO 模型检测效果差
+- 确认 `dobot_move/` 目录下存在 `best.onnx` 模型文件
+- 检查光照条件，避免强烈反光
+- 如更换检测目标，需重新训练模型并替换 `best.onnx`
+- 注意：新模型的类别数和掩码系数维度必须与硬编码值匹配（1 类，32 mask_coeff）
 
-### Hand-eye calibration accuracy is insufficient
-- Confirm tool point pose on calibration board is recorded accurately
-- Check Euler angle convention (this project uses ZYX rotation order)
-- Recommend multiple calibrations and averaging
-- Calibration error should be < 5mm
+### 手眼标定精度不足
+- 确认标定板上工具点位姿记录准确
+- 检查欧拉角约定（本项目使用 ZYX 旋转顺序）
+- 建议多次标定取平均值
+- 标定误差应 < 5mm
 
-## License
+## 许可证
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+本项目基于 MIT 许可证授权——详见 [LICENSE](LICENSE) 文件。

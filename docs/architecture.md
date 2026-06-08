@@ -1,87 +1,87 @@
-﻿# Architecture
+# 架构
 
-## Project Overview
+## 项目概述
 
-This project is a Dobot vision-guided robot control application. It provides a PyQt6 desktop UI for connecting to a Dobot robot, operating dual RealSense cameras, detecting targets with YOLO/ONNX Runtime, converting camera detections into robot coordinates, editing grasp-flow modules, and executing motion, native arc, relative-move, and visual-servo workflows.
+本项目是一个 Dobot 视觉引导机器人控制应用。它提供 PyQt6 桌面 UI，用于连接 Dobot 机器人、操作双 RealSense 相机、使用 YOLO/ONNX Runtime 检测目标、将相机检测结果转换为机器人坐标、编辑抓取流程模块，以及执行运动、原生圆弧、相对移动和视觉伺服工作流。
 
-The repository also includes an optional C++/pybind11 module named `dobot_core` for hot vision paths such as YOLO post-processing, depth position calculation, non-maximum suppression, and coordinate transforms. The Python application should continue to work when the native module is not built.
+该仓库还包含一个可选的 C++/pybind11 模块 `dobot_core`，用于加速视觉热路径，如 YOLO 后处理、深度定位计算、非极大值抑制和坐标变换。当原生模块未构建时，Python 应用应继续正常工作。
 
-## Directory Structure
+## 目录结构
 
 ```text
 .
-├── dobot_move/                  # Main Python package and PyQt6 application
-│   ├── gui_app.py               # Main window, tabs, lifecycle, worker wiring
-│   ├── main_control_panel.py    # Extracted main control panel widget
-│   ├── gui_mixins/              # UI behavior mixins by feature area
-│   ├── workers.py               # QThread workers for init, monitoring, flows, camera tests
-│   ├── robot_controller.py      # Dobot motion/state orchestration
-│   ├── dobot_api.py             # Dobot Dashboard/Feedback socket API wrappers
-│   ├── vision_system.py         # RealSense, ONNX inference, tracking, 3D position
-│   ├── config_manager.py        # Runtime JSON config service and point/calibration access
-│   ├── ui_theme.py              # Shared PyQt palette and stylesheet helpers
-│   └── config.json              # Runtime config, calibration, points, performance knobs
-├── cpp_core/                    # Optional C++17 pybind11 acceleration module
-├── docs/                        # Project documentation
-├── build_cpp.py                 # Native extension build helper
-├── requirements.txt             # Python dependencies
-├── test_yolo26_bbox.py          # Current root-level vision regression test/script
-└── DobotControl.spec            # PyInstaller packaging spec
+├── dobot_move/                  # 主 Python 包和 PyQt6 应用
+│   ├── gui_app.py               # 主窗口、标签页、生命周期、Worker 连接
+│   ├── main_control_panel.py    # 提取的主控制面板控件
+│   ├── gui_mixins/              # 按功能区域划分的 UI 行为 mixin
+│   ├── workers.py               # 用于初始化、监控、流程和相机测试的 QThread Worker
+│   ├── robot_controller.py      # Dobot 运动/状态编排
+│   ├── dobot_api.py             # Dobot Dashboard/Feedback Socket API 封装
+│   ├── vision_system.py         # RealSense、ONNX 推理、跟踪、3D 定位
+│   ├── config_manager.py        # 运行时 JSON 配置服务和点位/标定访问
+│   ├── ui_theme.py              # 共享的 PyQt 调色板和样式表辅助工具
+│   └── config.json              # 运行时配置、标定、点位、性能参数
+├── cpp_core/                    # 可选的 C++17 pybind11 加速模块
+├── docs/                        # 项目文档
+├── build_cpp.py                 # 原生扩展构建辅助脚本
+├── requirements.txt             # Python 依赖
+├── test_yolo26_bbox.py          # 当前根目录下的视觉回归测试/脚本
+└── DobotControl.spec            # PyInstaller 打包规范
 ```
 
-## Module Responsibilities
+## 模块职责
 
-- `gui_app.py`: owns the `QApplication` entrypoint, `DobotMainWindow`, tab composition, UI lifecycle, status refresh, and signal wiring.
-- `main_control_panel.py`: provides the primary control widget for robot connection, camera connection, grasp execution, collision level, pause/resume, and error clearing.
-- `gui_mixins/`: separates feature behavior for robot control, vision, Modbus slave service, point management, grasp flow, and jog control.
-- `workers.py`: runs slow or repeated work outside the UI thread, including flow execution, camera test display, robot command workers, and D435i low-FPS recognition.
-- `robot_controller.py`: coordinates Dobot Dashboard/Feedback APIs, motion commands, safety state, Modbus slave integration, motion ownership, safety state, and pose parsing.
-- `vision_system.py`: owns camera startup, RealSense frame capture, ONNX model loading, YOLO post-processing, tracking, depth processing, smoothing, and coordinate conversion.
-- `config_manager.py`: centralizes reads/writes for `dobot_move/config.json`, including robot IP, Modbus slave port, calibration, points, and hand-eye matrices.
-- `cpp_core/`: mirrors selected Python vision math in native code for performance. It must preserve input/output contracts used by `vision_system.py`.
+- `gui_app.py`：拥有 `QApplication` 入口、`DobotMainWindow`、标签页组合、UI 生命周期、状态刷新和信号连接。
+- `main_control_panel.py`：提供机器人连接、相机连接、抓取执行、碰撞等级、暂停/恢复和错误清除的主控制控件。
+- `gui_mixins/`：按功能分离的行为 mixin，包括机器人控制、视觉、Modbus 从站服务、点位管理、抓取流程和点动控制。
+- `workers.py`：在 UI 线程之外运行慢速或重复工作，包括流程执行、相机测试显示、机器人命令 Worker 和 D435i 低帧率识别。
+- `robot_controller.py`：协调 Dobot Dashboard/Feedback API、运动命令、安全状态、Modbus 从站集成、运动所有权、安全状态和位姿解析。
+- `vision_system.py`：拥有相机启动、RealSense 帧捕获、ONNX 模型加载、YOLO 后处理、跟踪、深度处理、平滑和坐标转换。
+- `config_manager.py`：集中管理 `dobot_move/config.json` 的读写，包括机器人 IP、Modbus 从站端口、标定、点位和手眼矩阵。
+- `cpp_core/`：在原生代码中镜像部分 Python 视觉数学运算以提升性能。必须保留 `vision_system.py` 使用的输入/输出契约。
 
-## Data Flow
+## 数据流
 
-1. User operates the PyQt6 UI in `DobotMainWindow`.
-2. UI events call feature mixins or `MainControlPanel` signals.
-3. Robot operations flow through `DobotController`, then into `DobotApiDashboard` and `DobotApiFeedBack`.
-4. Camera operations create `VisionSystem` instances for D435i and/or D405.
-5. `VisionSystem` captures RealSense frames, runs ONNX inference, tracks targets, estimates depth, and converts camera coordinates through hand-eye calibration.
-6. Detected base coordinates update default points such as `d435i` and `d405` through `config_manager.py`.
-7. `FlowThread` executes configured modules from `grasp_flow_modules.json`, resolving points and coordinating robot motion, vision detection, visual servoing, relative moves, and native arc operations.
-8. UI updates are returned through Qt signals to keep the main thread responsive.
+1. 用户在 `DobotMainWindow` 中操作 PyQt6 UI。
+2. UI 事件调用功能 mixin 或 `MainControlPanel` 信号。
+3. 机器人操作通过 `DobotController` 流转，然后进入 `DobotApiDashboard` 和 `DobotApiFeedBack`。
+4. 相机操作为 D435i 和/或 D405 创建 `VisionSystem` 实例。
+5. `VisionSystem` 捕获 RealSense 帧，运行 ONNX 推理，跟踪目标，估算深度，并通过手眼标定转换相机坐标。
+6. 检测到的基座坐标通过 `config_manager.py` 更新默认点位，如 `d435i` 和 `d405`。
+7. `FlowThread` 执行 `grasp_flow_modules.json` 中配置的模块，解析点位并协调机器人运动、视觉检测、视觉伺服、相对移动和原生圆弧操作。
+8. UI 更新通过 Qt 信号返回，保持主线程响应。
 
-## Dependencies
+## 依赖
 
-- Runtime Python dependencies are listed in `requirements.txt`.
-- RealSense operation requires Intel RealSense SDK and compatible D435i/D405 devices.
-- ONNX inference expects a model file at `dobot_move/best.onnx` according to `vision_system.py`.
-- Robot control expects reachable Dobot Dashboard and Feedback ports; defaults in docs mention Dashboard `29999` and Feedback `30004`.
-- Modbus defaults are stored in `config.json`, with typical TCP port `502`.
-- C++ acceleration depends on CMake, a C++17 compiler, pybind11, and Python ABI compatibility.
+- 运行时 Python 依赖列在 `requirements.txt` 中。
+- RealSense 操作需要 Intel RealSense SDK 和兼容的 D435i/D405 设备。
+- ONNX 推理期望模型文件位于 `dobot_move/best.onnx`，具体见 `vision_system.py`。
+- 机器人控制期望可达的 Dobot Dashboard 和 Feedback 端口；文档中的默认值提及 Dashboard `29999` 和 Feedback `30004`。
+- Modbus 默认值存储在 `config.json` 中，典型 TCP 端口为 `502`。
+- C++ 加速依赖 CMake、C++17 编译器、pybind11 和 Python ABI 兼容性。
 
-## Extension Points
+## 扩展点
 
-- Add new grasp-flow module types in `workers.FlowThread` and corresponding UI editing behavior in grasp-flow mixins.
-- Add new point/config fields through `config_manager.py` with migration/default handling.
-- Add camera-specific detection behavior by extending `VisionSystem` while preserving D435i/D405 role separation.
-- Add C++ acceleration by exposing a compatible pybind11 function and guarding calls with Python fallback behavior.
-- Extract additional UI panels from `gui_app.py` into focused widgets under `dobot_move/` or a future UI folder.
+- 在 `workers.FlowThread` 中添加新的抓取流程模块类型，并在抓取流程 mixin 中添加相应的 UI 编辑行为。
+- 通过 `config_manager.py` 添加新的点位/配置字段，并处理迁移/默认值。
+- 通过扩展 `VisionSystem` 添加特定相机的检测行为，同时保留 D435i/D405 角色分离。
+- 通过暴露兼容的 pybind11 函数并使用 Python 回退行为保护调用来添加 C++ 加速。
+- 将更多 UI 面板从 `gui_app.py` 提取为 `dobot_move/` 或未来 UI 目录下的专用控件。
 
-## Risk Points
+## 风险点
 
-- Robot motion is safety-critical. Incorrect coordinate conversion, calibration, units, or point resolution can cause unsafe motion.
-- Existing Chinese text in several files appears mojibake-corrupted. Editing those files can make recovery harder unless encoding is handled carefully.
-- `gui_app.py` remains large and still mixes UI composition, lifecycle, status, and some feature wiring.
-- `config.json` is both runtime state and persisted configuration; concurrent writes from UI/worker paths can cause stale or lost updates.
-- RealSense, ONNX Runtime, CUDA provider availability, Dobot network state, and C++ extension ABI are environment-sensitive.
-- Root-level generated/build artifacts such as `build/`, `Release/`, and `.pyd` files can obscure source-only changes.
+- 机器人运动是安全关键的。错误的坐标转换、标定、单位或点位解析可能导致不安全的运动。
+- 多个文件中的现有中文文本出现乱码损坏。编辑这些文件时如果不谨慎处理编码，可能使恢复更加困难。
+- `gui_app.py` 仍然很大，仍然混合了 UI 组合、生命周期、状态和部分功能连接。
+- `config.json` 既是运行时状态又是持久化配置；来自 UI/Worker 路径的并发写入可能导致过期或丢失更新。
+- RealSense、ONNX Runtime、CUDA provider 可用性、Dobot 网络状态和 C++ 扩展 ABI 都对环境敏感。
+- 根目录下的生成/构建产物（如 `build/`、`Release/` 和 `.pyd` 文件）可能掩盖纯源代码变更。
 
-## Refactoring Suggestions
+## 重构建议
 
-- Move remaining tab construction from `gui_app.py` into dedicated widgets, keeping `DobotMainWindow` as an assembler.
-- Move flow execution logic from `workers.FlowThread` into a service with testable module handlers.
-- Add config write debounce or a single save service to avoid direct writes from many UI paths.
-- Move root-level `test_yolo26_bbox.py` into `tests/` after confirming expected fixtures and hardware/model assumptions.
-- Add a packaging/build document for PyInstaller and native extension compatibility.
-- TODO: Define a stable schema version for `config.json` and migration rules.
+- 将剩余的标签页构建从 `gui_app.py` 移至专用控件，保持 `DobotMainWindow` 作为组装器。
+- 将流程执行逻辑从 `workers.FlowThread` 移至具有可测试模块处理器的服务。
+- 添加配置写入防抖或单一保存服务，避免多个 UI 路径直接写入。
+- 在确认预期的测试夹具和硬件/模型假设后，将根目录下的 `test_yolo26_bbox.py` 移至 `tests/`。
+- 添加 PyInstaller 和原生扩展兼容性的打包/构建文档。
+- TODO：为 `config.json` 定义稳定的模式版本和迁移规则。

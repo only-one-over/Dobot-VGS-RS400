@@ -1,123 +1,123 @@
-# UI Specification
+# UI 规范
 
-## Product Positioning
+## 产品定位
 
-This is an operational desktop control panel for a Dobot vision-guided robot system. The UI should prioritize safety, scanability, clear status, and repeatable operation over decorative presentation.
+这是一个 Dobot 视觉引导机器人系统的操作桌面控制面板。UI 应优先考虑安全性、可扫描性、清晰的状态显示和可重复操作，而非装饰性呈现。
 
-## Page Structure
+## 页面结构
 
-- Main window: `DobotMainWindow` with a status summary area, tab widget, and status bar.
-- Main control tab: robot IP, connect/enable/disable, camera connect/disconnect, run grasp task, collision level, clear error, pause/resume.
-- Parameter/settings tab: photo position and runtime configuration controls.
-- Motion/grasp-flow tab: point management, module selection, module parameter editing, ordered flow steps.
-- Jog control tab: coordinate/joint jog controls and current/target pose displays.
-- Hand-eye calibration tab: D435i/D405 calibration matrix view and save/reset/refresh actions.
-- Camera test tab: D435i/D405 test controls, image preview, coordinate details, D405 endpoint details, D435i low-FPS recognition.
-- Modbus and force-control sections are present through mixins and should remain grouped by task.
+- 主窗口：`DobotMainWindow`，包含状态摘要区域、标签页控件和状态栏。
+- 主控制标签页：机器人 IP、连接/使能/下使能、相机连接/断开、运行抓取任务、碰撞等级、清除错误、暂停/恢复。
+- 参数/设置标签页：拍照位置和运行时配置控件。
+- 运动/抓取流程标签页：点位管理、模块选择、模块参数编辑、有序流程步骤。
+- 点动控制标签页：坐标/关节点动控件和当前/目标位姿显示。
+- 手眼标定标签页：D435i/D405 标定矩阵查看和保存/重置/刷新操作。
+- 相机测试标签页：D435i/D405 测试控件、图像预览、坐标详情、D405 末端详情、D435i 低帧率识别。
+- Modbus 和力控部分通过 mixin 存在，应按任务分组保持。
 
-## Interaction Flow
+## 交互流程
 
-1. Enter or confirm robot IP.
-2. Connect robot.
-3. Enable robot only after connection succeeds and safety state is known.
-4. Connect D435i and/or D405 camera.
-5. Verify detection in camera test view.
-6. Confirm calibration/points and grasp-flow modules.
-7. Run grasp task.
-8. Use pause/resume or clear error when the system state requires it.
-9. Disconnect or close the app, allowing workers and hardware resources to stop cleanly.
+1. 输入或确认机器人 IP。
+2. 连接机器人。
+3. 仅在连接成功且安全状态已知后使能机器人。
+4. 连接 D435i 和/或 D405 相机。
+5. 在相机测试视图中验证检测。
+6. 确认标定/点位和抓取流程模块。
+7. 运行抓取任务。
+8. 当系统状态需要时使用暂停/恢复或清除错误。
+9. 断开连接或关闭应用，允许 Worker 和硬件资源干净地停止。
 
-## Design System
+## 设计系统
 
-The current design system lives in `dobot_move/ui_theme.py`:
+当前设计系统位于 `dobot_move/ui_theme.py`：
 
-- `GLOBAL_STYLESHEET` defines most widget styles.
-- `build_app_palette()` and `apply_app_palette()` set the app palette.
-- `set_button_role()` assigns semantic button roles.
-- `apply_status_visual()` maps status text to visual states.
-- `FLOW_STEP_STYLE`, `FLOW_STEP_SELECTED_STYLE`, and `FLOW_STEP_EMPTY_STYLE` style flow-step labels.
+- `GLOBAL_STYLESHEET` 定义了大部分控件样式。
+- `build_app_palette()` 和 `apply_app_palette()` 设置应用调色板。
+- `set_button_role()` 分配语义按钮角色。
+- `apply_status_visual()` 将状态文本映射到视觉状态。
+- `FLOW_STEP_STYLE`、`FLOW_STEP_SELECTED_STYLE` 和 `FLOW_STEP_EMPTY_STYLE` 样式化流程步骤标签。
 
-## Colors
+## 颜色
 
-Current dominant palette:
+当前主导调色板：
 
-- Window background: `#f0f8ff`
-- Surface: `white`
-- Primary text: `#1a237e`
-- Primary action: `#1565c0`, hover `#0d47a1`
-- Connect/success action: `#e8f5e9`, text `#1b5e20`, border `#66bb6a`
-- Warning action: `#fff7ed`, text `#9a3412`, border `#fb923c`
-- Danger action: `#fee2e2`, text `#991b1b`, border `#f87171`
-- Secondary action: `#f8fafc`, text `#334155`, border `#cbd5e1`
+- 窗口背景：`#f0f8ff`
+- 表面：`white`
+- 主要文本：`#1a237e`
+- 主要操作：`#1565c0`，悬停 `#0d47a1`
+- 连接/成功操作：`#e8f5e9`，文本 `#1b5e20`，边框 `#66bb6a`
+- 警告操作：`#fff7ed`，文本 `#9a3412`，边框 `#fb923c`
+- 危险操作：`#fee2e2`，文本 `#991b1b`，边框 `#f87171`
+- 次要操作：`#f8fafc`，文本 `#334155`，边框 `#cbd5e1`
 
-TODO: Reduce the one-note blue dominance over time while preserving operational clarity.
+TODO：随时间减少单一蓝色主导，同时保持操作清晰度。
 
-## Typography
+## 排版
 
-- Global font: `Segoe UI`, `Arial`, sans-serif.
-- Global size: `10pt`.
-- Status and numeric coordinate labels may use monospace where dense values need alignment.
-- Avoid oversized headings inside operational panels.
+- 全局字体：`Segoe UI`、`Arial`、sans-serif。
+- 全局字号：`10pt`。
+- 状态和数字坐标标签可在密集数值需要对齐时使用等宽字体。
+- 避免在操作面板中使用过大的标题。
 
-## Spacing
+## 间距
 
-- Main layout margins are currently `10px`.
-- Group and button layout spacing is generally `10px`.
-- Table item padding is `4px`.
-- Buttons use `8px 16px` padding.
+- 主布局边距当前为 `10px`。
+- 分组和按钮布局间距通常为 `10px`。
+- 表格项内边距为 `4px`。
+- 按钮使用 `8px 16px` 内边距。
 
-## Radius
+## 圆角
 
-- Inputs and status labels: `4px`.
-- Flow labels: `5px`.
-- Buttons: `6px`.
-- Group boxes, tabs, and message boxes: `8px`.
+- 输入框和状态标签：`4px`。
+- 流程标签：`5px`。
+- 按钮：`6px`。
+- 分组框、标签页和消息框：`8px`。
 
-## Buttons
+## 按钮
 
-- Use semantic roles instead of ad hoc styles:
-  - `primary`: run grasp task and main execution commands.
-  - `connect`: connect, enable, continue.
-  - `warning`: pause, disable.
-  - `danger`: clear error or destructive/safety-critical actions.
-  - `secondary`: support actions such as refresh, get pose, disconnect.
-- Disabled buttons must remain visibly disabled.
-- Motion and hardware actions should be disabled when robot/camera state does not permit them.
+- 使用语义角色而非临时样式：
+  - `primary`：运行抓取任务和主要执行命令。
+  - `connect`：连接、使能、继续。
+  - `warning`：暂停、下使能。
+  - `danger`：清除错误或破坏性/安全关键操作。
+  - `secondary`：辅助操作，如刷新、获取位姿、断开连接。
+- 禁用按钮必须保持明显的禁用状态。
+- 当机器人/相机状态不允许时，运动和硬件操作按钮应被禁用。
 
-## Inputs
+## 输入框
 
-- Robot IP input should stay compact and validate before connection attempts.
-- Numeric pose inputs should use `QDoubleSpinBox` with explicit ranges and units in nearby labels where possible.
-- Combo boxes should use meaningful, stable option order for collision level, camera type, coordinate system, and module type.
+- 机器人 IP 输入应保持紧凑并在连接尝试前验证。
+- 数值位姿输入应使用 `QDoubleSpinBox`，并带有明确的范围和附近标签中的单位说明。
+- 组合框应对碰撞等级、相机类型、坐标系和模块类型使用有意义、稳定的选项顺序。
 
-## Tables
+## 表格
 
-- Point tables should keep point name fixed-width and coordinate columns stretchable.
-- Use alternating rows for scanability.
-- Preserve enough row height for coordinate readability.
-- Avoid direct editing that bypasses validation or point resolution rules.
+- 点位表格应保持点位名称固定宽度，坐标列可拉伸。
+- 使用交替行颜色提高可扫描性。
+- 保持足够的行高以确保坐标可读性。
+- 避免绕过验证或点位解析规则的直接编辑。
 
-## Cards
+## 卡片
 
-This is a PyQt desktop app, so use `QGroupBox` as the main section container. Avoid nested card-like group boxes unless the UI needs a clear safety or data boundary.
+这是一个 PyQt 桌面应用，因此使用 `QGroupBox` 作为主要分区容器。除非 UI 需要明确的安全或数据边界，否则避免嵌套卡片式分组框。
 
-## Dialogs
+## 对话框
 
-- Use dialogs for confirmation, warnings, calibration reset, and unrecoverable errors.
-- Safety-critical confirmations should include the target device/action and consequences.
-- Do not hide hardware failures behind generic success/failure messages.
+- 使用对话框进行确认、警告、标定重置和不可恢复错误。
+- 安全关键确认应包含目标设备/操作和后果说明。
+- 不要将硬件故障隐藏在通用的成功/失败消息之后。
 
-## Status, Toast, and Log
+## 状态、提示和日志
 
-- Status labels use `apply_status_visual()`.
-- The status bar should show short current activity messages.
-- Long-running flows should emit logs through worker signals.
-- Error logs should include enough hardware context to diagnose robot/camera/network state.
-- TODO: Normalize status text matching so visual state does not depend on mojibake-corrupted Chinese strings.
+- 状态标签使用 `apply_status_visual()`。
+- 状态栏应显示简短的当前活动消息。
+- 长时间运行的流程应通过 Worker 信号发出日志。
+- 错误日志应包含足够的硬件上下文以诊断机器人/相机/网络状态。
+- TODO：规范化状态文本匹配，使视觉状态不依赖于乱码损坏的中文字符串。
 
-## Suggested UI Directories
+## 建议的 UI 目录
 
-The project contains UI and would benefit from future organization, but existing files should not be moved without an explicit refactor request:
+项目包含 UI 代码，未来可从组织中受益，但未经明确重构请求，不应移动现有文件：
 
 - `ui/`
 - `components/`
@@ -125,4 +125,4 @@ The project contains UI and would benefit from future organization, but existing
 - `styles/`
 - `resources/`
 
-For this Python/PyQt project, a less disruptive first step is to create `dobot_move/ui/` with widgets, panels, and style helpers after extracting more code from `gui_app.py`.
+对于此 Python/PyQt 项目，破坏性较小的第一步是在从 `gui_app.py` 提取更多代码后，创建 `dobot_move/ui/` 目录，放置控件、面板和样式辅助工具。

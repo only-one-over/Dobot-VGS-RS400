@@ -1,53 +1,53 @@
-# Roadmap
+# 路线图
 
-## Current State
+## 当前状态
 
-- Python/PyQt6 desktop app for Dobot robot control is present.
-- Dual-camera vision flow supports D435i and D405 roles.
-- YOLO/ONNX Runtime, tracking, depth processing, hand-eye calibration, visual servoing, force arc control, Modbus, and battery monitoring are represented in modules.
-- Optional `dobot_core` C++ acceleration exists and is documented in `docs/cpp_acceleration.md`.
-- Existing docs include README, porting guide, C++ acceleration notes, and UI/thread optimization notes.
-- Project-level Codex rules and architecture/workflow/UI/roadmap docs have now been added.
+- 已有基于 Python/PyQt6 的 Dobot 机器人控制桌面应用。
+- 双相机视觉流程支持 D435i 和 D405 角色。
+- YOLO/ONNX Runtime、跟踪、深度处理、手眼标定、视觉伺服、力控圆弧、Modbus 和电池监控等功能已在模块中实现。
+- 可选的 `dobot_core` C++ 加速模块已存在，文档见 `docs/cpp_acceleration.md`。
+- 现有文档包括 README、移植指南、C++ 加速说明和 UI/线程优化说明。
+- 项目级 Codex 规则和架构/工作流/UI/路线图文档现已添加。
 
-## Short-Term Tasks
+## 短期任务
 
-- Fix or recover mojibake-corrupted Chinese text in source comments, labels, and existing docs.
-- Move `test_yolo26_bbox.py` into `tests/` after documenting its expected inputs and fixtures.
-- Add targeted py_compile or smoke-test command to a script under `scripts/`.
-- Document required hardware state before any manual robot/camera validation.
-- Add a `README.md` section pointing to `docs/architecture.md`, `docs/ui_spec.md`, and `docs/dev_workflow.md`.
+- 修复或恢复源码注释、标签和现有文档中乱码损坏的中文文本。
+- 在记录其预期输入和测试夹具后，将 `test_yolo26_bbox.py` 移至 `tests/`。
+- 在 `scripts/` 下添加定向的 py_compile 或冒烟测试命令脚本。
+- 在任何手动机器人/相机验证之前，记录所需的硬件状态。
+- 在 `README.md` 中添加指向 `docs/architecture.md`、`docs/ui_spec.md` 和 `docs/dev_workflow.md` 的章节。
 
-## Medium-Term Tasks
+## 中期任务
 
-- Extract more UI construction from `gui_app.py` into dedicated widgets/panels.
-- Split `FlowThread` behavior into testable grasp-flow module handlers.
-- Introduce a config schema version and migration path for `dobot_move/config.json`.
-- Add unit tests for point resolution, calibration matrix generation, pose parsing, and C++/Python fallback contracts.
-- Add logging and status normalization so UI state colors do not depend on exact localized strings.
-- Confirm PyInstaller packaging and document bundled model/DLL/native-extension requirements.
+- 从 `gui_app.py` 中提取更多 UI 构建到专用控件/面板。
+- 将 `FlowThread` 行为拆分为可测试的抓取流程模块处理器。
+- 为 `dobot_move/config.json` 引入配置模式版本和迁移路径。
+- 为点位解析、标定矩阵生成、位姿解析和 C++/Python 回退契约添加单元测试。
+- 添加日志和状态规范化，使 UI 状态颜色不依赖于精确的本地化字符串。
+- 确认 PyInstaller 打包并记录捆绑的模型/DLL/原生扩展要求。
 
-## Long-Term Tasks
+## 长期任务
 
-- Define a plugin-like grasp-flow module registry for new motion/vision/force steps.
-- Add simulation or dry-run mode for flow validation without live robot motion.
-- Add structured telemetry for latency, detection confidence, robot state, and flow outcomes.
-- Add hardware-in-the-loop validation checklist for release builds.
-- Consider packaging the Python project with `pyproject.toml` once module layout and dependencies stabilize.
+- 定义类似插件式的抓取流程模块注册表，用于新的运动/视觉/力控步骤。
+- 添加仿真或空运行模式，用于在没有实际机器人运动的情况下验证流程。
+- 添加结构化遥测，用于延迟、检测置信度、机器人状态和流程结果。
+- 添加发布构建的硬件在环验证清单。
+- 在模块布局和依赖稳定后，考虑使用 `pyproject.toml` 打包 Python 项目。
 
-## Technical Debt
+## 技术债务
 
-- `gui_app.py` remains too large and owns too many UI construction details.
-- Some worker logic mixes orchestration, safety checks, and business rules in one thread class.
-- Runtime config writes are spread across UI and flow paths.
-- Encoding corruption makes maintenance risky and reduces operator readability.
-- Tests are not yet organized under `tests/`.
-- Build outputs and local environment artifacts are present in the working tree and should stay out of normal source changes.
+- `gui_app.py` 仍然过大，拥有过多的 UI 构建细节。
+- 部分 Worker 逻辑在一个线程类中混合了编排、安全检查和业务规则。
+- 运行时配置写入分散在 UI 和流程路径中。
+- 编码损坏使维护风险增加，降低了操作员可读性。
+- 测试尚未在 `tests/` 下组织。
+- 构建输出和本地环境产物存在于工作树中，应排除在正常源代码变更之外。
 
-## Priority Suggestions
+## 优先级建议
 
-1. Encoding recovery and UTF-8 policy enforcement.
-2. Test folder organization plus basic non-hardware regression checks.
-3. Config write centralization and schema versioning.
-4. UI extraction from `gui_app.py`.
-5. Flow execution service extraction.
-6. Packaging and release checklist.
+1. 编码恢复和 UTF-8 策略执行。
+2. 测试目录组织和基础非硬件回归检查。
+3. 配置写入集中化和模式版本化。
+4. 从 `gui_app.py` 提取 UI。
+5. 流程执行服务提取。
+6. 打包和发布清单。

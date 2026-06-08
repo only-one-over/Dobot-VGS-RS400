@@ -1,7 +1,7 @@
-﻿import json
+import json
 import os
 
-from qt_compat import QMessageBox
+from qt_compat import QMessageBox, QTableWidgetItem
 
 from config_manager import get_grasp_flow_file
 from flow_step_list import STATUS_COMPLETED, STATUS_FAILED, STATUS_RUNNING
@@ -52,7 +52,7 @@ class GraspFlowMixin:
                 "type": "move",
                 "name": "直线运动到目标",
                 "params": {
-                    "target": "camera_detected",
+                    "target": "saved_point",
                     "motion_type": "MovL",
                     "speed": 30,
                     "point_name": "d435i",
@@ -80,6 +80,22 @@ class GraspFlowMixin:
                     "speed": 30,
                     "acceleration": 20,
                     "cp": 100,
+                },
+            }
+        elif module_type == "连续相对路径":
+            new_module = {
+                "type": "relative_path",
+                "name": "连续相对路径",
+                "params": {
+                    "coord_system": "user",
+                    "motion_type": "linear",
+                    "speed": 30,
+                    "acceleration": 30,
+                    "cp": 0,
+                    "execution_mode": "stop_each",
+                    "segments": [
+                        {"enabled": True, "name": "X+200", "x": 200, "y": 0, "z": 0, "rx": 0, "ry": 0, "rz": 0}
+                    ],
                 },
             }
         elif module_type == "关节旋转":
@@ -144,6 +160,8 @@ class GraspFlowMixin:
             self.param_layout.addWidget(self.arc_motion_params, 0, 0)
         elif module_type == "相对移动":
             self.param_layout.addWidget(self.relative_move_params, 0, 0)
+        elif module_type == "连续相对路径":
+            self.param_layout.addWidget(self.relative_path_params, 0, 0)
         elif module_type == "关节旋转":
             self.param_layout.addWidget(self.joint_rotation_params, 0, 0)
         elif module_type in ("相机识别", "视觉伺服"):
@@ -169,6 +187,12 @@ class GraspFlowMixin:
 
         module_type = self.module_combo.currentText()
         if module_type == "直线运动" and current_module["type"] == "move":
+            target_text_map = {
+                "已保存点位": "saved_point",
+                "相机识别坐标": "camera_detected",
+                "初始位置": "initial_position",
+            }
+            current_module["params"]["target"] = target_text_map.get(self.linear_target_combo.currentText(), "saved_point")
             current_module["params"]["point_name"] = self.linear_point_combo.currentText()
             current_module["params"]["speed"] = int(self.linear_speed.value())
             QMessageBox.information(self, "成功", "直线运动参数已更新")
@@ -188,6 +212,17 @@ class GraspFlowMixin:
             current_module["params"]["acceleration"] = int(self.rel_accel.value())
             current_module["params"]["cp"] = int(self.rel_cp.value())
             QMessageBox.information(self, "成功", "相对移动参数已更新")
+        elif module_type == "连续相对路径" and current_module["type"] == "relative_path":
+            coord_map = {"用户": "user", "工具": "tool", "关节": "joint"}
+            motion_map = {"直线": "linear", "关节": "joint"}
+            current_module["params"]["coord_system"] = coord_map.get(self.rpath_coord_combo.currentText(), "user")
+            current_module["params"]["motion_type"] = motion_map.get(self.rpath_motion_combo.currentText(), "linear")
+            current_module["params"]["speed"] = int(self.rpath_speed.value())
+            current_module["params"]["acceleration"] = int(self.rpath_accel.value())
+            current_module["params"]["cp"] = int(self.rpath_cp.value())
+            current_module["params"]["execution_mode"] = self.rpath_exec_mode.currentText()
+            self._save_path_segments(self.rpath_seg_table, current_module["params"])
+            QMessageBox.information(self, "成功", "连续相对路径参数已更新")
         elif module_type == "关节旋转" and current_module["type"] == "joint_move":
             current_module["params"]["offsets"] = [self.joint_offsets[i].value() for i in range(6)]
             current_module["params"]["acceleration"] = int(self.joint_accel.value())
@@ -222,6 +257,7 @@ class GraspFlowMixin:
             "move": "直线运动",
             "arc_motion": "圆弧运动",
             "relative_move": "相对移动",
+            "relative_path": "连续相对路径",
             "joint_move": "关节旋转",
             "visual_servo": "视觉伺服",
         }.get(module.get("type"))
@@ -236,6 +272,16 @@ class GraspFlowMixin:
             if idx >= 0:
                 self.camera_module_combo.setCurrentIndex(idx)
         elif module["type"] == "move" and module["params"].get("motion_type") == "MovL":
+            target = module["params"].get("target", "saved_point")
+            target_text_map = {
+                "saved_point": "已保存点位",
+                "camera_detected": "相机识别坐标",
+                "initial_position": "初始位置",
+            }
+            target_text = target_text_map.get(target, "已保存点位")
+            idx = self.linear_target_combo.findText(target_text)
+            if idx >= 0:
+                self.linear_target_combo.setCurrentIndex(idx)
             point_name = module["params"].get("point_name", "")
             idx = self.linear_point_combo.findText(point_name)
             if idx >= 0:
@@ -268,6 +314,50 @@ class GraspFlowMixin:
             self.rel_speed.setValue(float(p.get("speed", 30)))
             self.rel_accel.setValue(float(p.get("acceleration", 20)))
             self.rel_cp.setValue(float(p.get("cp", 100)))
+        elif module["type"] == "relative_path":
+            p = module.get("params", {})
+            coord_text = {"user": "用户", "tool": "工具", "joint": "关节"}.get(p.get("coord_system", "user"), "用户")
+            motion_text = {"linear": "直线", "joint": "关节"}.get(p.get("motion_type", "linear"), "直线")
+            idx = self.rpath_coord_combo.findText(coord_text)
+            if idx >= 0:
+                self.rpath_coord_combo.setCurrentIndex(idx)
+            idx = self.rpath_motion_combo.findText(motion_text)
+            if idx >= 0:
+                self.rpath_motion_combo.setCurrentIndex(idx)
+            self.rpath_speed.setValue(float(p.get("speed", 30)))
+            self.rpath_accel.setValue(float(p.get("acceleration", 30)))
+            self.rpath_cp.setValue(float(p.get("cp", 0)))
+            # Load execution_mode
+            exec_mode = p.get("execution_mode", "stop_each")
+            idx = self.rpath_exec_mode.findText(exec_mode)
+            if idx >= 0:
+                self.rpath_exec_mode.setCurrentIndex(idx)
+            # Load segments into table
+            self.rpath_seg_table.setRowCount(0)
+            for seg in p.get("segments", []):
+                row = self.rpath_seg_table.rowCount()
+                self.rpath_seg_table.insertRow(row)
+                # enabled
+                self.rpath_seg_table.setItem(row, 0, QTableWidgetItem("✓" if seg.get("enabled", True) else "✗"))
+                # name
+                self.rpath_seg_table.setItem(row, 1, QTableWidgetItem(seg.get("name", "")))
+                # coord_system
+                self.rpath_seg_table.setItem(row, 2, QTableWidgetItem(seg.get("coord_system", "继承")))
+                # motion_type
+                self.rpath_seg_table.setItem(row, 3, QTableWidgetItem(seg.get("motion_type", "继承")))
+                # offsets
+                for col, key in enumerate(["x", "y", "z", "rx", "ry", "rz"]):
+                    self.rpath_seg_table.setItem(row, 4 + col, QTableWidgetItem(str(seg.get(key, 0))))
+                # speed
+                self.rpath_seg_table.setItem(row, 10, QTableWidgetItem(str(seg["speed"]) if "speed" in seg else "继承"))
+                # acceleration
+                self.rpath_seg_table.setItem(row, 11, QTableWidgetItem(str(seg["acceleration"]) if "acceleration" in seg else "继承"))
+                # cp
+                self.rpath_seg_table.setItem(row, 12, QTableWidgetItem(str(seg["cp"]) if "cp" in seg else "继承"))
+                # wait_after
+                self.rpath_seg_table.setItem(row, 13, QTableWidgetItem("是" if seg.get("wait_after", True) else "否"))
+                # note
+                self.rpath_seg_table.setItem(row, 14, QTableWidgetItem(seg.get("note", "")))
 
     def save_grasp_flow(self):
         if not self.grasp_flow_modules:
@@ -371,3 +461,147 @@ class GraspFlowMixin:
     def _on_steps_reordered(self, modules):
         self.grasp_flow_modules = modules
         self._normalize_flow_modules()
+
+    # -- 连续相对路径 segment table helpers --
+
+    def _add_path_template(self, table, template):
+        row = table.rowCount()
+        table.insertRow(row)
+        # Column order: 启用, 名称, 坐标系, 方式, X, Y, Z, Rx, Ry, Rz, 速度, 加速度, CP, 段后等待, 备注
+        table.setItem(row, 0, QTableWidgetItem("✓"))  # enabled
+        if template == "x200":
+            table.setItem(row, 1, QTableWidgetItem("X+200"))
+            values = [200, 0, 0, 0, 0, 0]
+        elif template == "y200":
+            table.setItem(row, 1, QTableWidgetItem("Y+200"))
+            values = [0, 200, 0, 0, 0, 0]
+        elif template == "z200":
+            table.setItem(row, 1, QTableWidgetItem("Z+200"))
+            values = [0, 0, 200, 0, 0, 0]
+        elif template == "zy200":
+            table.setItem(row, 1, QTableWidgetItem("ZY平面200"))
+            values = [0, 141.4, 141.4, 0, 0, 0]
+        else:
+            table.setItem(row, 1, QTableWidgetItem(f"段{row+1}"))
+            values = [0, 0, 0, 0, 0, 0]
+        table.setItem(row, 2, QTableWidgetItem("继承"))  # coord_system
+        table.setItem(row, 3, QTableWidgetItem("继承"))  # motion_type
+        for col, val in enumerate(values):
+            table.setItem(row, 4 + col, QTableWidgetItem(str(val)))
+        table.setItem(row, 10, QTableWidgetItem("继承"))  # speed
+        table.setItem(row, 11, QTableWidgetItem("继承"))  # acceleration
+        table.setItem(row, 12, QTableWidgetItem("继承"))  # cp
+        table.setItem(row, 13, QTableWidgetItem("是"))  # wait_after
+        table.setItem(row, 14, QTableWidgetItem(""))  # note
+
+    def _remove_path_segment(self, table):
+        rows = set(item.row() for item in table.selectedItems())
+        for row in sorted(rows, reverse=True):
+            table.removeRow(row)
+        self._renumber_segments(table)
+
+    def _move_path_segment(self, table, direction):
+        rows = set(item.row() for item in table.selectedItems())
+        if not rows:
+            return
+        row = min(rows)
+        new_row = row + direction
+        if new_row < 0 or new_row >= table.rowCount():
+            return
+        for col in range(table.columnCount()):
+            item1 = table.takeItem(row, col)
+            item2 = table.takeItem(new_row, col)
+            table.setItem(row, col, item2)
+            table.setItem(new_row, col, item1)
+        self._renumber_segments(table)
+
+    def _renumber_segments(self, table):
+        # No longer renumbering column 0 (now "启用" instead of "段号")
+        pass
+
+    def _copy_path_segment(self, table):
+        rows = set(item.row() for item in table.selectedItems())
+        if not rows:
+            return
+        for row in sorted(rows):
+            new_row = row + 1
+            table.insertRow(new_row)
+            for col in range(table.columnCount()):
+                item = table.item(row, col)
+                new_item = QTableWidgetItem(item.text() if item else "")
+                table.setItem(new_row, col, new_item)
+        self._renumber_segments(table)
+
+    def _apply_global_to_segments(self, table):
+        """Apply global defaults to selected segments."""
+        rows = set(item.row() for item in table.selectedItems())
+        for row in rows:
+            table.setItem(row, 2, QTableWidgetItem("继承"))  # coord_system
+            table.setItem(row, 3, QTableWidgetItem("继承"))  # motion_type
+            table.setItem(row, 10, QTableWidgetItem("继承"))  # speed
+            table.setItem(row, 11, QTableWidgetItem("继承"))  # acceleration
+            table.setItem(row, 12, QTableWidgetItem("继承"))  # cp
+
+    def _zero_selected_segments(self, table):
+        """Zero out offsets for selected segments."""
+        rows = set(item.row() for item in table.selectedItems())
+        for row in rows:
+            for col in range(4, 10):  # X, Y, Z, Rx, Ry, Rz columns
+                table.setItem(row, col, QTableWidgetItem("0"))
+
+    def _save_path_segments(self, table, module_params):
+        segments = []
+        for row in range(table.rowCount()):
+            seg = {}
+            # enabled
+            enabled_item = table.item(row, 0)
+            seg["enabled"] = enabled_item.text() != "✗" if enabled_item else True
+            # name
+            name_item = table.item(row, 1)
+            if name_item and name_item.text():
+                seg["name"] = name_item.text()
+            # coord_system (only save if not "继承")
+            coord_item = table.item(row, 2)
+            if coord_item and coord_item.text() and coord_item.text() != "继承":
+                seg["coord_system"] = coord_item.text()
+            # motion_type (only save if not "继承")
+            motion_item = table.item(row, 3)
+            if motion_item and motion_item.text() and motion_item.text() != "继承":
+                seg["motion_type"] = motion_item.text()
+            # offsets
+            for col, key in enumerate(["x", "y", "z", "rx", "ry", "rz"]):
+                item = table.item(row, 4 + col)
+                try:
+                    seg[key] = float(item.text()) if item else 0.0
+                except ValueError:
+                    seg[key] = 0.0
+            # speed (only save if not "继承")
+            speed_item = table.item(row, 10)
+            if speed_item and speed_item.text() and speed_item.text() != "继承":
+                try:
+                    seg["speed"] = int(float(speed_item.text()))
+                except ValueError:
+                    pass
+            # acceleration (only save if not "继承")
+            accel_item = table.item(row, 11)
+            if accel_item and accel_item.text() and accel_item.text() != "继承":
+                try:
+                    seg["acceleration"] = int(float(accel_item.text()))
+                except ValueError:
+                    pass
+            # cp (only save if not "继承")
+            cp_item = table.item(row, 12)
+            if cp_item and cp_item.text() and cp_item.text() != "继承":
+                try:
+                    seg["cp"] = int(float(cp_item.text()))
+                except ValueError:
+                    pass
+            # wait_after
+            wait_item = table.item(row, 13)
+            seg["wait_after"] = wait_item.text() != "否" if wait_item else True
+            # note
+            note_item = table.item(row, 14)
+            if note_item and note_item.text():
+                seg["note"] = note_item.text()
+            segments.append(seg)
+        module_params["segments"] = segments

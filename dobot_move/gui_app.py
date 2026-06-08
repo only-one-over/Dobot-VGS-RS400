@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 机器人抓取控制程序 - 图形界面版本
@@ -471,7 +471,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         module_select_layout.setSpacing(10)
         module_select_layout.addWidget(QLabel("选择模块:"))
         self.module_combo = QComboBox()
-        self.module_combo.addItems(["相机识别", "直线运动", "圆弧运动", "相对移动", "关节旋转", "视觉伺服"])
+        self.module_combo.addItems(["相机识别", "直线运动", "圆弧运动", "相对移动", "连续相对路径", "关节旋转", "视觉伺服"])
         self.module_combo.currentIndexChanged.connect(self.on_module_combo_changed)
         module_select_layout.addWidget(self.module_combo)
         
@@ -494,6 +494,15 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.linear_params = QWidget()
         linear_layout = QVBoxLayout(self.linear_params)
         linear_layout.setSpacing(10)
+
+        target_layout = QHBoxLayout()
+        target_layout.addWidget(QLabel("目标类型:"))
+        self.linear_target_combo = QComboBox()
+        self.linear_target_combo.addItems(["已保存点位", "相机识别坐标", "初始位置"])
+        self.linear_target_combo.setToolTip("已保存点位: 移动到已保存的点位; 相机识别坐标: 移动到相机识别结果; 初始位置: 移动到初始位置")
+        target_layout.addWidget(self.linear_target_combo)
+        target_layout.addStretch()
+        linear_layout.addLayout(target_layout)
 
         self.linear_point_combo = QComboBox()
         linear_layout.addWidget(self.linear_point_combo)
@@ -644,7 +653,116 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.camera_module_combo.addItems(["D435i", "D405"])
         self.camera_module_combo.setCurrentIndex(0)
         camera_param_layout.addWidget(self.camera_module_combo, 0, 1)
-        
+
+        # 连续相对路径参数
+        self.relative_path_params = QWidget()
+        rpath_layout = QVBoxLayout(self.relative_path_params)
+        rpath_layout.setSpacing(6)
+
+        # 执行模式
+        exec_mode_layout = QHBoxLayout()
+        rpath_exec_mode_label = QLabel("执行模式:")
+        exec_mode_layout.addWidget(rpath_exec_mode_label)
+        self.rpath_exec_mode = QComboBox()
+        self.rpath_exec_mode.addItems(["stop_each", "queued"])
+        self.rpath_exec_mode.setToolTip("stop_each: 每段等待完成; queued: 连续下发后统一等待")
+        exec_mode_layout.addWidget(self.rpath_exec_mode)
+        exec_mode_layout.addStretch()
+        rpath_layout.addLayout(exec_mode_layout)
+
+        # 段表格
+        self.rpath_seg_table = QTableWidget(0, 15)
+        self.rpath_seg_table.setHorizontalHeaderLabels(["启用", "名称", "坐标系", "方式", "X", "Y", "Z", "Rx", "Ry", "Rz", "速度", "加速度", "CP", "段后等待", "备注"])
+        self.rpath_seg_table.horizontalHeader().setStretchLastSection(True)
+        self.rpath_seg_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        rpath_layout.addWidget(self.rpath_seg_table)
+
+        # 段操作按钮行
+        seg_btn_layout = QHBoxLayout()
+        btn_add_seg = QPushButton("添加段")
+        btn_add_seg.clicked.connect(lambda: self._add_path_template(self.rpath_seg_table, "empty"))
+        seg_btn_layout.addWidget(btn_add_seg)
+
+        btn_del_seg = QPushButton("删除段")
+        btn_del_seg.clicked.connect(lambda: self._remove_path_segment(self.rpath_seg_table))
+        seg_btn_layout.addWidget(btn_del_seg)
+
+        btn_up_seg = QPushButton("上移")
+        btn_up_seg.clicked.connect(lambda: self._move_path_segment(self.rpath_seg_table, -1))
+        seg_btn_layout.addWidget(btn_up_seg)
+
+        btn_down_seg = QPushButton("下移")
+        btn_down_seg.clicked.connect(lambda: self._move_path_segment(self.rpath_seg_table, 1))
+        seg_btn_layout.addWidget(btn_down_seg)
+
+        btn_x200 = QPushButton("X +200")
+        btn_x200.clicked.connect(lambda: self._add_path_template(self.rpath_seg_table, "x200"))
+        seg_btn_layout.addWidget(btn_x200)
+
+        btn_zy200 = QPushButton("ZY 平面 200")
+        btn_zy200.clicked.connect(lambda: self._add_path_template(self.rpath_seg_table, "zy200"))
+        seg_btn_layout.addWidget(btn_zy200)
+
+        btn_y200 = QPushButton("Y +200")
+        btn_y200.clicked.connect(lambda: self._add_path_template(self.rpath_seg_table, "y200"))
+        seg_btn_layout.addWidget(btn_y200)
+
+        btn_z200 = QPushButton("Z +200")
+        btn_z200.clicked.connect(lambda: self._add_path_template(self.rpath_seg_table, "z200"))
+        seg_btn_layout.addWidget(btn_z200)
+
+        btn_copy_seg = QPushButton("复制段")
+        btn_copy_seg.clicked.connect(lambda: self._copy_path_segment(self.rpath_seg_table))
+        seg_btn_layout.addWidget(btn_copy_seg)
+
+        btn_apply_global = QPushButton("应用全局")
+        btn_apply_global.clicked.connect(lambda: self._apply_global_to_segments(self.rpath_seg_table))
+        seg_btn_layout.addWidget(btn_apply_global)
+
+        btn_zero_sel = QPushButton("清零选中")
+        btn_zero_sel.clicked.connect(lambda: self._zero_selected_segments(self.rpath_seg_table))
+        seg_btn_layout.addWidget(btn_zero_sel)
+
+        seg_btn_layout.addStretch()
+        rpath_layout.addLayout(seg_btn_layout)
+
+        # 通用参数行
+        common_layout = QGridLayout()
+        common_layout.setSpacing(10)
+
+        common_layout.addWidget(QLabel("坐标系:"), 0, 0)
+        self.rpath_coord_combo = QComboBox()
+        self.rpath_coord_combo.addItems(["用户", "工具", "关节"])
+        common_layout.addWidget(self.rpath_coord_combo, 0, 1)
+
+        common_layout.addWidget(QLabel("运动方式:"), 0, 2)
+        self.rpath_motion_combo = QComboBox()
+        self.rpath_motion_combo.addItems(["直线", "关节"])
+        common_layout.addWidget(self.rpath_motion_combo, 0, 3)
+
+        common_layout.addWidget(QLabel("速度:"), 0, 4)
+        self.rpath_speed = QDoubleSpinBox()
+        self.rpath_speed.setRange(1, 100)
+        self.rpath_speed.setValue(30)
+        self.rpath_speed.setDecimals(0)
+        common_layout.addWidget(self.rpath_speed, 0, 5)
+
+        common_layout.addWidget(QLabel("加速度:"), 1, 0)
+        self.rpath_accel = QDoubleSpinBox()
+        self.rpath_accel.setRange(1, 100)
+        self.rpath_accel.setValue(30)
+        self.rpath_accel.setDecimals(0)
+        common_layout.addWidget(self.rpath_accel, 1, 1)
+
+        common_layout.addWidget(QLabel("CP:"), 1, 2)
+        self.rpath_cp = QDoubleSpinBox()
+        self.rpath_cp.setRange(0, 100)
+        self.rpath_cp.setValue(0)
+        self.rpath_cp.setDecimals(0)
+        common_layout.addWidget(self.rpath_cp, 1, 3)
+
+        rpath_layout.addLayout(common_layout)
+
         # 默认显示直线运动参数
         self.param_layout.addWidget(self.linear_params, 0, 0)
         
@@ -1180,12 +1298,17 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
 
     def _poll_status(self):
         if self.controller:
-            last_time = self.controller.get_last_feed_time()
-            if last_time > 0 and time.time() - last_time < 2:
-                robot_status = "已连接"
+            if self.controller.is_connected:
+                # Check 30004 feedback health separately
+                fb_health = self.controller.get_feedback_health()
+                if fb_health["health"] == "ok":
+                    robot_status = "已连接"
+                elif fb_health["health"] == "stale":
+                    robot_status = "已连接(反馈延迟)"
+                else:
+                    robot_status = "已连接(反馈异常)"
             else:
                 robot_status = "未连接"
-                self.controller.is_connected = False
             self.update_status("robot", robot_status)
 
         cameras = []
@@ -1232,6 +1355,8 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             self.statusBar().showMessage("正在解除软件急停...")
             thread = RobotCmdThread("解除软件急停", self.controller.release_emergency_stop, self)
         else:
+            # Immediately mark emergency active and stop flow
+            self._software_emergency_active = True
             if hasattr(self, "_flow_thread") and self._flow_thread is not None and self._flow_thread.isRunning():
                 self._flow_thread.stop()
             self.statusBar().showMessage("正在触发软件急停...")

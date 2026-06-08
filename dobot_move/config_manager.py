@@ -19,7 +19,7 @@ _cache_valid = False
 
 DEFAULT_PERFORMANCE_CONFIG = {
     "flow_wait_poll_interval": 0.05,
-    "robot_mode_dashboard_fallback_interval": 0.5,
+    "robot_mode_dashboard_fallback_interval": 1.0,
     "pose_cache_max_age": 0.3,
     "motion_settle_time": 0.15,
     "flow_camera_frames": 3,
@@ -28,6 +28,13 @@ DEFAULT_PERFORMANCE_CONFIG = {
     "flow_detection_cache_ttl": 1.0,
     "feedback_stale_warn_age": 0.5,
     "feedback_stale_fail_age": 2.0,
+    "motion_done_speed_threshold": 1.0,
+    "motion_done_rotation_speed_threshold": 1.0,
+    "motion_done_pose_tolerance": 2.0,
+    "motion_done_rotation_tolerance": 2.0,
+    "motion_done_stable_samples": 3,
+    "motion_done_use_feedback": True,
+    "motion_wait_robot_mode_fallback": True,
 }
 
 

@@ -6,7 +6,7 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-green.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-基于 Python + PySide6 的越疆 CR 系列机械臂视觉定位控制系统。集成双 RealSense 深度相机（D435i + D405）、YOLO 实例分割、ByteTrack 目标跟踪、3D 卡尔曼滤波、手眼标定、视觉伺服和普通圆弧运动，实现从目标识别到精准定位的全自动化流程。
+基于 Python + PyQt6 的越疆 CR 系列机械臂视觉定位控制系统。集成双 RealSense 深度相机（D435i + D405）、YOLO 实例分割、ByteTrack 目标跟踪、3D 卡尔曼滤波、手眼标定、视觉伺服和普通圆弧运动，实现从目标识别到精准定位的全自动化流程。
 
 ## 目录
 
@@ -31,7 +31,15 @@
 - ⚡ **C++ 加速** — 可选 dobot_core pybind11 模块，5-20 倍加速，Python 回退
 - 🔀 **流程步骤编辑器** — 拖拽排序步骤，实时状态图标（待执行/执行中/已完成/失败）
 - 💾 **ConfigService** — 统一防抖配置写入，避免频繁磁盘 I/O
-- 🎨 **PySide6 兼容** — qt_compat.py 抽象层，实现 Qt 框架无关性
+- 🎨 **PyQt6 兼容** — qt_compat.py 抽象层，实现 Qt 框架无关性
+- 🔒 **运动互斥锁** — acquire_motion/release_motion，流程和 Modbus 运动互斥，急停始终优先
+- ⚡ **30004 反馈状态机** — 速度归零+位姿到位+连续稳定判定运动完成，减少 Dashboard 查询
+- 🆔 **指令 ID 追踪** — 按官方 TCP-IP-Python-V4 模式，CurrentCommandId 精确判定运动完成
+- 🛑 **急停独立连接** — 独立临时 Dashboard 连接发送 EmergencyStop，避免主连接锁阻塞
+- 📊 **统一反馈快照** — get_motion_feedback_snapshot() 一次性返回位姿、速度、队列状态、运行状态
+- 🔄 **Modbus 异步执行** — 运动命令投递独立线程，cmd=9 急停走快速路径，200ms 周期不阻塞
+- 📋 **连续相对路径编辑器** — 15 列段表、stop_each/queued 执行模式、模板按钮、段级参数覆盖
+- 🎯 **saved_point 目标** — 直线运动支持已保存点位/相机识别坐标/初始位置三种目标
 
 ## 快速开始
 
@@ -64,7 +72,7 @@ python build_cpp.py
 ### 验证安装
 
 ```bash
-python -c "import PySide6, numpy, cv2, pyrealsense2, onnxruntime; print('All dependencies OK')"
+python -c "import PyQt6, numpy, cv2, pyrealsense2, onnxruntime; print('All dependencies OK')"
 
 # 可选：验证 C++ 模块
 python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
@@ -74,7 +82,7 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                   GUI (PySide6)                    │
+│                   GUI (PyQt6)                    │
 │           DobotMainWindow + 7 Mixins             │
 ├─────────┬──────────┬──────────┬─────────────────┤
 │  机器人   │  视觉     │  力控     │   Modbus        │
@@ -93,7 +101,7 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 
 | 模块 | 文件 | 描述 |
 |------|------|------|
-| 主界面 | `gui_app.py` | PySide6 主窗口 + 7 个 Mixin |
+| 主界面 | `gui_app.py` | PyQt6 主窗口 + 7 个 Mixin |
 | 机器人控制器 | `robot_controller.py` | 运动控制、状态管理 |
 | 通信 | `dobot_api.py` | TCP/IP Dashboard (29999) + Feedback (30004) |
 | 视觉系统 | `vision_system.py` | YOLO 推理、目标检测、3D 定位 |
@@ -102,15 +110,15 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 | 深度处理 | `depth_processor.py` | 4 级 RealSense 深度滤波链 |
 | 手眼标定 | `hand_eye_calib.py` | 标定矩阵管理 |
 | 坐标变换 | `transform_utils.py` | euler2rot / pose2matrix |
-| 视觉伺服 | `visual_servo_controller.py` | 迭代视觉伺服控制 |
+| 视觉伺服 | `visual_servo_controller.py` | 多线程视觉伺服控制 |
 | 圆弧运动 | `arc_motion_controller.py` | 原生 Dobot Arc() 运动控制 | 力传感器监测线程 |
 | 圆弧规划 | `arc_trajectory_planner.py` | 圆弧航点生成 | CAN 总线电池监测 |
 | Modbus 服务器 | `modbus_server.py` | Modbus TCP 服务器 | Modbus TCP 客户端（小车） |
 | 配置管理 | `config_manager.py` | JSON 配置读写 |
 | 主控面板 | `main_control_panel.py` | 主控面板组件，基于信号通信 |
-| 流程步骤列表 | `flow_step_list.py` | 流程步骤列表，支持拖拽排序和状态图标 |
-| Qt 兼容层 | `qt_compat.py` | Qt 框架兼容层（PySide6） |
-| 工作线程 | `workers.py` | 设备初始化、状态更新线程 |
+| 流程步骤列表 | `flow_step_list.py` | 流程步骤列表，拖拽排序+状态图标 |
+| Qt 兼容层 | `qt_compat.py` | Qt 框架兼容层（PyQt6） |
+| 工作线程 | `workers.py` | 流程执行、FlowRunContext、模块验证、运动互斥锁 |
 | C++ 核心 | `cpp_core/` | pybind11 加速模块 |
 
 ### 硬件要求
@@ -163,6 +171,36 @@ python gui_app.py
 → 原生圆弧运动或相对移动（可选） → 抬升 → 放置
 ```
 
+### 流程模块类型
+
+| 类型 | 描述 |
+|------|------|
+| 直线运动 | MovJ/MovL 绝对运动，支持已保存点位/相机识别坐标/初始位置三种目标 |
+| 圆弧运动 | 基于当前位姿生成圆弧路径，使用 ServoP 队列运动 |
+| 相对移动 | 单次 RelMovL/RelMovJ 相对运动 |
+| 连续相对路径 | 多段相对运动，15列段表编辑，stop_each/queued 两种执行模式 |
+| 相机识别 | 多帧检测+置信度提前退出+缓存复用，D435i/D405 双相机 |
+| 视觉伺服 | D405 闭环迭代逼近，自适应增益 |
+| 关节旋转 | RelJointMovJ 关节空间旋转 |
+
+### 运动完成判定
+
+运动完成判定采用三级优先级机制：
+
+1. **指令 ID 判定**（最高优先级）：30004 反馈中 `CurrentCommandId == command_id` 且运行状态显示完成
+2. **30004 反馈状态机**：线速度+角速度归零 + 位姿到位（绝对运动）或 RunningStatus/RunQueuedCmd 完成（相对运动）+ 连续稳定 3 次
+3. **Dashboard 兜底**：仅在 30004 反馈过期时按 1.0s 冷却间隔查询 RobotMode
+
+安全守卫：最小稳定时间（0.15s）+ 必须见过运动状态才允许判定完成。
+
+### 安全机制
+
+- **急停独立连接**：通过独立临时 TCP 连接发送 EmergencyStop，避免主 Dashboard 连接锁阻塞
+- **运动互斥锁**：流程和 Modbus 运动互斥执行，急停始终优先
+- **急停立即停止**：急停触发时立即设置 stop_event，流程线程马上停止下发
+- **反馈包校验**：30004 反馈 TestValue 严格校验，校验失败不更新缓存
+- **连接状态分离**：Dashboard 连接状态和 30004 反馈健康状态分开显示
+
 ## 配置
 
 ### config.json
@@ -180,6 +218,22 @@ python gui_app.py
 | `calibration.D405` | object | D405 手眼标定参数 | 见下方 |
 | `points` | object | 点位表 | 见下方 | 小车 IP 地址 | `"192.168.5.2"` | 小车 Modbus 端口 | `502` |
 | `modbus_port` | int | 本地 Modbus 服务器端口 | `502` |
+
+#### 性能配置
+
+| 字段 | 默认值 | 描述 |
+|------|--------|------|
+| `flow_wait_poll_interval` | 0.05 | 流程等待轮询间隔（秒） |
+| `robot_mode_dashboard_fallback_interval` | 1.0 | RobotMode Dashboard 查询冷却间隔（秒） |
+| `pose_cache_max_age` | 0.3 | 位姿缓存最大年龄（秒） |
+| `motion_settle_time` | 0.15 | 运动命令后最小稳定时间（秒） |
+| `motion_done_speed_threshold` | 1.0 | 线速度归零阈值（mm/s） |
+| `motion_done_rotation_speed_threshold` | 1.0 | 角速度归零阈值（°/s） |
+| `motion_done_pose_tolerance` | 2.0 | 位姿到位容差（mm） |
+| `motion_done_rotation_tolerance` | 2.0 | 旋转到位容差（°） |
+| `motion_done_stable_samples` | 3 | 连续稳定采样次数 |
+| `motion_done_use_feedback` | true | 是否使用 30004 反馈辅助判定 |
+| `feedback_stale_fail_age` | 2.0 | 反馈断流失败判定时间（秒） |
 
 #### 手眼标定
 

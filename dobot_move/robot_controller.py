@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 越疆机器人控制模块
@@ -44,6 +44,23 @@ class DobotController:
         self.latest_robot_mode = None
         self.latest_robot_mode_time = 0.0
         self.latest_feed_time = 0.0
+        self.latest_tcp_speed = None
+        self.latest_tcp_speed_time = 0.0
+        self.latest_running_status = None
+        self.latest_running_status_time = 0.0
+        self.latest_run_queued_cmd = None
+        self.latest_run_queued_cmd_time = 0.0
+        self.latest_current_command_id = None
+        self.latest_current_command_id_time = 0.0
+        self.latest_tool_vector_target = None
+        self.latest_tool_vector_target_time = 0.0
+        self.latest_q_actual = None
+        self.latest_q_actual_time = 0.0
+        self.latest_q_target = None
+        self.latest_q_target_time = 0.0
+
+        self._motion_command_sent_time = 0.0
+        self._has_seen_motion_state = False
 
         self.position_tolerance = 10.0
         self.safe_speed = 30
@@ -57,6 +74,8 @@ class DobotController:
         self.modbus_server = None
         self._modbus_thread = None
         self._modbus_event = threading.Event()
+        self._modbus_exec_thread = None
+        self._modbus_exec_lock = threading.Lock()
         self._modbus_cycle_count = 0
         self._modbus_last_duration = 0.0
         self.auto_hook_mode = False
@@ -64,10 +83,14 @@ class DobotController:
         self._last_fault_code = 0
         self._robot_alarm_recorded = False
         self.software_emergency_active = False
+        self._active_flow_thread = None
         self.alarm_history = AlarmHistory()
 
         self._motion_owner = None
         self._motion_lock = threading.Lock()
+        self._last_move_timing = {}  # {"speed_set": 0.0, "command_send": 0.0, "motion_wait": 0.0}
+        self._last_command_id = None
+        self._feed_packet_drops = 0
 
     def record_alarm(self, source, code="", level="报警", description="", solution="", raw=""):
         try:
@@ -124,6 +147,25 @@ class DobotController:
         except Exception as e:
             logger.error(f" 解析响应码失败: {e}")
         return None
+
+    def parse_response_ids(self, response):
+        """Parse Dashboard response to extract [code, command_id, ...].
+
+        Follows official DobotDemo.parseResultId pattern.
+        Returns list of ints, e.g. [0, 123] for "0,123,..."
+        or [0] if only code present, or [1] if "Not Tcp" detected.
+        """
+        if not response:
+            return [1]
+        if "Not Tcp" in str(response):
+            logger.warning("控制模式不是TCP模式")
+            return [1]
+        try:
+            nums = [int(n) for n in re.findall(r'-?\d+', str(response))]
+            return nums if nums else [2]
+        except Exception as e:
+            logger.error(f"解析响应ID失败: {e}")
+            return [2]
 
     def parse_robot_mode(self, response):
         """专门解析RobotMode响应，提取花括号中的状态码"""
@@ -650,6 +692,28 @@ class DobotController:
         except Exception:
             return None
 
+    def _extract_tcp_speed_from_feed_data(self, data):
+        """Extract TCPSpeedActual from 30004 feedback data.
+
+        Returns a list of 6 floats [vx, vy, vz, vrx, vry, vrz] or None.
+        """
+        try:
+            if data is None:
+                return None
+            names = getattr(getattr(data, "dtype", None), "names", None)
+            if names and "TCPSpeedActual" in names:
+                speed = data["TCPSpeedActual"][0]
+            elif hasattr(data, "get"):
+                speed = data.get("TCPSpeedActual")
+                if speed is not None and len(speed) and hasattr(speed[0], "__iter__"):
+                    speed = speed[0]
+            else:
+                return None
+            speed = [float(v) for v in speed[:6]]
+            return speed if len(speed) == 6 and all(np.isfinite(speed)) else None
+        except Exception:
+            return None
+
     def _extract_robot_mode_from_feed_data(self, data):
         try:
             if data is None:
@@ -667,6 +731,123 @@ class DobotController:
         except Exception:
             return None
         return None
+
+    def _extract_running_status_from_feed_data(self, data):
+        """Extract RunningStatus from 30004 feedback data. Returns int or None."""
+        try:
+            if data is None:
+                return None
+            if hasattr(data, "get"):
+                val = data.get("RunningStatus")
+                if val is not None:
+                    try:
+                        return int(val[0])
+                    except Exception:
+                        return int(val)
+            names = getattr(getattr(data, "dtype", None), "names", None)
+            if names and "RunningStatus" in names:
+                return int(data["RunningStatus"][0])
+        except Exception:
+            return None
+        return None
+
+    def _extract_run_queued_cmd_from_feed_data(self, data):
+        """Extract RunQueuedCmd from 30004 feedback data. Returns int or None."""
+        try:
+            if data is None:
+                return None
+            if hasattr(data, "get"):
+                val = data.get("RunQueuedCmd")
+                if val is not None:
+                    try:
+                        return int(val[0])
+                    except Exception:
+                        return int(val)
+            names = getattr(getattr(data, "dtype", None), "names", None)
+            if names and "RunQueuedCmd" in names:
+                return int(data["RunQueuedCmd"][0])
+        except Exception:
+            return None
+        return None
+
+    def _extract_current_command_id_from_feed_data(self, data):
+        """Extract CurrentCommandId from 30004 feedback data. Returns int or None."""
+        try:
+            if data is None:
+                return None
+            if hasattr(data, "get"):
+                val = data.get("CurrentCommandId")
+                if val is not None:
+                    try:
+                        return int(val[0])
+                    except Exception:
+                        return int(val)
+            names = getattr(getattr(data, "dtype", None), "names", None)
+            if names and "CurrentCommandId" in names:
+                return int(data["CurrentCommandId"][0])
+        except Exception:
+            return None
+        return None
+
+    def _extract_tool_vector_target_from_feed_data(self, data):
+        """Extract ToolVectorTarget from 30004 feedback data. Returns list of 6 floats or None."""
+        try:
+            if data is None:
+                return None
+            if hasattr(data, "get"):
+                val = data.get("ToolVectorTarget")
+                if val is not None and len(val) and hasattr(val[0], "__iter__"):
+                    val = val[0]
+            else:
+                names = getattr(getattr(data, "dtype", None), "names", None)
+                if names and "ToolVectorTarget" in names:
+                    val = data["ToolVectorTarget"][0]
+                else:
+                    return None
+            result = [float(v) for v in val[:6]]
+            return result if len(result) == 6 and all(np.isfinite(result)) else None
+        except Exception:
+            return None
+
+    def _extract_q_actual_from_feed_data(self, data):
+        """Extract QActual from 30004 feedback data. Returns list of 6 floats or None."""
+        try:
+            if data is None:
+                return None
+            if hasattr(data, "get"):
+                val = data.get("QActual")
+                if val is not None and len(val) and hasattr(val[0], "__iter__"):
+                    val = val[0]
+            else:
+                names = getattr(getattr(data, "dtype", None), "names", None)
+                if names and "QActual" in names:
+                    val = data["QActual"][0]
+                else:
+                    return None
+            result = [float(v) for v in val[:6]]
+            return result if len(result) == 6 and all(np.isfinite(result)) else None
+        except Exception:
+            return None
+
+    def _extract_q_target_from_feed_data(self, data):
+        """Extract QTarget from 30004 feedback data. Returns list of 6 floats or None."""
+        try:
+            if data is None:
+                return None
+            if hasattr(data, "get"):
+                val = data.get("QTarget")
+                if val is not None and len(val) and hasattr(val[0], "__iter__"):
+                    val = val[0]
+            else:
+                names = getattr(getattr(data, "dtype", None), "names", None)
+                if names and "QTarget" in names:
+                    val = data["QTarget"][0]
+                else:
+                    return None
+            result = [float(v) for v in val[:6]]
+            return result if len(result) == 6 and all(np.isfinite(result)) else None
+        except Exception:
+            return None
 
     def get_cached_pose(self, max_age=0.3):
         """Read parsed TCP pose from the 30004 feedback cache."""
@@ -747,12 +928,16 @@ class DobotController:
         with self.feed_lock:
             pose = list(self.latest_pose) if self.latest_pose is not None else None
             mode = self.latest_robot_mode
+            running_status = self.latest_running_status
+            run_queued_cmd = self.latest_run_queued_cmd
+            tcp_speed = list(self.latest_tcp_speed) if self.latest_tcp_speed is not None else None
             timestamp = self.latest_pose_time
 
         if timestamp <= 0:
             return {
                 "pose": None, "robot_mode": None, "timestamp": 0.0,
                 "health": "disconnected",
+                "running_status": None, "run_queued_cmd": None, "tcp_speed": None,
             }
 
         age = now - timestamp
@@ -769,6 +954,59 @@ class DobotController:
         return {
             "pose": pose, "robot_mode": mode, "timestamp": timestamp,
             "health": health,
+            "running_status": running_status,
+            "run_queued_cmd": run_queued_cmd,
+            "tcp_speed": tcp_speed,
+        }
+
+    def get_motion_feedback_snapshot(self, max_age: float = 0.3) -> dict:
+        """Return a unified snapshot of all 30004 feedback fields for motion completion detection.
+
+        Returns dict with: pose, tcp_speed, running_status, run_queued_cmd,
+        current_command_id, tool_vector_target, robot_mode, q_actual, q_target,
+        timestamp, health ("ok"/"stale"/"disconnected").
+        """
+        perf = get_performance_config()
+        stale_fail_age = float(perf.get("feedback_stale_fail_age", 2.0))
+
+        now = time.time()
+        with self.feed_lock:
+            pose = list(self.latest_pose) if self.latest_pose is not None else None
+            tcp_speed = list(self.latest_tcp_speed) if self.latest_tcp_speed is not None else None
+            running_status = self.latest_running_status
+            run_queued_cmd = self.latest_run_queued_cmd
+            current_command_id = self.latest_current_command_id
+            tool_vector_target = list(self.latest_tool_vector_target) if self.latest_tool_vector_target is not None else None
+            robot_mode = self.latest_robot_mode
+            q_actual = list(self.latest_q_actual) if self.latest_q_actual is not None else None
+            q_target = list(self.latest_q_target) if self.latest_q_target is not None else None
+            timestamp = self.latest_pose_time
+
+        if timestamp <= 0:
+            return {
+                "pose": None, "tcp_speed": None, "running_status": None,
+                "run_queued_cmd": None, "current_command_id": None,
+                "tool_vector_target": None, "robot_mode": None,
+                "q_actual": None, "q_target": None,
+                "timestamp": 0.0, "health": "disconnected",
+                "feedback_age": 999.0,
+            }
+
+        age = now - timestamp
+        if age <= max_age:
+            health = "ok"
+        elif age <= stale_fail_age:
+            health = "stale"
+        else:
+            health = "disconnected"
+
+        return {
+            "pose": pose, "tcp_speed": tcp_speed, "running_status": running_status,
+            "run_queued_cmd": run_queued_cmd, "current_command_id": current_command_id,
+            "tool_vector_target": tool_vector_target, "robot_mode": robot_mode,
+            "q_actual": q_actual, "q_target": q_target,
+            "timestamp": timestamp, "health": health,
+            "feedback_age": age,
         }
 
     def wait_for_motion_completion(
@@ -779,59 +1017,193 @@ class DobotController:
         dashboard_fallback_interval=None,
         settle_time=None,
         stop_checker=None,
+        target_pose=None,
+        command_id=None,
     ):
-        """Wait until RobotMode reports idle, preferring 30004 feedback cache."""
+        """Wait until motion is complete, preferring 30004 feedback state machine."""
         perf = get_performance_config()
         poll_interval = float(poll_interval if poll_interval is not None else perf.get("flow_wait_poll_interval", 0.05))
         dashboard_fallback_interval = float(
             dashboard_fallback_interval
             if dashboard_fallback_interval is not None
-            else perf.get("robot_mode_dashboard_fallback_interval", 0.5)
+            else perf.get("robot_mode_dashboard_fallback_interval", 1.0)
         )
         settle_time = float(settle_time if settle_time is not None else perf.get("motion_settle_time", 0.15))
+        speed_threshold = float(perf.get("motion_done_speed_threshold", 1.0))
+        rotation_speed_threshold = float(perf.get("motion_done_rotation_speed_threshold", 1.0))
+        pose_tolerance = float(perf.get("motion_done_pose_tolerance", 2.0))
+        rot_tolerance = float(perf.get("motion_done_rotation_tolerance", 2.0))
+        stable_samples = int(perf.get("motion_done_stable_samples", 3))
+        use_feedback = perf.get("motion_done_use_feedback", True)
+        pose_cache_max_age = float(perf.get("pose_cache_max_age", 0.3))
+        feedback_stale_fail_age = float(perf.get("feedback_stale_fail_age", 2.0))
 
-        logger.info(" 等待运动完成: timeout=%.1fs poll=%.2fs settle=%.2fs", timeout, poll_interval, settle_time)
+        logger.info("等待运动完成: timeout=%.1fs poll=%.2fs settle=%.2fs target=%s",
+                    timeout, poll_interval, settle_time,
+                    "absolute" if target_pose is not None else "relative")
+
         start_time = time.time()
         if settle_time > 0:
             time.sleep(settle_time)
 
         last_running_log_second = -1
+        self._motion_done_stable_count = 0
+        _feedback_stale_logged = False
+
         while time.time() - start_time < timeout:
             if stop_checker is not None and stop_checker():
                 logger.info("运动等待被外部打断")
                 return False
-            robot_mode = self.get_robot_mode_fast(
-                max_age=float(perf.get("pose_cache_max_age", 0.3)),
-                fallback=True,
-                dashboard_fallback_interval=dashboard_fallback_interval,
-            )
-            if robot_mode is not None:
 
-                if robot_mode == 5:
-                    logger.info(" 运动完成")
-                    self.clear_error_retry_count = 0
-                    return True
-                elif robot_mode in (7, 8):
-                    elapsed = time.time() - start_time
-                    elapsed_second = int(elapsed)
-                    if elapsed_second != last_running_log_second and elapsed_second % 2 == 0:
-                        logger.debug(f"  运行中... 已耗时: {elapsed:.1f}秒")
-                        last_running_log_second = elapsed_second
-                elif robot_mode == 9:
-                    logger.warning("  机器人出现错误，尝试自动清除报警...")
-                    if auto_clear_error and self.clear_error_retry_count < 3:
-                        self.clear_error_retry_count += 1
-                        self.clear_error(auto_enable=False)
-                        logger.warning(f"  第{self.clear_error_retry_count}次清除报警，等待0.5秒后继续检查...")
-                        time.sleep(max(poll_interval, 0.1))
+            # --- Settle time guard ---
+            if self._motion_command_sent_time > 0 and time.time() - self._motion_command_sent_time < settle_time:
+                time.sleep(poll_interval)
+                continue
+
+            # --- Get feedback snapshot ---
+            snapshot = self.get_motion_feedback_snapshot(max_age=pose_cache_max_age)
+            cur_pose = snapshot["pose"]
+            cur_speed = snapshot["tcp_speed"]
+            running_status = snapshot["running_status"]
+            run_queued_cmd = snapshot["run_queued_cmd"]
+            snapshot_health = snapshot["health"]
+            snapshot_timestamp = snapshot["timestamp"]
+
+            # --- Motion state guard: must have seen motion before allowing completion ---
+            if cur_speed is not None:
+                has_speed = any(abs(v) > speed_threshold for v in cur_speed[:3]) or any(abs(v) > rotation_speed_threshold for v in cur_speed[3:6])
+                if has_speed:
+                    self._has_seen_motion_state = True
+            if running_status is not None and running_status != 0:
+                self._has_seen_motion_state = True
+
+            if not self._has_seen_motion_state:
+                # Haven't seen motion yet, can't judge completion
+                time.sleep(poll_interval)
+                continue
+
+            # --- Command ID completion check (official pattern) ---
+            if command_id is not None and snapshot_health == "ok":
+                feedback_cmd_id = snapshot.get("current_command_id")
+                if feedback_cmd_id is not None and feedback_cmd_id == command_id:
+                    # Our command is still current; check if it's done via status
+                    cmd_done = False
+                    if running_status is not None and running_status == 0:
+                        cmd_done = True
+                    if cur_speed is not None:
+                        linear_speed_ok = all(abs(v) < speed_threshold for v in cur_speed[:3])
+                        if len(cur_speed) >= 6:
+                            rotation_speed_ok = all(abs(v) < rotation_speed_threshold for v in cur_speed[3:6])
+                        else:
+                            rotation_speed_ok = True
+                        if linear_speed_ok and rotation_speed_ok:
+                            cmd_done = True
+                    if snapshot.get("robot_mode") == 5:
+                        cmd_done = True
+                    if cmd_done:
+                        self._motion_done_stable_count = getattr(self, '_motion_done_stable_count', 0) + 1
+                        if self._motion_done_stable_count >= stable_samples:
+                            logger.info("30004反馈辅助判定完成: CurrentCommandId匹配+完成状态, 连续%d次", stable_samples)
+                            self._motion_done_stable_count = 0
+                            return True
                     else:
-                        logger.error("  已重试3次清除报警失败，返回False")
+                        self._motion_done_stable_count = 0
+                else:
+                    self._motion_done_stable_count = 0
+
+            # --- 30004 feedback-assisted completion check ---
+            if use_feedback and cur_speed is not None:
+                # Check speed near zero
+                linear_speed_ok = all(abs(v) < speed_threshold for v in cur_speed[:3])
+                rotation_speed_ok = all(abs(v) < rotation_speed_threshold for v in cur_speed[3:6]) if len(cur_speed) >= 6 else True
+                speed_ok = linear_speed_ok and rotation_speed_ok
+
+                if speed_ok:
+                    if target_pose is not None and cur_pose is not None:
+                        # --- Absolute motion: speed + pose + stable ---
+                        pos_ok = True
+                        if len(target_pose) >= 3:
+                            pos_diff = sum((a - b) ** 2 for a, b in zip(cur_pose[:3], target_pose[:3])) ** 0.5
+                            pos_ok = pos_diff < pose_tolerance
+
+                        rot_ok = True
+                        if len(target_pose) >= 6 and len(cur_pose) >= 6:
+                            rot_diff = sum((a - b) ** 2 for a, b in zip(cur_pose[3:6], target_pose[3:6])) ** 0.5
+                            rot_ok = rot_diff < rot_tolerance
+
+                        if pos_ok and rot_ok:
+                            self._motion_done_stable_count = getattr(self, '_motion_done_stable_count', 0) + 1
+                            if self._motion_done_stable_count >= stable_samples:
+                                logger.info("30004反馈辅助判定完成: 速度归零+位姿到位, 连续%d次", stable_samples)
+                                self._motion_done_stable_count = 0
+                                return True
+                        else:
+                            self._motion_done_stable_count = 0
+
+                    elif target_pose is None:
+                        # --- Relative motion: speed + RunningStatus/RunQueuedCmd + stable ---
+                        status_done = False
+                        if running_status is not None and running_status == 0:
+                            status_done = True
+                        if run_queued_cmd is not None and run_queued_cmd == 0:
+                            status_done = True
+
+                        if status_done:
+                            self._motion_done_stable_count = getattr(self, '_motion_done_stable_count', 0) + 1
+                            if self._motion_done_stable_count >= stable_samples:
+                                logger.info("30004反馈辅助判定完成: 速度归零+运行状态完成, 连续%d次", stable_samples)
+                                self._motion_done_stable_count = 0
+                                return True
+                        else:
+                            self._motion_done_stable_count = 0
+                    else:
+                        self._motion_done_stable_count = 0
+                else:
+                    self._motion_done_stable_count = 0
+            else:
+                self._motion_done_stable_count = 0
+
+            # --- Dashboard fallback: only when 30004 feedback is NOT fresh ---
+            if snapshot_health != "ok":
+                now = time.time()
+                feedback_age = now - snapshot_timestamp if snapshot_timestamp > 0 else 999
+
+                # Log feedback disconnect
+                if feedback_age > feedback_stale_fail_age and not _feedback_stale_logged:
+                    logger.warning("30004反馈断流: %.1fs (fail_age=%.1fs), 使用Dashboard兜底", feedback_age, feedback_stale_fail_age)
+                    _feedback_stale_logged = True
+
+                robot_mode = self.get_robot_mode_fast(
+                    max_age=pose_cache_max_age,
+                    fallback=True,
+                    dashboard_fallback_interval=dashboard_fallback_interval,
+                )
+                if robot_mode is not None:
+                    if robot_mode == 5:
+                        logger.info("运动完成 (Dashboard RobotMode=5)")
                         self.clear_error_retry_count = 0
-                        return False
+                        return True
+                    elif robot_mode in (7, 8):
+                        elapsed = time.time() - start_time
+                        elapsed_second = int(elapsed)
+                        if elapsed_second != last_running_log_second and elapsed_second % 2 == 0:
+                            logger.debug("运行中... 已耗时: %.1f秒", elapsed)
+                            last_running_log_second = elapsed_second
+                    elif robot_mode == 9:
+                        logger.warning("机器人出现错误，尝试自动清除报警...")
+                        if auto_clear_error and self.clear_error_retry_count < 3:
+                            self.clear_error_retry_count += 1
+                            self.clear_error(auto_enable=False)
+                            logger.warning("第%d次清除报警，等待0.5秒后继续检查...", self.clear_error_retry_count)
+                            time.sleep(max(poll_interval, 0.1))
+                        else:
+                            logger.error("已重试3次清除报警失败，返回False")
+                            self.clear_error_retry_count = 0
+                            return False
 
             time.sleep(poll_interval)
 
-        logger.error(f"  等待超时 ({timeout}秒)")
+        logger.error("等待超时 (%.1f秒)", timeout)
         return False
 
     def move_to_point(
@@ -850,9 +1222,13 @@ class DobotController:
             return False
 
         if speed_percentage is not None:
+            _speed_start = time.perf_counter()
             self.set_speed(speed_percentage)
+            _speed_elapsed = time.perf_counter() - _speed_start
         else:
+            _speed_start = time.perf_counter()
             self.set_speed(self.current_speed)
+            _speed_elapsed = time.perf_counter() - _speed_start
 
         x, y, z, rx, ry, rz = target_pose
 
@@ -890,6 +1266,7 @@ class DobotController:
         logger.info("=" * 60)
 
         logger.info(f" 发送{move_type}指令...")
+        _cmd_start = time.perf_counter()
         if move_type == "MovJ":
             response = self.dashboard.MovJ(x, y, z, rx, ry, rz, 0)
         elif move_type == "MovL":
@@ -905,6 +1282,7 @@ class DobotController:
             return False
 
         logger.debug(f" 运动响应: {response}")
+        _cmd_elapsed = time.perf_counter() - _cmd_start
 
         response_code = self.parse_response_code(response)
         if response_code != 0:
@@ -930,12 +1308,29 @@ class DobotController:
                 if response_code != 0:
                     logger.error(f" 重试运动指令仍然失败，响应码: {response_code}")
                     return False
+                else:
+                    ids = self.parse_response_ids(response)
+                    self._last_command_id = ids[1] if len(ids) > 1 else None
             else:
                 return False
 
         logger.info(" 运动指令已接受")
+        if response_code == 0:
+            ids = self.parse_response_ids(response)
+            self._last_command_id = ids[1] if len(ids) > 1 else None
 
-        success = self.wait_for_motion_completion(timeout=estimated_time + 10, poll_interval=wait_poll_interval)
+        self._motion_command_sent_time = time.time()
+        self._has_seen_motion_state = False
+
+        _wait_start = time.perf_counter()
+        success = self.wait_for_motion_completion(timeout=estimated_time + 10, poll_interval=wait_poll_interval, target_pose=target_pose, command_id=self._last_command_id)
+        _wait_elapsed = time.perf_counter() - _wait_start
+
+        self._last_move_timing = {
+            "speed_set": _speed_elapsed,
+            "command_send": _cmd_elapsed,
+            "motion_wait": _wait_elapsed,
+        }
 
         if not success:
             logger.error("  运动可能未完成，强制停止...")
@@ -1031,10 +1426,18 @@ class DobotController:
                 if response_code != 0:
                     logger.error(f" 重试运动指令仍然失败，响应码: {response_code}")
                     return False
+                else:
+                    ids = self.parse_response_ids(response)
+                    self._last_command_id = ids[1] if len(ids) > 1 else None
             else:
                 return False
 
         logger.info(" 运动指令已接受")
+        ids = self.parse_response_ids(response)
+        self._last_command_id = ids[1] if len(ids) > 1 else None
+
+        self._motion_command_sent_time = time.time()
+        self._has_seen_motion_state = False
 
         estimated_time = 10
         success = self.wait_for_motion_completion(timeout=estimated_time + 10, poll_interval=wait_poll_interval)
@@ -1133,6 +1536,12 @@ class DobotController:
             logger.error(f"{command_name}指令被拒绝，响应码: {response_code}")
             return False
 
+        ids = self.parse_response_ids(response)
+        self._last_command_id = ids[1] if len(ids) > 1 else None
+
+        self._motion_command_sent_time = time.time()
+        self._has_seen_motion_state = False
+
         linear_distance = math.sqrt(offsets[0] ** 2 + offsets[1] ** 2 + offsets[2] ** 2)
         angular_distance = max(abs(offsets[3]), abs(offsets[4]), abs(offsets[5]))
         timeout = min(max(max(linear_distance / 20.0, angular_distance / 20.0) + 5.0, 5.0), 60.0)
@@ -1177,16 +1586,36 @@ class DobotController:
 
     def stop_feedback(self):
         self._feed_running = False
-        if self.feed_thread:
-            self.feed_thread.join()
+        # Close socket first to unblock recv() in _feed_loop
         if self.feed_four:
-            self.feed_four.close()
+            try:
+                self.feed_four.close()
+            except Exception:
+                pass
+        if self.feed_thread:
+            self.feed_thread.join(timeout=1.0)
+            if self.feed_thread.is_alive():
+                logger.warning("反馈线程未能在1秒内退出")
         with self.feed_lock:
             self.latest_pose = None
             self.latest_pose_time = 0.0
             self.latest_robot_mode = None
             self.latest_robot_mode_time = 0.0
             self.latest_feed_time = 0.0
+            self.latest_tcp_speed = None
+            self.latest_tcp_speed_time = 0.0
+            self.latest_running_status = None
+            self.latest_running_status_time = 0.0
+            self.latest_run_queued_cmd = None
+            self.latest_run_queued_cmd_time = 0.0
+            self.latest_current_command_id = None
+            self.latest_current_command_id_time = 0.0
+            self.latest_tool_vector_target = None
+            self.latest_tool_vector_target_time = 0.0
+            self.latest_q_actual = None
+            self.latest_q_actual_time = 0.0
+            self.latest_q_target = None
+            self.latest_q_target_time = 0.0
 
     def _feed_loop(self):
         while self._feed_running:
@@ -1195,13 +1624,27 @@ class DobotController:
                 if result is not None and len(result) > 0:
                     try:
                         magic_ok = result[0][0] == 0x123456789abcdef
-                    except:
-                        magic_ok = True
+                    except Exception:
+                        magic_ok = False
 
-                    if magic_ok or len(result[0]) > 0:
+                    if not magic_ok:
+                        self._feed_packet_drops += 1
+                        if self._feed_packet_drops == 1 or self._feed_packet_drops % 100 == 0:
+                            logger.warning("30004反馈包校验失败(TestValue不匹配), 累计%d次", self._feed_packet_drops)
+                        self._feed_error_count = 0
+                        continue
+
+                    if magic_ok:
                         now = time.time()
                         pose = self._extract_pose_from_feed_data(result)
                         robot_mode = self._extract_robot_mode_from_feed_data(result)
+                        tcp_speed = self._extract_tcp_speed_from_feed_data(result)
+                        running_status = self._extract_running_status_from_feed_data(result)
+                        run_queued_cmd = self._extract_run_queued_cmd_from_feed_data(result)
+                        current_command_id = self._extract_current_command_id_from_feed_data(result)
+                        tool_vector_target = self._extract_tool_vector_target_from_feed_data(result)
+                        q_actual = self._extract_q_actual_from_feed_data(result)
+                        q_target = self._extract_q_target_from_feed_data(result)
                         with self.feed_lock:
                             self.feed_data = result
                             self.last_feed_time = now
@@ -1212,6 +1655,27 @@ class DobotController:
                             if robot_mode is not None:
                                 self.latest_robot_mode = robot_mode
                                 self.latest_robot_mode_time = now
+                            if tcp_speed is not None:
+                                self.latest_tcp_speed = tcp_speed
+                                self.latest_tcp_speed_time = now
+                            if running_status is not None:
+                                self.latest_running_status = running_status
+                                self.latest_running_status_time = now
+                            if run_queued_cmd is not None:
+                                self.latest_run_queued_cmd = run_queued_cmd
+                                self.latest_run_queued_cmd_time = now
+                            if current_command_id is not None:
+                                self.latest_current_command_id = current_command_id
+                                self.latest_current_command_id_time = now
+                            if tool_vector_target is not None:
+                                self.latest_tool_vector_target = tool_vector_target
+                                self.latest_tool_vector_target_time = now
+                            if q_actual is not None:
+                                self.latest_q_actual = q_actual
+                                self.latest_q_actual_time = now
+                            if q_target is not None:
+                                self.latest_q_target = q_target
+                                self.latest_q_target_time = now
                         self._feed_error_count = 0
             except Exception as e:
                 self._feed_error_count += 1
@@ -1362,15 +1826,24 @@ class DobotController:
         if cmd == 1:
             self._modbus_reset()
         elif cmd == 2:
-            self._modbus_go_safe_position()
+            self._modbus_dispatch_motion(self._modbus_go_safe_position, "回安全位")
         elif cmd == 3:
-            self._modbus_auto_hook()
+            self._modbus_dispatch_motion(self._modbus_auto_hook, "目标运动")
         elif cmd == 9:
             self.emergency_stop()
         else:
             logger.warning(f" 未知Modbus命令: {cmd}")
             self._last_fault_code = int(cmd)
             self.record_alarm("Modbus命令", cmd, "故障", "收到未知Modbus命令")
+
+    def _modbus_dispatch_motion(self, func, name):
+        """Dispatch Modbus motion command to a separate thread."""
+        with self._modbus_exec_lock:
+            if self._modbus_exec_thread is not None and self._modbus_exec_thread.is_alive():
+                logger.warning("Modbus运动命令'%s'被拒绝: 上一次运动仍在执行", name)
+                return
+            self._modbus_exec_thread = threading.Thread(target=func, daemon=True)
+            self._modbus_exec_thread.start()
 
     def _modbus_reset(self):
         """复位"""
@@ -1411,55 +1884,112 @@ class DobotController:
             logger.error(f"❌ 清除故障失败: {e}")
             return False
 
+    def _emergency_stop_direct(self, mode=1):
+        """Send EmergencyStop via independent temporary Dashboard connection.
+
+        This avoids being blocked by the main Dashboard connection's __globalLock.
+        Returns True if command was sent successfully, False otherwise.
+        """
+        try:
+            temp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            temp_socket.settimeout(3.0)
+            temp_socket.connect((self.robot_ip, 29999))
+            cmd = f"EmergencyStop({mode})"
+            temp_socket.sendall(cmd.encode('utf-8') + b";")
+            try:
+                response = temp_socket.recv(1024).decode('utf-8').strip()
+            except socket.timeout:
+                response = ""
+            temp_socket.close()
+            logger.info("急停独立连接发送成功: EmergencyStop(%d), 响应=%s", mode, response)
+            return True
+        except Exception as e:
+            logger.warning("急停独立连接发送失败: %s", e)
+            return False
+
     def emergency_stop(self):
         if not self.is_connected:
             logger.error("❌ 机器人未连接，无法软件急停")
             self.record_alarm("软件急停", "DISCONNECTED", "故障", "机器人未连接，无法执行软件急停")
             return False
-        try:
-            response = self.dashboard.EmergencyStop(1)
-            response_code = self.parse_response_code(response)
-            if response_code != 0:
-                logger.error(f"❌ 软件急停失败，响应码: {response_code}")
-                self.record_alarm("软件急停", response_code, "故障", "软件急停指令被拒绝", raw=response)
-                return False
-            self._modbus_status_override = 5
-            self.is_enabled = False
-            self._last_speed_factor = None
-            self.software_emergency_active = True
-            self.record_alarm("软件急停", response_code, "急停", "软件急停信号已触发", "复位软件急停信号后清除报警并重新使能", response)
-            if self.modbus_server:
-                self.modbus_server.update_status_registers(status=5, fault_code=0, in_position=0, emergency=1)
-            logger.warning("软件急停已触发")
-            return True
-        except Exception as e:
-            logger.error(f"❌ 软件急停异常: {e}")
-            self.record_alarm("软件急停", "EXCEPTION", "故障", "软件急停执行异常", raw=e)
-            return False
+
+        # Immediately mark as active - don't wait for Dashboard response
+        self.software_emergency_active = True
+        self._modbus_status_override = 5
+        self.is_enabled = False
+        self._last_speed_factor = None
+
+        # Signal active flow thread to stop immediately
+        if self._active_flow_thread is not None and hasattr(self._active_flow_thread, '_ctx') and self._active_flow_thread._ctx is not None:
+            self._active_flow_thread._ctx.stop_event.set()
+
+        # Try independent connection first (avoids __globalLock blocking)
+        direct_ok = self._emergency_stop_direct(mode=1)
+        if not direct_ok:
+            # Fallback to main Dashboard connection
+            try:
+                old_timeout = self.dashboard.socket_dobot.gettimeout()
+                self.dashboard.socket_dobot.settimeout(2.0)
+                try:
+                    response = self.dashboard.EmergencyStop(1)
+                    response_code = self.parse_response_code(response)
+                    if response_code == 0:
+                        direct_ok = True
+                    else:
+                        logger.warning("软件急停主连接响应码非0: %s", response_code)
+                finally:
+                    self.dashboard.socket_dobot.settimeout(old_timeout)
+            except Exception as e:
+                logger.warning("软件急停主连接异常: %s", e)
+
+        if not direct_ok:
+            logger.error("软件急停所有连接方式均失败")
+            self.record_alarm("软件急停", "ALL_FAILED", "故障", "软件急停独立连接和主连接均失败")
+
+        if self.modbus_server:
+            self.modbus_server.update_status_registers(status=5, fault_code=0, in_position=0, emergency=1)
+
+        self.record_alarm("软件急停", "0", "急停", "软件急停信号已触发", "复位软件急停信号后清除报警并重新使能", "")
+        logger.warning("软件急停已触发 (独立连接=%s)", "成功" if direct_ok else "失败")
+        return True
 
     def release_emergency_stop(self):
         if not self.is_connected:
             logger.error("❌ 机器人未连接，无法解除软件急停")
             self.record_alarm("解除软件急停", "DISCONNECTED", "故障", "机器人未连接，无法解除软件急停")
             return False
-        try:
-            response = self.dashboard.EmergencyStop(0)
-            response_code = self.parse_response_code(response)
-            if response_code != 0:
-                logger.error(f"❌ 解除软件急停失败，响应码: {response_code}")
-                self.record_alarm("解除软件急停", response_code, "故障", "解除软件急停指令被拒绝", raw=response)
-                return False
-            self.software_emergency_active = False
-            if self._modbus_status_override == 5:
-                self._modbus_status_override = None
-            if self.modbus_server:
-                self.modbus_server.update_status_registers(status=1, fault_code=self._last_fault_code, in_position=0, emergency=0)
-            logger.info("软件急停信号已解除")
-            return True
-        except Exception as e:
-            logger.error(f"❌ 解除软件急停异常: {e}")
-            self.record_alarm("解除软件急停", "EXCEPTION", "故障", "解除软件急停执行异常", raw=e)
+
+        # Try independent connection first
+        direct_ok = self._emergency_stop_direct(mode=0)
+        if not direct_ok:
+            # Fallback to main Dashboard connection
+            try:
+                old_timeout = self.dashboard.socket_dobot.gettimeout()
+                self.dashboard.socket_dobot.settimeout(2.0)
+                try:
+                    response = self.dashboard.EmergencyStop(0)
+                    response_code = self.parse_response_code(response)
+                    if response_code == 0:
+                        direct_ok = True
+                    else:
+                        logger.warning("解除急停主连接响应码非0: %s", response_code)
+                finally:
+                    self.dashboard.socket_dobot.settimeout(old_timeout)
+            except Exception as e:
+                logger.warning("解除急停主连接异常: %s, 尝试独立连接", e)
+
+        if not direct_ok:
+            logger.error("解除急停所有连接方式均失败")
+            self.record_alarm("解除软件急停", "ALL_FAILED", "故障", "解除软件急停独立连接和主连接均失败")
             return False
+
+        self.software_emergency_active = False
+        if self._modbus_status_override == 5:
+            self._modbus_status_override = None
+        if self.modbus_server:
+            self.modbus_server.update_status_registers(status=1, fault_code=self._last_fault_code, in_position=0, emergency=0)
+        logger.info("软件急停信号已解除 (独立连接=%s)", "成功" if direct_ok else "失败")
+        return True
 
     def pause(self):
         if not self.is_connected:

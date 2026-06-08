@@ -9,13 +9,26 @@
 - 现有文档包括 README、移植指南、C++ 加速说明和 UI/线程优化说明。
 - 项目级 Codex 规则和架构/工作流/UI/路线图文档现已添加。
 
+## 已完成
+
+- ✅ 流程可靠性增强：FlowRunContext、运动互斥锁、反馈健康检查、相机缓存安全
+- ✅ 执行流程优化：预执行验证、默认模板修复、耗时拆分（speed_set/cmd_send/motion_wait）
+- ✅ 运动完成判定提速：30004 反馈状态机、角速度判定、Dashboard fallback 降频
+- ✅ 连续相对路径模块：多段相对运动、stop_each/queued 执行模式
+- ✅ 连续相对运动高自由度编辑器：15列段表、模板按钮、段级参数覆盖
+- ✅ 官方 command_id 模式：parse_response_ids、CurrentCommandId 精确判定
+- ✅ 稳定性修复：command_id 保守判定、stop_feedback 不卡死、急停独立连接优先
+- ✅ Modbus 异步执行：运动命令投递独立线程、cmd=9 急停快速路径
+- ✅ UI 连接状态修复：反馈断流不判为断开
+- ✅ UI 主题一致性修复：深色工业仪表盘主题
+
 ## 短期任务
 
-- 修复或恢复源码注释、标签和现有文档中乱码损坏的中文文本。
+- 修复或恢复源码注释、标签和现有文档中乱码损坏的中文文本（部分完成：UI 主题已修复，文档已翻译）。
 - 在记录其预期输入和测试夹具后，将 `test_yolo26_bbox.py` 移至 `tests/`。
 - 在 `scripts/` 下添加定向的 py_compile 或冒烟测试命令脚本。
 - 在任何手动机器人/相机验证之前，记录所需的硬件状态。
-- 在 `README.md` 中添加指向 `docs/architecture.md`、`docs/ui_spec.md` 和 `docs/dev_workflow.md` 的章节。
+- ~~在 `README.md` 中添加指向 `docs/architecture.md`、`docs/ui_spec.md` 和 `docs/dev_workflow.md` 的章节。~~ ✅ 已完成
 
 ## 中期任务
 
@@ -42,6 +55,8 @@
 - 编码损坏使维护风险增加，降低了操作员可读性。
 - 测试尚未在 `tests/` 下组织。
 - 构建输出和本地环境产物存在于工作树中，应排除在正常源代码变更之外。
+- 30004 反馈字段提取方法重复代码多，可考虑统一提取框架。
+- FlowThread 行为仍在一个类中混合编排和安全检查。
 
 ## 优先级建议
 

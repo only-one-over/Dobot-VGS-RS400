@@ -51,6 +51,69 @@
 7. `FlowThread` 执行 `grasp_flow_modules.json` 中配置的模块，解析点位并协调机器人运动、视觉检测、视觉伺服、相对移动和原生圆弧操作。
 8. UI 更新通过 Qt 信号返回，保持主线程响应。
 
+## 30004 反馈缓存
+
+`_feed_loop()` 持续接收 30004 端口反馈数据并缓存以下字段：
+
+| 缓存字段 | 30004 字段 | 类型 | 描述 |
+|---------|-----------|------|------|
+| `latest_pose` | ToolVectorActual | float[6] | 当前 TCP 位姿 (x,y,z,rx,ry,rz) |
+| `latest_tcp_speed` | TCPSpeedActual | float[6] | 当前 TCP 速度 (vx,vy,vz,wx,wy,wz) |
+| `latest_robot_mode` | RobotMode | int | 机器人模式 |
+| `latest_running_status` | RunningStatus | int | 运行状态（0=空闲） |
+| `latest_run_queued_cmd` | RunQueuedCmd | int | 队列命令数 |
+| `latest_current_command_id` | CurrentCommandId | int | 当前执行指令 ID |
+| `latest_tool_vector_target` | ToolVectorTarget | float[6] | 目标 TCP 位姿 |
+| `latest_q_actual` | QActual | float[6] | 实际关节角度 |
+| `latest_q_target` | QTarget | float[6] | 目标关节角度 |
+
+所有字段在 `feed_lock` 内更新，通过 `get_motion_feedback_snapshot(max_age)` 统一读取。
+
+反馈包校验：`TestValue == 0x123456789abcdef`，校验失败时不更新缓存，递增 `_feed_packet_drops` 计数器。
+
+## FlowRunContext
+
+`FlowRunContext` 是单次流程执行的上下文数据类：
+
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| `run_id` | str | 唯一标识 |
+| `start_time` | float | 流程开始时间 |
+| `current_module_index` | int | 当前模块索引 |
+| `stop_event` | threading.Event | 停止事件 |
+| `module_timings` | list | 每步耗时记录 |
+| `motion_generation` | int | 运动代数（每次运动+1，用于相机缓存失效） |
+| `_flow_detection_cache` | dict | 相机识别结果缓存 |
+
+FlowThread 在 `run()` 开始时注册为 `controller._active_flow_thread`，在 `finally` 中释放。
+
+## 运动互斥锁
+
+`acquire_motion(owner)` / `release_motion(owner)` 确保流程和 Modbus 运动互斥执行：
+
+- 流程执行时持有 `"flow"` 锁
+- Modbus 运动持有 `"modbus"` 锁
+- 急停始终优先，不受锁限制
+- `wait_for_motion_completion()` 接受 `stop_checker` 参数，每轮轮询检查停止信号
+
+## 急停独立连接
+
+`_emergency_stop_direct(mode)` 通过独立临时 TCP 连接（端口 29999）发送 `EmergencyStop`：
+
+- 优先使用独立连接，避免主 Dashboard 连接 `__globalLock` 阻塞
+- 主连接作为备份
+- 急停触发时立即设置 `software_emergency_active = True`，不等待响应确认
+- 同时设置 `stop_event`，流程线程马上停止下发
+
+## Modbus 异步执行
+
+`_modbus_dispatch_motion(func, name)` 将 Modbus 运动命令投递到独立线程：
+
+- cmd=2（回安全位）和 cmd=3（目标运动）投递到独立线程执行
+- cmd=9（急停）直接调用 `emergency_stop()`，不排队
+- `_modbus_exec_lock` 确保同一时间只有一个 Modbus 运动在执行
+- 200ms 周期状态刷新不被运动阻塞
+
 ## 依赖
 
 - 运行时 Python 依赖列在 `requirements.txt` 中。

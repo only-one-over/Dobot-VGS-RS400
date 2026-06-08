@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import logging
@@ -98,6 +98,13 @@ def validate_grasp_flow_modules(modules: list) -> list:
                 from config_manager import get_point
                 if not get_point("initial_point"):
                     errors.append(f"第{step}步「{name}」：初始位置点位 initial_point 不存在")
+            elif target == "saved_point":
+                from config_manager import get_point
+                point_name = params.get("point_name", "")
+                if not point_name.strip():
+                    errors.append(f"第{step}步「{name}」：已保存点位未指定点位名称")
+                elif not get_point(point_name):
+                    errors.append(f"第{step}步「{name}」：点位 '{point_name}' 不存在")
 
         elif mtype == "arc_motion":
             center_offset_z = float(params.get('center_offset_z', params.get('radius', 0)))
@@ -106,6 +113,17 @@ def validate_grasp_flow_modules(modules: list) -> list:
                 errors.append(f"第{step}步「{name}」：圆弧上方距离必须大于0")
             if sweep_angle <= 0:
                 errors.append(f"第{step}步「{name}」：圆弧角度必须大于0")
+
+        elif mtype == "relative_path":
+            segments = params.get("segments", [])
+            if not segments:
+                errors.append(f"第{step}步「{name}」：连续相对路径段列表为空")
+            else:
+                for seg_idx, seg in enumerate(segments):
+                    offsets = [seg.get('x', 0), seg.get('y', 0), seg.get('z', 0),
+                               seg.get('rx', 0), seg.get('ry', 0), seg.get('rz', 0)]
+                    if all(float(v) == 0 for v in offsets):
+                        errors.append(f"第{step}步第{seg_idx+1}段：偏移量全为0")
 
         elif mtype == "camera":
             camera_type = params.get("camera_type", "D435i")
@@ -154,6 +172,7 @@ class FlowThread(QThread):
                 start_time=time.perf_counter(),
             )
             self._ctx = ctx
+            self.controller._active_flow_thread = self
 
             if not self.controller.acquire_motion("flow"):
                 self.flow_log.emit("❌ 无法获取运动控制权，可能有其他操作正在执行")
@@ -191,7 +210,7 @@ class FlowThread(QThread):
                     self.flow_module_progress.emit(i + 1, total, name)
 
                     # --- Feedback health check before motion modules ---
-                    if module['type'] in ("move", "arc_motion", "relative_move", "joint_move"):
+                    if module['type'] in ("move", "arc_motion", "relative_move", "relative_path", "joint_move"):
                         fb = self.controller.get_feedback_health(max_age=pose_cache_max_age)
                         if fb["health"] == "disconnected":
                             self._fail_module(ctx, i, name, f"反馈缓存断流({stale_fail_age:.1f}s)")
@@ -200,11 +219,11 @@ class FlowThread(QThread):
                     stop_checker = lambda: ctx.stop_event.is_set()
 
                     if module['type'] == "move":
-                        cmd_start = time.perf_counter()
                         if module['params']['target'] == "initial_position":
                             if not self.controller.move_to_initial_position(verify_start_pose=False, verify_end_pose=False, wait_poll_interval=wait_poll_interval):
                                 self._fail_module(ctx, i, name, "移动到初始位置失败")
                                 return
+                            move_timing = getattr(self.controller, '_last_move_timing', {})
                         elif module['params']['target'] == "camera_detected":
                             if base_coords is None:
                                 self._fail_module(ctx, i, name, "相机未识别到物体坐标，请确保流程中先有相机识别步骤")
@@ -229,7 +248,34 @@ class FlowThread(QThread):
                                 if not success:
                                     self._fail_module(ctx, i, name, "直线运动失败")
                                     return
-                        cmd_elapsed = time.perf_counter() - cmd_start
+                            move_timing = getattr(self.controller, '_last_move_timing', {})
+                        elif module['params']['target'] == "saved_point":
+                            point_name = module['params'].get('point_name', '')
+                            if not point_name:
+                                self._fail_module(ctx, i, name, "未指定目标点位名称")
+                                return
+                            resolved = resolve_point(point_name)
+                            if resolved is None:
+                                self._fail_module(ctx, i, name, f"点位 '{point_name}' 不存在或循环引用")
+                                return
+                            success = self.controller.move_to_point(
+                                resolved,
+                                move_type=module['params'].get('motion_type', 'MovJ'),
+                                speed_percentage=module['params']['speed'],
+                                verify_start_pose=False,
+                                verify_end_pose=False,
+                                wait_poll_interval=wait_poll_interval,
+                            )
+                            if not success:
+                                self._fail_module(ctx, i, name, f"移动到点位 '{point_name}' 失败")
+                                return
+                            move_timing = getattr(self.controller, '_last_move_timing', {})
+                        else:
+                            move_timing = {}
+                        speed_set_elapsed = move_timing.get("speed_set", 0.0)
+                        command_send_elapsed = move_timing.get("command_send", 0.0)
+                        motion_wait_elapsed = move_timing.get("motion_wait", 0.0)
+                        cmd_elapsed = speed_set_elapsed + command_send_elapsed + motion_wait_elapsed
                         wait_elapsed = 0.0
                         ctx.increment_motion_generation()
 
@@ -340,6 +386,149 @@ class FlowThread(QThread):
                             return
                         self.flow_log.emit(f"✅ 模块{i+1}相对移动完成")
                         ctx.increment_motion_generation()
+
+                    elif module['type'] == "relative_path":
+                        if not self.controller.is_connected:
+                            self._fail_module(ctx, i, name, "机器人未连接，无法执行连续相对路径")
+                            return
+                        if not self.controller.is_enabled:
+                            self._fail_module(ctx, i, name, "机器人未使能，无法执行连续相对路径")
+                            return
+                        p = module['params']
+                        # Global defaults
+                        g_coord = str(p.get('coord_system', 'user')).lower()
+                        g_motion = str(p.get('motion_type', 'linear')).lower()
+                        g_speed = int(p.get('speed', 30))
+                        g_accel = int(p.get('acceleration', 30))
+                        g_cp = int(p.get('cp', 0))
+                        execution_mode = str(p.get('execution_mode', 'stop_each')).lower()
+                        segments = p.get('segments', [])
+
+                        if not segments:
+                            self._fail_module(ctx, i, name, "连续相对路径段列表为空")
+                            return
+
+                        active_segments = [s for s in segments if s.get('enabled', True)]
+                        if not active_segments:
+                            self._fail_module(ctx, i, name, "所有路径段均已禁用")
+                            return
+
+                        self.flow_log.emit(f"  连续相对路径: {len(active_segments)}/{len(segments)}段有效, 模式={execution_mode}")
+
+                        if execution_mode == "queued":
+                            # Queued mode: send all commands, then wait once
+                            queued_count = 0
+                            for seg_idx, seg in enumerate(segments):
+                                if not seg.get('enabled', True):
+                                    continue
+                                if ctx.stop_event.is_set():
+                                    self._fail_module(ctx, i, name, f"用户停止（第{seg_idx+1}段下发前）")
+                                    return
+                                offsets = [
+                                    float(seg.get('x', 0)), float(seg.get('y', 0)), float(seg.get('z', 0)),
+                                    float(seg.get('rx', 0)), float(seg.get('ry', 0)), float(seg.get('rz', 0))
+                                ]
+                                seg_coord = str(seg.get('coord_system', g_coord)).lower()
+                                seg_motion = str(seg.get('motion_type', g_motion)).lower()
+                                seg_speed = int(seg.get('speed', g_speed))
+                                seg_accel = int(seg.get('acceleration', g_accel))
+                                seg_cp = int(seg.get('cp', g_cp))
+                                
+                                # Direct command send without waiting
+                                self.controller.set_speed(seg_speed)
+                                if seg_coord == "tool":
+                                    if seg_motion == "joint":
+                                        resp = self.controller.dashboard.RelMovJTool(
+                                            offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
+                                            a=seg_accel, v=seg_speed, cp=seg_cp
+                                        )
+                                    else:
+                                        resp = self.controller.dashboard.RelMovLTool(
+                                            offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
+                                            a=seg_accel, v=seg_speed, speed=seg_speed, cp=seg_cp
+                                        )
+                                elif seg_coord == "joint":
+                                    resp = self.controller.dashboard.RelJointMovJ(
+                                        offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
+                                        a=seg_accel, v=seg_speed, cp=seg_cp
+                                    )
+                                else:  # user
+                                    if seg_motion == "joint":
+                                        resp = self.controller.dashboard.RelMovJUser(
+                                            offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
+                                            a=seg_accel, v=seg_speed, cp=seg_cp
+                                        )
+                                    else:
+                                        resp = self.controller.dashboard.RelMovLUser(
+                                            offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
+                                            a=seg_accel, v=seg_speed, speed=seg_speed, cp=seg_cp
+                                        )
+                                
+                                resp_code = self.controller.parse_response_code(resp) if resp is not None else -1
+                                if resp_code == 0:
+                                    queued_count += 1
+                                    ids = self.controller.parse_response_ids(resp) if resp is not None else [0]
+                                    seg_cmd_id = ids[1] if len(ids) > 1 else None
+                                    if seg_cmd_id is not None:
+                                        self.controller._last_command_id = seg_cmd_id
+                                    logger.info("relative_path queued seg %d: offsets=%s coord=%s speed=%d cp=%d cmd_id=%s", queued_count, offsets, seg_coord, seg_speed, seg_cp, seg_cmd_id)
+                                else:
+                                    self._fail_module(ctx, i, name, f"第{seg_idx+1}段下发失败: offsets={offsets}")
+                                    return
+                            
+                            # Wait for all queued motions to complete
+                            self.flow_log.emit(f"  队列模式: {queued_count}段已下发, 等待完成...")
+                            wait_ok = self.controller.wait_for_motion_completion(
+                                timeout=60,
+                                stop_checker=lambda: ctx.stop_event.is_set(),
+                                command_id=self.controller._last_command_id,
+                            )
+                            if not wait_ok:
+                                self._fail_module(ctx, i, name, "队列模式运动等待超时或被停止")
+                                return
+                            self.flow_log.emit(f"  队列模式完成")
+                        
+                        else:
+                            # stop_each mode: each segment waits for completion
+                            for seg_idx, seg in enumerate(segments):
+                                if not seg.get('enabled', True):
+                                    self.flow_log.emit(f"  段{seg_idx+1}: 已禁用，跳过")
+                                    continue
+                                if ctx.stop_event.is_set():
+                                    self._fail_module(ctx, i, name, f"用户停止（第{seg_idx+1}段）")
+                                    return
+                                offsets = [
+                                    float(seg.get('x', 0)), float(seg.get('y', 0)), float(seg.get('z', 0)),
+                                    float(seg.get('rx', 0)), float(seg.get('ry', 0)), float(seg.get('rz', 0))
+                                ]
+                                seg_coord = str(seg.get('coord_system', g_coord)).lower()
+                                seg_motion = str(seg.get('motion_type', g_motion)).lower()
+                                seg_speed = int(seg.get('speed', g_speed))
+                                seg_accel = int(seg.get('acceleration', g_accel))
+                                seg_cp = int(seg.get('cp', g_cp))
+
+                                seg_start = time.perf_counter()
+                                success = self.controller.move_relative(
+                                    offsets,
+                                    coord_system=seg_coord,
+                                    motion_type=seg_motion,
+                                    speed=seg_speed,
+                                    acceleration=seg_accel,
+                                    cp=seg_cp,
+                                )
+                                seg_elapsed = time.perf_counter() - seg_start
+
+                                if not success:
+                                    self._fail_module(ctx, i, name, f"第{seg_idx+1}段相对移动失败: offsets={offsets}")
+                                    return
+
+                                seg_name = seg.get('name', f'段{seg_idx+1}')
+                                logger.info("relative_path seg %d/%d: name=%s offsets=%s coord=%s speed=%d cp=%d elapsed=%.3fs", seg_idx + 1, len(segments), seg_name, offsets, seg_coord, seg_speed, seg_cp, seg_elapsed)
+                                self.flow_log.emit(f"  段{seg_idx+1}/{len(segments)}「{seg_name}」: [{offsets[0]:.1f},{offsets[1]:.1f},{offsets[2]:.1f}] coord={seg_coord} speed={seg_speed}% cp={seg_cp} %.3fs" % seg_elapsed)
+
+                        ctx.increment_motion_generation()
+                        cmd_elapsed = time.perf_counter() - module_start - camera_elapsed
+                        wait_elapsed = 0.0
 
                     elif module['type'] == "camera":
                         camera_type = module['params'].get('camera_type', 'D435i')
@@ -476,12 +665,15 @@ class FlowThread(QThread):
 
                     module_elapsed = time.perf_counter() - module_start
                     # For non-motion modules, cmd_elapsed equals total module time
-                    if module['type'] not in ("move", "arc_motion", "relative_move", "joint_move"):
+                    if module['type'] not in ("move", "arc_motion", "relative_move", "relative_path", "joint_move"):
                         cmd_elapsed = module_elapsed
                     ctx.module_timings.append((i + 1, name, module_elapsed, camera_elapsed, cmd_elapsed, wait_elapsed))
                     logger.info("flow module %s/%s finished: %s total=%.3fs camera=%.3fs cmd=%.3fs wait=%.3fs", i + 1, total, name, module_elapsed, camera_elapsed, cmd_elapsed, wait_elapsed)
                     if module_elapsed > 1.0:
-                        logger.warning("flow module %s/%s SLOW: %s total=%.3fs cmd=%.3fs wait=%.3fs", i + 1, total, name, module_elapsed, cmd_elapsed, wait_elapsed)
+                        if module['type'] == "move":
+                            logger.warning("flow module %s/%s SLOW: %s total=%.3fs speed_set=%.3fs cmd=%.3fs motion_wait=%.3fs camera=%.3fs", i + 1, total, name, module_elapsed, speed_set_elapsed, command_send_elapsed, motion_wait_elapsed, camera_elapsed)
+                        else:
+                            logger.warning("flow module %s/%s SLOW: %s total=%.3fs cmd=%.3fs wait=%.3fs camera=%.3fs", i + 1, total, name, module_elapsed, cmd_elapsed, wait_elapsed, camera_elapsed)
 
                 self.flow_log.emit("✅ 抓取流程执行完成")
                 total_elapsed = time.perf_counter() - flow_start
@@ -490,11 +682,15 @@ class FlowThread(QThread):
                     for idx, module_name, elapsed, _, cmd, wait in ctx.module_timings
                 )
                 logger.info("flow finished total=%.3fs modules=[%s]", total_elapsed, summary)
+                for idx, module_name, elapsed, cam_elapsed, cmd_e, wait_e in ctx.module_timings:
+                    if elapsed > 0.5:
+                        logger.info("  模块%d.%s: total=%.3fs cmd=%.3fs wait=%.3fs camera=%.3fs", idx, module_name, elapsed, cmd_e, wait_e, cam_elapsed)
                 self.flow_log.emit(f"流程总耗时 {total_elapsed:.2f}s")
                 self.flow_finished.emit(True)
             finally:
                 self.controller.release_motion("flow")
                 self._ctx = None
+                self.controller._active_flow_thread = None
         except Exception as e:
             self.flow_log.emit(f"❌ 流程异常: {e}")
             self.flow_finished.emit(False)

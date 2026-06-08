@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Unified UI theme: Industrial Robotics Dashboard design system.
-
-Design reference: Industrial Robotics Dashboard UI (Community) — Figma
-Dark industrial dashboard with card-based layout, icon sidebar, status indicators.
-"""
+"""Unified UI theme: colours, palette, stylesheet, and style helpers."""
 
 from __future__ import annotations
 
@@ -12,37 +8,24 @@ from qt_compat import QColor, QPalette
 
 
 # ---------------------------------------------------------------------------
-# Colour tokens — Industrial Robotics Dashboard palette
+# Colour tokens
 # ---------------------------------------------------------------------------
 
 COLORS = {
-    # Background layers
-    "bg":           "#0b0f1a",
-    "surface":      "#111827",
-    "panel":        "#1a2236",
-    "card":         "#1e293b",
-    "card_hover":   "#243049",
-    # Borders & lines
-    "line":         "#2a3550",
-    "line_light":   "#334155",
-    # Text
-    "text":         "#e2e8f0",
-    "text_secondary": "#94a3b8",
-    "text_muted":   "#64748b",
-    # Brand / accent
-    "primary":      "#3b82f6",
+    "bg": "#0b0f1a",
+    "surface": "#111827",
+    "panel": "#1a2236",
+    "card": "#1e293b",
+    "line": "#2a3550",
+    "border": "#334155",
+    "text": "#e2e8f0",
+    "muted": "#94a3b8",
+    "primary": "#3b82f6",
     "primary_dark": "#2563eb",
-    "primary_light": "#60a5fa",
-    "accent":       "#06b6d4",
-    # Semantic
-    "success":      "#22c55e",
-    "success_bg":   "#064e3b",
-    "warning":      "#f59e0b",
-    "warning_bg":   "#451a03",
-    "danger":       "#ef4444",
-    "danger_bg":    "#450a0a",
-    "info":         "#38bdf8",
-    "info_bg":      "#0c2d48",
+    "success": "#22c55e",
+    "warning": "#f59e0b",
+    "danger": "#ef4444",
+    "accent_blue": "#93c5fd",
 }
 
 # Sidebar navigation icon characters (Unicode)
@@ -55,18 +38,18 @@ NAV_ICONS = {
     "Modbus 通信": "\u229E",
     "报警记录":  "\u26A0",
     "点动控制":  "\u2725",
-    "手眼标定":  "\u229E",
+    "手眼标定":  "\u25A3",
     "相机测试":  "\u25C9",
 }
 
 
 # ---------------------------------------------------------------------------
-# Global stylesheet — Industrial Robotics Dashboard
+# Global stylesheet (inlined from style.qss)
 # ---------------------------------------------------------------------------
 
 GLOBAL_STYLESHEET = """\
 * {
-    font-family: "Segoe UI", "Microsoft YaHei UI", Arial, sans-serif;
+    font-family: "Microsoft YaHei UI", "Segoe UI", Arial, sans-serif;
     font-size: 10pt;
 }
 
@@ -83,32 +66,26 @@ QScrollArea > QWidget > QWidget {
     border: none;
 }
 
-/* GroupBox -> Dashboard Card */
 QGroupBox {
     background: #1e293b;
     border: 1px solid #2a3550;
-    border-radius: 10px;
-    margin-top: 22px;
+    border-radius: 8px;
+    margin-top: 18px;
     font-weight: 700;
-    color: #e2e8f0;
-    padding: 14px 12px 10px 12px;
 }
 
 QGroupBox::title {
     subcontrol-origin: margin;
-    left: 16px;
-    padding: 0 10px;
-    color: #94a3b8;
+    left: 14px;
+    padding: 0 8px;
+    color: #e2e8f0;
     background: #1e293b;
-    font-size: 9pt;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
 }
 
 QGroupBox#topStatusPanel {
-    background: #111827;
+    background: #1e293b;
     border: 1px solid #2a3550;
-    border-radius: 10px;
+    border-radius: 8px;
     margin-top: 0;
 }
 
@@ -116,20 +93,12 @@ QGroupBox#topStatusPanel::title {
     color: #3b82f6;
 }
 
-/* Dashboard Card Frame */
 QFrame#dashboardCard {
     background: #1e293b;
-    border: 1px solid #2a3550;
-    border-radius: 10px;
-}
-
-QFrame#statusCard {
-    background: #1a2236;
     border: 1px solid #2a3550;
     border-radius: 8px;
 }
 
-/* Labels */
 QLabel {
     color: #e2e8f0;
 }
@@ -138,35 +107,17 @@ QLabel#cardTitle {
     color: #64748b;
     font-size: 9pt;
     font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
 }
 
-QLabel#cardValue {
-    color: #e2e8f0;
-    font-size: 16pt;
-    font-weight: 700;
-}
-
-QLabel#statusBadge {
-    color: #e2e8f0;
-    font-size: 9pt;
-    font-weight: 600;
-    padding: 3px 10px;
-    border-radius: 12px;
-}
-
-/* Input widgets */
 QLineEdit,
 QDoubleSpinBox,
 QComboBox {
-    min-height: 34px;
-    padding: 6px 12px;
-    border: 1px solid #2a3550;
+    min-height: 32px;
+    padding: 6px 10px;
+    border: 1px solid #334155;
     border-radius: 6px;
     background: #111827;
     color: #e2e8f0;
-    selection-background-color: #2563eb;
 }
 
 QLineEdit:focus,
@@ -175,23 +126,10 @@ QComboBox:focus {
     border-color: #3b82f6;
 }
 
-QComboBox::drop-down {
-    border: none;
-    width: 24px;
-}
-
-QComboBox::down-arrow {
-    image: none;
-    border-left: 5px solid transparent;
-    border-right: 5px solid transparent;
-    border-top: 6px solid #94a3b8;
-}
-
-/* Buttons */
 QPushButton {
-    min-height: 34px;
-    padding: 7px 16px;
-    border: 1px solid #2a3550;
+    min-height: 32px;
+    padding: 7px 14px;
+    border: 1px solid #334155;
     border-radius: 6px;
     background: #1e293b;
     color: #e2e8f0;
@@ -199,19 +137,18 @@ QPushButton {
 }
 
 QPushButton:hover {
-    background: #243049;
-    border-color: #3b82f6;
+    background: #1a2236;
+    border-color: #475569;
 }
 
 QPushButton:pressed {
-    background: #1a2236;
-    border-color: #2563eb;
+    background: #1e3a8a;
 }
 
 QPushButton:disabled {
-    background: #111827;
-    color: #475569;
-    border-color: #1e293b;
+    background: #1a2236;
+    color: #64748b;
+    border-color: #2a3550;
 }
 
 QPushButton[role="primary"] {
@@ -224,19 +161,10 @@ QPushButton[role="primary"]:hover {
     background: #1d4ed8;
 }
 
-QPushButton[role="primary"]:pressed {
-    background: #1e40af;
-}
-
 QPushButton[role="connect"] {
     background: #064e3b;
     border-color: #22c55e;
     color: #86efac;
-}
-
-QPushButton[role="connect"]:hover {
-    background: #065f46;
-    border-color: #4ade80;
 }
 
 QPushButton[role="warning"] {
@@ -245,34 +173,18 @@ QPushButton[role="warning"] {
     color: #fcd34d;
 }
 
-QPushButton[role="warning"]:hover {
-    background: #78350f;
-    border-color: #fbbf24;
-}
-
 QPushButton[role="danger"] {
     background: #450a0a;
     border-color: #ef4444;
     color: #fca5a5;
 }
 
-QPushButton[role="danger"]:hover {
-    background: #7f1d1d;
-    border-color: #f87171;
-}
-
 QPushButton[role="secondary"] {
     background: #1a2236;
-    border-color: #2a3550;
+    border-color: #334155;
     color: #94a3b8;
 }
 
-QPushButton[role="secondary"]:hover {
-    background: #243049;
-    color: #e2e8f0;
-}
-
-/* Emergency Stop */
 QPushButton#emergencyStopButton {
     min-width: 82px;
     min-height: 82px;
@@ -295,40 +207,10 @@ QPushButton#emergencyStopButton[active="true"] {
     border-color: #9a3412;
 }
 
-/* Sidebar Navigation */
-QWidget#sideNav {
-    background: #0b0f1a;
-    border-right: 1px solid #1e293b;
-}
-
-QPushButton#sideNavButton {
-    min-height: 44px;
-    padding: 8px 14px;
-    border: none;
-    border-radius: 8px;
-    background: transparent;
-    color: #64748b;
-    font-weight: 600;
-    text-align: left;
-    font-size: 10pt;
-}
-
-QPushButton#sideNavButton:hover {
-    background: #1a2236;
-    color: #e2e8f0;
-}
-
-QPushButton#sideNavButton:checked {
-    background: #1e293b;
-    color: #3b82f6;
-    border-left: 3px solid #3b82f6;
-}
-
-/* Tab Widget */
 QTabWidget#workspaceTabs::pane {
-    background: #111827;
+    background: #1e293b;
     border: 1px solid #2a3550;
-    border-radius: 10px;
+    border-radius: 8px;
 }
 
 QTabWidget#workspaceTabs QTabBar {
@@ -342,7 +224,7 @@ QTabWidget#workspaceTabs QTabBar::tab {
     margin: 4px 8px;
     border-radius: 6px;
     background: transparent;
-    color: #64748b;
+    color: #94a3b8;
     font-weight: 700;
 }
 
@@ -356,39 +238,33 @@ QTabWidget#workspaceTabs QTabBar::tab:hover {
     color: #e2e8f0;
 }
 
-/* Tables */
 QTableWidget {
-    background: #111827;
-    alternate-background-color: #1a2236;
-    gridline-color: #1e293b;
+    background: #1e293b;
+    alternate-background-color: #111827;
+    gridline-color: #2a3550;
     border: 1px solid #2a3550;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #e2e8f0;
 }
 
 QTableWidget::item {
-    padding: 6px;
+    padding: 4px;
 }
 
 QTableWidget::item:selected {
     background: #1e3a8a;
-    color: #e2e8f0;
+    color: #93c5fd;
 }
 
 QHeaderView::section {
     background: #1a2236;
     color: #94a3b8;
-    padding: 8px;
+    padding: 7px;
     border: none;
     border-right: 1px solid #2a3550;
-    border-bottom: 1px solid #2a3550;
     font-weight: 700;
-    font-size: 9pt;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
 }
 
-/* Scrollbars */
 QScrollBar:vertical,
 QScrollBar:horizontal {
     background: transparent;
@@ -396,22 +272,17 @@ QScrollBar:horizontal {
 }
 
 QScrollBar:vertical {
-    width: 8px;
+    width: 10px;
 }
 
 QScrollBar:horizontal {
-    height: 8px;
+    height: 10px;
 }
 
 QScrollBar::handle:vertical,
 QScrollBar::handle:horizontal {
-    background: #334155;
-    border-radius: 4px;
-}
-
-QScrollBar::handle:vertical:hover,
-QScrollBar::handle:horizontal:hover {
     background: #475569;
+    border-radius: 5px;
 }
 
 QScrollBar::add-line,
@@ -423,81 +294,69 @@ QScrollBar::sub-page {
     background: none;
 }
 
-/* Status Bar */
 QStatusBar {
-    background: #0b0f1a;
-    border-top: 1px solid #1e293b;
+    background: #1e293b;
+    border-top: 1px solid #2a3550;
     color: #64748b;
-    font-size: 9pt;
 }
 
 QMessageBox {
     background: #1e293b;
+}
+
+QWidget#sideNav {
+    background: #0b0f1a;
+    border-right: 1px solid #1e293b;
+}
+
+QPushButton#sideNavButton {
+    background: transparent;
+    border: none;
+    border-left: 3px solid transparent;
+    color: #94a3b8;
+    text-align: left;
+    padding: 10px 12px;
+    font-weight: 600;
+    min-height: 36px;
+}
+
+QPushButton#sideNavButton:hover {
+    background: #1a2236;
     color: #e2e8f0;
+}
+
+QPushButton#sideNavButton:checked {
+    background: #111827;
+    color: #3b82f6;
+    border-left: 3px solid #3b82f6;
+}
+
+QFrame#statusCard {
+    background: #1e293b;
+    border: 1px solid #2a3550;
+    border-radius: 10px;
 }
 """
 
 
 # ---------------------------------------------------------------------------
-# Flow-step style constants — Industrial Dashboard
+# Flow-step style constants
 # ---------------------------------------------------------------------------
 
 FLOW_STEP_STYLE = (
-    "color: #94a3b8; background-color: #1a2236; padding: 8px 12px; "
-    "border: 1px solid #2a3550; border-radius: 6px;"
+    "color: #e2e8f0; background-color: #1e293b; padding: 7px 9px; "
+    "border: 1px solid #475569; border-radius: 6px;"
 )
 
 FLOW_STEP_SELECTED_STYLE = (
-    "color: #ffffff; background-color: #1e3a8a; padding: 8px 12px; "
-    "border: 1px solid #3b82f6; border-radius: 6px; font-weight: 700;"
+    "color: #ffffff; background-color: #3b82f6; padding: 7px 9px; "
+    "border: 1px solid #2563eb; border-radius: 6px; font-weight: 700;"
 )
 
 FLOW_STEP_EMPTY_STYLE = (
-    "color: #475569; background-color: #111827; padding: 12px; "
-    "border: 1px dashed #2a3550; border-radius: 6px;"
+    "color: #64748b; background-color: #0b0f1a; padding: 10px; "
+    "border: 1px dashed #475569; border-radius: 6px;"
 )
-
-
-# ---------------------------------------------------------------------------
-# Dashboard card style helpers
-# ---------------------------------------------------------------------------
-
-def card_style(accent_color: str = "") -> str:
-    """Return stylesheet for a dashboard card frame, optionally with accent border."""
-    base = (
-        "QFrame { background: #1e293b; border: 1px solid #2a3550; "
-        "border-radius: 10px; padding: 12px; }"
-    )
-    if accent_color:
-        base = (
-            f"QFrame {{ background: #1e293b; border: 1px solid {accent_color}; "
-            f"border-left: 3px solid {accent_color}; border-radius: 10px; padding: 12px; }}"
-        )
-    return base
-
-
-def metric_label_style(color: str = "#e2e8f0") -> str:
-    """Large metric value label."""
-    return (
-        f"color: {color}; font-size: 18pt; font-weight: 700; "
-        "font-family: 'Segoe UI', monospace; background: transparent; border: none;"
-    )
-
-
-def metric_title_style() -> str:
-    """Small uppercase metric title label."""
-    return (
-        "color: #64748b; font-size: 8pt; font-weight: 700; "
-        "text-transform: uppercase; letter-spacing: 0.5px; "
-        "background: transparent; border: none;"
-    )
-
-
-def sidebar_icon_style(active: bool = False) -> str:
-    """Icon character style for sidebar buttons."""
-    if active:
-        return "color: #3b82f6; font-size: 16pt; background: transparent; border: none;"
-    return "color: #475569; font-size: 16pt; background: transparent; border: none;"
 
 
 # ---------------------------------------------------------------------------
@@ -506,16 +365,19 @@ def sidebar_icon_style(active: bool = False) -> str:
 
 def build_app_palette() -> QPalette:
     palette = QPalette()
-    palette.setColor(QPalette.ColorRole.Window, QColor(COLORS["bg"]))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor(COLORS["text"]))
-    palette.setColor(QPalette.ColorRole.Base, QColor(COLORS["surface"]))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(COLORS["panel"]))
-    palette.setColor(QPalette.ColorRole.Button, QColor(COLORS["card"]))
-    palette.setColor(QPalette.ColorRole.ButtonText, QColor(COLORS["text"]))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor(COLORS["primary"]))
+    palette.setColor(QPalette.ColorRole.Window, QColor("#0b0f1a"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#e2e8f0"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#111827"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#1a2236"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#1e293b"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#e2e8f0"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#3b82f6"))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
-    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(COLORS["card"]))
-    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(COLORS["text"]))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#e2e8f0"))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#1e293b"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#e2e8f0"))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#64748b"))
     return palette
 
 
@@ -552,12 +414,12 @@ def status_style(value):
         border = "#f59e0b"
     else:
         color = "#94a3b8"
-        background = "#1a2236"
-        border = "#2a3550"
+        background = "#1e293b"
+        border = "#475569"
     return (
         f"color: {color}; background-color: {background}; "
-        f"border: 1px solid {border}; border-radius: 12px; "
-        "padding: 4px 12px; font-weight: 600; font-size: 9pt;"
+        f"border: 1px solid {border}; border-radius: 6px; "
+        "padding: 4px 8px; font-weight: 600;"
     )
 
 
@@ -569,3 +431,34 @@ def set_button_role(button, role):
     button.setProperty("role", role)
     button.style().unpolish(button)
     button.style().polish(button)
+
+
+def card_style(accent_color: str = "") -> str:
+    """Return stylesheet for a dashboard card frame, optionally with accent border."""
+    base = (
+        "QFrame { background: #1e293b; border: 1px solid #2a3550; "
+        "border-radius: 10px; padding: 12px; }"
+    )
+    if accent_color:
+        base = (
+            f"QFrame {{ background: #1e293b; border: 1px solid {accent_color}; "
+            f"border-left: 3px solid {accent_color}; border-radius: 10px; padding: 12px; }}"
+        )
+    return base
+
+
+def metric_label_style(color: str = "#e2e8f0") -> str:
+    """Large metric value label."""
+    return (
+        f"color: {color}; font-size: 18pt; font-weight: 700; "
+        "font-family: 'Segoe UI', monospace; background: transparent; border: none;"
+    )
+
+
+def metric_title_style() -> str:
+    """Small uppercase metric title label."""
+    return (
+        "color: #64748b; font-size: 8pt; font-weight: 700; "
+        "text-transform: uppercase; letter-spacing: 0.5px; "
+        "background: transparent; border: none;"
+    )

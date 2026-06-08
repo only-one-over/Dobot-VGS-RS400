@@ -120,7 +120,7 @@ _DEFAULT_GRASP_FLOW_MODULES = [
             "target": "camera_detected",
             "motion_type": "MovL",
             "speed": 30,
-            "point_name": ""
+            "point_name": "d435i"
         }
     }
 ]

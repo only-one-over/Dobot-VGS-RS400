@@ -44,7 +44,7 @@ class GraspFlowMixin:
                     "target": "camera_detected",
                     "motion_type": "MovL",
                     "speed": 30,
-                    "point_name": ""
+                    "point_name": "d435i"
                 }
             }
         elif module_type == "圆弧运动":
@@ -350,6 +350,15 @@ class GraspFlowMixin:
         if hasattr(self, "_refresh_action_states"):
             self._refresh_action_states()
         self._is_paused_ref = [False]
+        from workers import validate_grasp_flow_modules
+        errors = validate_grasp_flow_modules(self.grasp_flow_modules)
+        if errors:
+            self._flow_running = False
+            error_text = "\n".join(errors)
+            QMessageBox.warning(self, "流程校验失败", f"以下问题需要修正：\n\n{error_text}")
+            if hasattr(self, "_refresh_action_states"):
+                self._refresh_action_states()
+            return
         from workers import FlowThread
         self._flow_thread = FlowThread(
             self.controller, self.vision_d435i, self.vision_d405, self.grasp_flow_modules, self._is_paused_ref, self

@@ -15,7 +15,7 @@ import math
 import threading
 import numpy as np
 from dobot_api import DobotApiDashboard, DobotApiFeedBack
-from config_manager import get_initial_point
+from config_manager import get_initial_point, get_performance_config
 from alarm_history import AlarmHistory
 
 logger = logging.getLogger(__name__)
@@ -40,12 +40,19 @@ class DobotController:
         self.feed_lock = threading.Lock()
         self.feed_data = None
         self.feed_thread = None
+        self.latest_pose = None
+        self.latest_pose_time = 0.0
+        self.latest_robot_mode = None
+        self.latest_robot_mode_time = 0.0
+        self.latest_feed_time = 0.0
 
         self.position_tolerance = 10.0
         self.safe_speed = 30
         self.current_speed = 30
         self._last_speed_factor = None
         self.last_feed_time = 0
+        self._last_robot_mode_dashboard_query_time = 0.0
+        self._last_robot_mode_dashboard_query_value = None
         self._feed_error_count = 0
         self.clear_error_retry_count = 0
         self.modbus_server = None
@@ -69,6 +76,9 @@ class DobotController:
         self.force_trigger_callback = None
         self.last_force_value = 0.0
         self.force_triggered = False
+
+        self._motion_owner = None
+        self._motion_lock = threading.Lock()
 
     def record_alarm(self, source, code="", level="报警", description="", solution="", raw=""):
         try:
@@ -531,6 +541,29 @@ class DobotController:
             logger.error(f"  设置速度失败，响应码: {response_code}")
             return False
 
+    def acquire_motion(self, owner: str, allow_if_idle: bool = True) -> bool:
+        """Try to acquire exclusive motion control. Returns True if acquired."""
+        with self._motion_lock:
+            if self._motion_owner is None:
+                if allow_if_idle:
+                    self._motion_owner = owner
+                    logger.info("运动控制权获取: %s", owner)
+                    return True
+                return False
+            if self._motion_owner == owner:
+                return True
+            logger.warning("运动控制权被 %s 占用，%s 无法获取", self._motion_owner, owner)
+            return False
+
+    def release_motion(self, owner: str):
+        """Release motion control if currently held by owner."""
+        with self._motion_lock:
+            if self._motion_owner == owner:
+                self._motion_owner = None
+                logger.info("运动控制权释放: %s", owner)
+            else:
+                logger.warning("运动控制权不属于 %s（当前: %s），无法释放", owner, self._motion_owner)
+
     def get_force(self, tool=2):
         """获取力传感器当前数值（工具坐标系2）
 
@@ -611,14 +644,8 @@ class DobotController:
         logger.error(" 获取位置失败，已达到最大重试次数")
         return None
 
-    def get_current_pose_from_feedback(self, max_age=0.25):
-        """Read current TCP pose from the 30004 real-time feedback cache."""
-        if not self.is_connected:
-            return None
-        if self.last_feed_time <= 0 or time.time() - self.last_feed_time > max_age:
-            return None
+    def _extract_pose_from_feed_data(self, data):
         try:
-            data = self.get_feed_data()
             if data is None:
                 return None
             names = getattr(getattr(data, "dtype", None), "names", None)
@@ -631,79 +658,184 @@ class DobotController:
             else:
                 return None
             pose = [float(v) for v in pose[:6]]
-            if len(pose) == 6 and all(np.isfinite(pose)):
-                logger.debug(
-                    " 30004反馈位姿: X=%.1f, Y=%.1f, Z=%.1f, Rx=%.1f, Ry=%.1f, Rz=%.1f",
-                    pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]
-                )
-                return pose
-        except Exception as e:
-            logger.debug(f" 读取30004反馈位姿失败: {e}")
-        return None
-
-    def get_current_pose_fast(self, max_age=0.25, fallback=True, max_retries=1):
-        """Prefer 30004 feedback pose; fallback to dashboard GetPose when needed."""
-        pose = self.get_current_pose_from_feedback(max_age=max_age)
-        if pose is not None:
-            return pose
-        if not fallback:
+            return pose if len(pose) == 6 and all(np.isfinite(pose)) else None
+        except Exception:
             return None
-        return self.get_current_pose(max_retries=max_retries)
 
-    def _get_robot_mode_from_feedback(self):
+    def _extract_robot_mode_from_feed_data(self, data):
         try:
-            feed_data = self.get_feed_data()
-            if feed_data is None:
+            if data is None:
                 return None
-            if hasattr(feed_data, "get"):
-                robot_mode = feed_data.get("RobotMode")
+            if hasattr(data, "get"):
+                robot_mode = data.get("RobotMode")
                 if robot_mode is not None:
                     try:
                         return int(robot_mode[0])
                     except Exception:
                         return int(robot_mode)
-            names = getattr(getattr(feed_data, "dtype", None), "names", None)
+            names = getattr(getattr(data, "dtype", None), "names", None)
             if names and "RobotMode" in names:
-                return int(feed_data["RobotMode"][0])
+                return int(data["RobotMode"][0])
         except Exception:
             return None
         return None
 
-    def _get_robot_mode(self):
-        mode = self._get_robot_mode_from_feedback()
-        if mode is not None:
+    def get_cached_pose(self, max_age=0.3):
+        """Read parsed TCP pose from the 30004 feedback cache."""
+        if not self.is_connected:
+            return None
+        now = time.time()
+        with self.feed_lock:
+            pose = list(self.latest_pose) if self.latest_pose is not None else None
+            pose_time = self.latest_pose_time
+        if pose is None or pose_time <= 0 or now - pose_time > max_age:
+            return None
+        return pose
+
+    def get_current_pose_from_feedback(self, max_age=0.3):
+        return self.get_cached_pose(max_age=max_age)
+
+    def get_current_pose_fast(self, max_age=0.3, fallback=True, max_retries=1):
+        """Prefer parsed 30004 feedback pose; fallback to dashboard GetPose when needed."""
+        pose = self.get_cached_pose(max_age=max_age)
+        if pose is not None:
+            return pose
+        logger.debug("30004 pose cache expired; fallback=%s", fallback)
+        if not fallback:
+            return None
+        return self.get_current_pose(max_retries=max_retries)
+
+    def get_robot_mode_fast(self, max_age=0.3, fallback=True, dashboard_fallback_interval=None):
+        now = time.time()
+        with self.feed_lock:
+            mode = self.latest_robot_mode
+            mode_time = self.latest_robot_mode_time
+        if mode is not None and mode_time > 0 and now - mode_time <= max_age:
             return mode
-        try:
-            response = self.dashboard.RobotMode()
-            return self.parse_robot_mode(response) if response else None
-        except Exception as e:
-            logger.debug(f" 获取RobotMode失败: {e}")
+        if not fallback or not self.dashboard:
             return None
 
-    def wait_for_motion_completion(self, timeout=30, poll_interval=0.1, auto_clear_error=True):
-        """等待运动完成"""
-        logger.info(" 等待运动完成...")
-        start_time = time.time()
+        perf = get_performance_config()
+        fallback_interval = float(
+            dashboard_fallback_interval
+            if dashboard_fallback_interval is not None
+            else perf.get("robot_mode_dashboard_fallback_interval", 0.5)
+        )
+        if now - self._last_robot_mode_dashboard_query_time < fallback_interval:
+            return self._last_robot_mode_dashboard_query_value
 
+        try:
+            logger.debug("30004 RobotMode cache expired; fallback to dashboard RobotMode()")
+            response = self.dashboard.RobotMode()
+            mode = self.parse_robot_mode(response) if response else None
+            self._last_robot_mode_dashboard_query_time = now
+            self._last_robot_mode_dashboard_query_value = mode
+            return mode
+        except Exception as e:
+            logger.debug(f" 获取RobotMode失败: {e}")
+            self._last_robot_mode_dashboard_query_time = now
+            self._last_robot_mode_dashboard_query_value = None
+            return None
+
+    def _get_robot_mode_from_feedback(self):
+        return self.get_robot_mode_fast(fallback=False)
+
+    def _get_robot_mode(self):
+        return self.get_robot_mode_fast()
+
+    def get_feedback_health(self, max_age: float = 0.3) -> dict:
+        """Return feedback cache snapshot with health status.
+
+        Health levels:
+        - "ok": feedback within max_age
+        - "stale": feedback older than max_age but within stale_fail_age
+        - "disconnected": feedback older than stale_fail_age or never received
+        """
+        perf = get_performance_config()
+        stale_warn_age = float(perf.get("feedback_stale_warn_age", 0.5))
+        stale_fail_age = float(perf.get("feedback_stale_fail_age", 2.0))
+
+        now = time.time()
+        with self.feed_lock:
+            pose = list(self.latest_pose) if self.latest_pose is not None else None
+            mode = self.latest_robot_mode
+            timestamp = self.latest_pose_time
+
+        if timestamp <= 0:
+            return {
+                "pose": None, "robot_mode": None, "timestamp": 0.0,
+                "health": "disconnected",
+            }
+
+        age = now - timestamp
+        if age <= max_age:
+            health = "ok"
+        elif age <= stale_fail_age:
+            health = "stale"
+            if age > stale_warn_age:
+                logger.warning("反馈缓存过期: %.2fs (warn_age=%.1fs)", age, stale_warn_age)
+        else:
+            health = "disconnected"
+            logger.error("反馈缓存断流: %.2fs (fail_age=%.1fs)", age, stale_fail_age)
+
+        return {
+            "pose": pose, "robot_mode": mode, "timestamp": timestamp,
+            "health": health,
+        }
+
+    def wait_for_motion_completion(
+        self,
+        timeout=30,
+        poll_interval=0.05,
+        auto_clear_error=True,
+        dashboard_fallback_interval=None,
+        settle_time=None,
+        stop_checker=None,
+    ):
+        """Wait until RobotMode reports idle, preferring 30004 feedback cache."""
+        perf = get_performance_config()
+        poll_interval = float(poll_interval if poll_interval is not None else perf.get("flow_wait_poll_interval", 0.05))
+        dashboard_fallback_interval = float(
+            dashboard_fallback_interval
+            if dashboard_fallback_interval is not None
+            else perf.get("robot_mode_dashboard_fallback_interval", 0.5)
+        )
+        settle_time = float(settle_time if settle_time is not None else perf.get("motion_settle_time", 0.15))
+
+        logger.info(" 等待运动完成: timeout=%.1fs poll=%.2fs settle=%.2fs", timeout, poll_interval, settle_time)
+        start_time = time.time()
+        if settle_time > 0:
+            time.sleep(settle_time)
+
+        last_running_log_second = -1
         while time.time() - start_time < timeout:
-            robot_mode = self._get_robot_mode()
+            if stop_checker is not None and stop_checker():
+                logger.info("运动等待被外部打断")
+                return False
+            robot_mode = self.get_robot_mode_fast(
+                max_age=float(perf.get("pose_cache_max_age", 0.3)),
+                fallback=True,
+                dashboard_fallback_interval=dashboard_fallback_interval,
+            )
             if robot_mode is not None:
 
                 if robot_mode == 5:
                     logger.info(" 运动完成")
                     self.clear_error_retry_count = 0
                     return True
-                elif robot_mode == 7:
+                elif robot_mode in (7, 8):
                     elapsed = time.time() - start_time
-                    if int(elapsed) % 2 == 0:
+                    elapsed_second = int(elapsed)
+                    if elapsed_second != last_running_log_second and elapsed_second % 2 == 0:
                         logger.debug(f"  运行中... 已耗时: {elapsed:.1f}秒")
+                        last_running_log_second = elapsed_second
                 elif robot_mode == 9:
                     logger.warning("  机器人出现错误，尝试自动清除报警...")
                     if auto_clear_error and self.clear_error_retry_count < 3:
                         self.clear_error_retry_count += 1
                         self.clear_error(auto_enable=False)
                         logger.warning(f"  第{self.clear_error_retry_count}次清除报警，等待0.5秒后继续检查...")
-                        time.sleep(poll_interval)
+                        time.sleep(max(poll_interval, 0.1))
                     else:
                         logger.error("  已重试3次清除报警失败，返回False")
                         self.clear_error_retry_count = 0
@@ -722,7 +854,7 @@ class DobotController:
         middle_pose=None,
         verify_start_pose=True,
         verify_end_pose=True,
-        wait_poll_interval=0.1,
+        wait_poll_interval=0.05,
     ):
         """移动到目标点"""
         if not self.is_enabled:
@@ -875,7 +1007,7 @@ class DobotController:
             logger.error(f" ServoP异常: {e}")
             return False
 
-    def move_joint_relative(self, offsets, a=20, v=50, cp=100, verify_end_pose=True, wait_poll_interval=0.1):
+    def move_joint_relative(self, offsets, a=20, v=50, cp=100, verify_end_pose=True, wait_poll_interval=0.05):
         """关节相对运动"""
         if not self.is_enabled:
             logger.error(" 机器人未使能")
@@ -945,7 +1077,7 @@ class DobotController:
         speed=30,
         acceleration=20,
         cp=100,
-        wait_poll_interval=0.1,
+        wait_poll_interval=0.05,
     ):
         """Relative motion without force control."""
         if not self.is_connected:
@@ -1067,8 +1199,10 @@ class DobotController:
                 self.dashboard.Stop()
                 return True
 
-            response = self.dashboard.RobotMode()
-            robot_mode = self.parse_robot_mode(response) if response else None
+            robot_mode = self.get_robot_mode_fast(
+                max_age=float(get_performance_config().get("pose_cache_max_age", 0.3)),
+                fallback=True,
+            )
             if robot_mode == 5:
                 logger.info("力阈值移动自然完成，未触发停止")
                 return True
@@ -1081,7 +1215,7 @@ class DobotController:
         self.dashboard.Stop()
         return True
 
-    def move_to_initial_position(self, verify_start_pose=True, verify_end_pose=True, wait_poll_interval=0.1):
+    def move_to_initial_position(self, verify_start_pose=True, verify_end_pose=True, wait_poll_interval=0.05):
         """移动到初始位置"""
         self.initial_pose = get_initial_point()
         logger.info("\n" + "=" * 60)
@@ -1120,6 +1254,12 @@ class DobotController:
             self.feed_thread.join()
         if self.feed_four:
             self.feed_four.close()
+        with self.feed_lock:
+            self.latest_pose = None
+            self.latest_pose_time = 0.0
+            self.latest_robot_mode = None
+            self.latest_robot_mode_time = 0.0
+            self.latest_feed_time = 0.0
 
     def _feed_loop(self):
         while self._feed_running:
@@ -1132,9 +1272,19 @@ class DobotController:
                         magic_ok = True
 
                     if magic_ok or len(result[0]) > 0:
+                        now = time.time()
+                        pose = self._extract_pose_from_feed_data(result)
+                        robot_mode = self._extract_robot_mode_from_feed_data(result)
                         with self.feed_lock:
                             self.feed_data = result
-                            self.last_feed_time = time.time()
+                            self.last_feed_time = now
+                            self.latest_feed_time = now
+                            if pose is not None:
+                                self.latest_pose = pose
+                                self.latest_pose_time = now
+                            if robot_mode is not None:
+                                self.latest_robot_mode = robot_mode
+                                self.latest_robot_mode_time = now
                         self._feed_error_count = 0
             except Exception as e:
                 self._feed_error_count += 1
@@ -1458,48 +1608,78 @@ class DobotController:
         """回安全位"""
         if not self.is_connected:
             return
+        if not self.acquire_motion("modbus"):
+            logger.warning("流程运行中，Modbus回安全位被拒绝")
+            self._modbus_status_override = 4
+            self._last_fault_code = 2
+            self.record_alarm("Modbus回安全位", "BUSY", "故障", "流程运行中，回安全位被拒绝")
+            if self.modbus_server:
+                self.modbus_server.update_status_registers(status=4, fault_code=2, in_position=0, emergency=0)
+            return
         try:
             self._modbus_status_override = 2
             pose = self.initial_pose
-            response = self.dashboard.MovJ(pose[0], pose[1], pose[2], pose[3], pose[4], pose[5], 0)
-            response_code = self.parse_response_code(response)
-            if response_code != 0:
+            success = self.move_to_point(
+                pose,
+                move_type="MovJ",
+                speed_percentage=self.current_speed or 20,
+                verify_start_pose=False,
+                verify_end_pose=False,
+            )
+            if not success:
                 self._modbus_status_override = 4
-                self._last_fault_code = response_code or 2
-                self.record_alarm("Modbus回安全位", response_code, "故障", "回安全位指令被拒绝", raw=response)
+                self._last_fault_code = 2
+                self.record_alarm("Modbus回安全位", "REJECTED", "故障", "回安全位指令被拒绝或超时")
             else:
                 self._modbus_status_override = None
         except Exception as e:
             logger.error(f" Modbus回安全位失败: {e}")
             self._modbus_status_override = 4
             self._last_fault_code = 2
-            self.record_alarm("Modbus回安全位", "EXCEPTION", "故障", "回安全位执行异常", raw=e)
-
+            self.record_alarm("Modbus回安全位", "EXCEPTION", "故障", "Modbus回安全位执行异常", raw=e)
+        finally:
+            self.release_motion("modbus")
     def _modbus_auto_hook(self):
         """执行外部主站写入的目标位姿"""
+        if not self.is_connected:
+            return
+        if not self.acquire_motion("modbus"):
+            logger.warning("流程运行中，Modbus目标运动被拒绝")
+            self._modbus_status_override = 4
+            self._last_fault_code = 3
+            self.record_alarm("Modbus目标运动", "BUSY", "故障", "流程运行中，目标运动被拒绝")
+            if self.modbus_server:
+                self.modbus_server.update_status_registers(status=4, fault_code=3, in_position=0, emergency=0)
+            return
         target = self.modbus_server.get_target_position() if self.modbus_server else None
-        if target and self.is_connected:
-            try:
-                speed = int(target.get("speed", 30))
-                speed = min(max(speed, 1), 100)
-                self._modbus_status_override = 2
-                self.dashboard.SpeedFactor(speed)
-                response = self.dashboard.MovJ(
-                    target["x"], target["y"], target["z"],
-                    target["rx"], target.get("ry", 0.0), target.get("rz", 0.0), 0
-                )
-                response_code = self.parse_response_code(response)
-                if response_code != 0:
-                    self._modbus_status_override = 4
-                    self._last_fault_code = response_code or 3
-                    self.record_alarm("Modbus目标运动", response_code, "故障", "目标运动指令被拒绝", raw=response)
-                else:
-                    self._modbus_status_override = None
-            except Exception as e:
-                logger.error(f" Modbus目标运动失败: {e}")
+        if not target:
+            self.release_motion("modbus")
+            return
+        try:
+            speed = int(target.get("speed", 30))
+            speed = min(max(speed, 1), 100)
+            self._modbus_status_override = 2
+            target_pose = [target["x"], target["y"], target["z"], target["rx"], target.get("ry", 0.0), target.get("rz", 0.0)]
+            success = self.move_to_point(
+                target_pose,
+                move_type="MovJ",
+                speed_percentage=speed,
+                verify_start_pose=False,
+                verify_end_pose=False,
+            )
+            if not success:
                 self._modbus_status_override = 4
                 self._last_fault_code = 3
-                self.record_alarm("Modbus目标运动", "EXCEPTION", "故障", "目标运动执行异常", raw=e)
+                self.record_alarm("Modbus目标运动", "REJECTED", "故障", "目标运动指令被拒绝或超时")
+            else:
+                self._modbus_status_override = None
+        except Exception as e:
+            logger.error(f" Modbus目标运动失败: {e}")
+            self._modbus_status_override = 4
+            self._last_fault_code = 3
+            self.record_alarm("Modbus目标运动", "EXCEPTION", "故障", "目标运动执行异常", raw=e)
+        finally:
+            self.release_motion("modbus")
 
     def set_force_threshold(self, threshold):
         """设置力控阈值"""

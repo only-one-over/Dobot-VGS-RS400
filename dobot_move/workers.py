@@ -2,10 +2,14 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import threading
 import time
+from dataclasses import dataclass, field
+from typing import Optional
+
 import numpy as np
 from qt_compat import QImage, QThread, pyqtSignal
-from config_manager import get_point, set_point, resolve_point
+from config_manager import get_point, set_point, resolve_point, get_performance_config
 from force_arc_controller import ForceArcController
 from visual_servo_controller import VisualServoController
 
@@ -82,6 +86,73 @@ class RobotCmdThread(QThread):
             self.cmd_finished.emit(self._cmd_name, False)
 
 
+@dataclass
+class FlowRunContext:
+    """Unified context for a single flow execution run."""
+    run_id: str
+    start_time: float
+    current_module_index: int = -1
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    module_timings: list = field(default_factory=list)
+    motion_generation: int = 0
+    _flow_detection_cache: dict = field(default_factory=dict)
+
+    def increment_motion_generation(self):
+        self.motion_generation += 1
+
+    def is_cache_valid(self, camera_type: str) -> bool:
+        entry = self._flow_detection_cache.get(camera_type)
+        if entry is None:
+            return False
+        if entry.get("motion_generation") != self.motion_generation:
+            return False
+        return True
+
+
+def validate_grasp_flow_modules(modules: list) -> list:
+    """Validate grasp flow module configuration before execution.
+
+    Returns a list of error strings. Empty list means validation passed.
+    """
+    errors = []
+    has_camera_before = set()  # camera types seen so far
+
+    for i, module in enumerate(modules):
+        step = i + 1
+        name = module.get("name", f"模块{step}")
+        mtype = module.get("type", "")
+        params = module.get("params", {})
+
+        if mtype == "move":
+            target = params.get("target", "")
+            if target == "camera_detected":
+                camera_type = "D435i"  # default assumption
+                if camera_type not in has_camera_before and "D405" not in has_camera_before:
+                    errors.append(f"第{step}步「{name}」：目标为 camera_detected，但前面没有相机识别模块")
+                motion_type = params.get("motion_type", "")
+                point_name = params.get("point_name", "")
+                if motion_type == "MovL" and not point_name.strip():
+                    errors.append(f"第{step}步「{name}」：直线运动目标为 camera_detected，但未指定目标点位")
+            elif target == "initial_position":
+                from config_manager import get_point
+                if not get_point("initial_point"):
+                    errors.append(f"第{step}步「{name}」：初始位置点位 initial_point 不存在")
+
+        elif mtype == "force_arc":
+            center_offset_z = float(params.get('center_offset_z', params.get('radius', 0)))
+            sweep_angle = float(params.get('sweep_angle', 0))
+            if center_offset_z <= 0:
+                errors.append(f"第{step}步「{name}」：圆弧上方距离必须大于0")
+            if sweep_angle <= 0:
+                errors.append(f"第{step}步「{name}」：圆弧角度必须大于0")
+
+        elif mtype == "camera":
+            camera_type = params.get("camera_type", "D435i")
+            has_camera_before.add(camera_type)
+
+    return errors
+
+
 class FlowThread(QThread):
     flow_log = pyqtSignal(str)
     flow_finished = pyqtSignal(bool)
@@ -95,300 +166,401 @@ class FlowThread(QThread):
         self.grasp_flow_modules = grasp_flow_modules
         self.is_paused_ref = is_paused_ref
         self._stop_requested = False
+        self._ctx: Optional[FlowRunContext] = None
+        self.performance_config = get_performance_config()
+        self._flow_detection_cache = {}
+
+    def _fail_module(self, ctx, module_index, module_name, reason):
+        """Unified failure handler: record timing, emit log/signal, write alarm."""
+        module_elapsed = time.perf_counter() - ctx.start_time - sum(t[2] for t in ctx.module_timings)
+        ctx.module_timings.append((module_index + 1, module_name, module_elapsed, 0.0, 0.0, 0.0))
+        self.flow_log.emit(f"❌ 模块{module_index + 1}失败: {reason}")
+        self.controller.record_alarm("流程执行", f"模块{module_index + 1}", "故障", reason)
+        self.flow_finished.emit(False)
+        self.controller.release_motion("flow")
 
     def stop(self):
+        if self._ctx is not None:
+            self._ctx.stop_event.set()
         self._stop_requested = True
         if self.is_paused_ref:
             self.is_paused_ref[0] = False
 
     def run(self):
         try:
-            modules = self.grasp_flow_modules
-            total = len(modules)
-            base_coords = None
-            for i, module in enumerate(modules):
-                if self._stop_requested:
-                    self.flow_finished.emit(False)
-                    return
-                while self.is_paused_ref[0]:
-                    if self._stop_requested:
-                        self.flow_finished.emit(False)
+            ctx = FlowRunContext(
+                run_id=f"flow_{int(time.perf_counter() * 1000)}",
+                start_time=time.perf_counter(),
+            )
+            self._ctx = ctx
+
+            if not self.controller.acquire_motion("flow"):
+                self.flow_log.emit("❌ 无法获取运动控制权，可能有其他操作正在执行")
+                self.flow_finished.emit(False)
+                return
+
+            try:
+                flow_start = ctx.start_time
+                wait_poll_interval = float(self.performance_config.get("flow_wait_poll_interval", 0.05))
+                pose_cache_max_age = float(self.performance_config.get("pose_cache_max_age", 0.3))
+                stale_fail_age = float(self.performance_config.get("feedback_stale_fail_age", 2.0))
+                modules = self.grasp_flow_modules
+                total = len(modules)
+                base_coords = None
+
+                for i, module in enumerate(modules):
+                    module_start = time.perf_counter()
+                    camera_elapsed = 0.0
+                    cmd_elapsed = 0.0
+                    wait_elapsed = 0.0
+                    ctx.current_module_index = i
+
+                    if ctx.stop_event.is_set():
+                        self._fail_module(ctx, i, module.get("name", f"模块{i+1}"), "用户停止")
                         return
-                    self.msleep(100)
-                name = module.get("name", f"模块{i+1}")
-                self.flow_module_progress.emit(i + 1, total, name)
-                if module['type'] == "move":
-                    if module['params']['target'] == "initial_position":
-                        if not self.controller.move_to_initial_position(verify_start_pose=False, verify_end_pose=False, wait_poll_interval=0.1):
-                            self.flow_log.emit(f"❌ 模块{i+1}运动失败: 移动到初始位置失败")
-                            self.flow_finished.emit(False)
+
+                    while self.is_paused_ref[0]:
+                        if ctx.stop_event.is_set():
+                            self._fail_module(ctx, i, module.get("name", f"模块{i+1}"), "用户停止")
                             return
-                    elif module['params']['target'] == "camera_detected":
-                        if base_coords is None:
-                            self.flow_log.emit("❌ 相机未识别到物体坐标，请确保流程中先有相机识别步骤")
-                            self.flow_finished.emit(False)
+                        self.msleep(100)
+
+                    name = module.get("name", f"模块{i+1}")
+                    self.flow_module_progress.emit(i + 1, total, name)
+
+                    # --- Feedback health check before motion modules ---
+                    if module['type'] in ("move", "force_arc", "force_guard_move", "relative_move", "joint_move"):
+                        fb = self.controller.get_feedback_health(max_age=pose_cache_max_age)
+                        if fb["health"] == "disconnected":
+                            self._fail_module(ctx, i, name, f"反馈缓存断流({stale_fail_age:.1f}s)")
                             return
-                        if module['params']['motion_type'] == "MovL":
-                            point_name = module['params'].get('point_name', '')
-                            if not point_name:
-                                self.flow_log.emit(f"❌ 模块{i+1}直线运动未指定目标点位")
-                                self.flow_finished.emit(False)
+
+                    stop_checker = lambda: ctx.stop_event.is_set()
+
+                    if module['type'] == "move":
+                        cmd_start = time.perf_counter()
+                        if module['params']['target'] == "initial_position":
+                            if not self.controller.move_to_initial_position(verify_start_pose=False, verify_end_pose=False, wait_poll_interval=wait_poll_interval):
+                                self._fail_module(ctx, i, name, "移动到初始位置失败")
                                 return
-                            resolved = resolve_point(point_name)
-                            if resolved is None:
-                                self.flow_log.emit(f"❌ 点位 '{point_name}' 不存在或循环引用")
-                                self.flow_finished.emit(False)
+                        elif module['params']['target'] == "camera_detected":
+                            if base_coords is None:
+                                self._fail_module(ctx, i, name, "相机未识别到物体坐标，请确保流程中先有相机识别步骤")
                                 return
-                            success = self.controller.move_to_point(
-                                resolved,
-                                move_type="MovL",
-                                speed_percentage=module['params']['speed'],
-                                verify_start_pose=False,
-                                verify_end_pose=False,
-                                wait_poll_interval=0.1,
+                            if module['params']['motion_type'] == "MovL":
+                                point_name = module['params'].get('point_name', '')
+                                if not point_name:
+                                    self._fail_module(ctx, i, name, "直线运动未指定目标点位")
+                                    return
+                                resolved = resolve_point(point_name)
+                                if resolved is None:
+                                    self._fail_module(ctx, i, name, f"点位 '{point_name}' 不存在或循环引用")
+                                    return
+                                success = self.controller.move_to_point(
+                                    resolved,
+                                    move_type="MovL",
+                                    speed_percentage=module['params']['speed'],
+                                    verify_start_pose=False,
+                                    verify_end_pose=False,
+                                    wait_poll_interval=wait_poll_interval,
+                                )
+                                if not success:
+                                    self._fail_module(ctx, i, name, "直线运动失败")
+                                    return
+                        cmd_elapsed = time.perf_counter() - cmd_start
+                        wait_elapsed = 0.0
+                        ctx.increment_motion_generation()
+
+                    elif module['type'] == "force_arc":
+                        if not self.controller.is_connected:
+                            self._fail_module(ctx, i, name, "机器人未连接，无法执行圆弧运动")
+                            return
+                        if not self.controller.is_enabled:
+                            self._fail_module(ctx, i, name, "机器人未使能，无法执行圆弧运动")
+                            return
+                        try:
+                            p = dict(module['params'])
+                            current_pose = self.controller.get_current_pose_fast(max_age=pose_cache_max_age)
+                            if not current_pose or len(current_pose) < 6:
+                                self._fail_module(ctx, i, name, "无法获取当前机器人位姿，无法生成圆弧")
+                                return
+
+                            center_offset_z = float(p.get('center_offset_z', p.get('radius', 50)))
+                            sweep_angle = float(p.get('sweep_angle', abs(float(p.get('end_angle', 90)) - float(p.get('start_angle', 0)))))
+                            arc_direction = p.get('arc_direction')
+                            if arc_direction is None:
+                                arc_direction = 'cw' if float(p.get('end_angle', 90)) < float(p.get('start_angle', 0)) else 'ccw'
+                            if center_offset_z <= 0 or sweep_angle <= 0:
+                                self._fail_module(ctx, i, name, "圆弧距离和角度必须大于0")
+                                return
+
+                            center = [
+                                float(current_pose[0]),
+                                float(current_pose[1]),
+                                float(current_pose[2]) + center_offset_z,
+                            ]
+                            start_angle = -90.0
+                            end_angle = start_angle - sweep_angle if arc_direction == 'cw' else start_angle + sweep_angle
+                            base_orientation = [float(v) for v in current_pose[3:6]]
+                            rx_delta = -sweep_angle if arc_direction == 'cw' else sweep_angle
+                            orientation = [
+                                [base_orientation[0], base_orientation[1], base_orientation[2]],
+                                [base_orientation[0] + rx_delta / 2.0, base_orientation[1], base_orientation[2]],
+                                [base_orientation[0] + rx_delta, base_orientation[1], base_orientation[2]],
+                            ]
+                            direction_text = "顺时针" if arc_direction == 'cw' else "逆时针"
+                            self.flow_log.emit(
+                                f"↪️ 圆弧运动: 当前点={current_pose[:3]}, 圆心={center}, "
+                                f"距离={center_offset_z:.1f}mm, 角度={sweep_angle:.1f}°, "
+                                f"方向={direction_text}, Rx={base_orientation[0]:.1f}->{orientation[-1][0]:.1f}"
                             )
-                            if not success:
-                                self.flow_log.emit(f"❌ 模块{i+1}直线运动失败")
-                                self.flow_finished.emit(False)
+                            fa_ctrl = ForceArcController()
+                            fa_ctrl.set_dashboard(self.controller.dashboard)
+                            self.controller.set_speed(p.get('speed', 20))
+                            fa_ctrl.configure_arc(
+                                center=center,
+                                radius=center_offset_z,
+                                start_angle=start_angle,
+                                end_angle=end_angle,
+                                rotation_axis='X',
+                                num_waypoints=3,
+                                orientation=orientation,
+                                speed_factor=p.get('speed', 20)
+                            )
+                            cmd_start = time.perf_counter()
+                            fa_ctrl.execute(set_speed=False)
+                            cmd_elapsed = time.perf_counter() - cmd_start
+                            arc_length = abs(center_offset_z * np.deg2rad(sweep_angle))
+                            timeout = min(max(arc_length / 20.0 + 5.0, 5.0), 60.0)
+                            wait_start = time.perf_counter()
+                            if not self.controller.wait_for_motion_completion(timeout=timeout, poll_interval=wait_poll_interval, stop_checker=stop_checker):
+                                self._fail_module(ctx, i, name, "圆弧运动等待完成失败")
                                 return
-                elif module['type'] == "force_arc":
-                    if not self.controller.is_connected:
-                        self.flow_log.emit("❌ 机器人未连接，无法执行圆弧运动")
-                        self.flow_finished.emit(False)
-                        return
-                    if not self.controller.is_enabled:
-                        self.flow_log.emit("❌ 机器人未使能，无法执行圆弧运动")
-                        self.flow_finished.emit(False)
-                        return
-                    try:
-                        p = dict(module['params'])
-                        current_pose = self.controller.get_current_pose_fast()
-                        if not current_pose or len(current_pose) < 6:
-                            self.flow_log.emit("❌ 无法获取当前机器人位姿，无法生成圆弧")
-                            self.flow_finished.emit(False)
+                            wait_elapsed = time.perf_counter() - wait_start
+                            self.flow_log.emit(f"✅ 模块{i+1}圆弧运动完成")
+                        except Exception as e:
+                            self._fail_module(ctx, i, name, f"圆弧运动失败: {e}")
                             return
+                        ctx.increment_motion_generation()
 
-                        center_offset_z = float(p.get('center_offset_z', p.get('radius', 50)))
-                        sweep_angle = float(p.get('sweep_angle', abs(float(p.get('end_angle', 90)) - float(p.get('start_angle', 0)))))
-                        arc_direction = p.get('arc_direction')
-                        if arc_direction is None:
-                            arc_direction = 'cw' if float(p.get('end_angle', 90)) < float(p.get('start_angle', 0)) else 'ccw'
-                        if center_offset_z <= 0 or sweep_angle <= 0:
-                            self.flow_log.emit(f"❌ 模块{i+1}圆弧距离和角度必须大于0")
-                            self.flow_finished.emit(False)
+                    elif module['type'] == "force_guard_move":
+                        if not self.controller.is_connected:
+                            self._fail_module(ctx, i, name, "机器人未连接，无法执行力阈值移动")
                             return
-
-                        center = [
-                            float(current_pose[0]),
-                            float(current_pose[1]),
-                            float(current_pose[2]) + center_offset_z,
-                        ]
-                        start_angle = -90.0
-                        end_angle = start_angle - sweep_angle if arc_direction == 'cw' else start_angle + sweep_angle
-                        base_orientation = [float(v) for v in current_pose[3:6]]
-                        rx_delta = -sweep_angle if arc_direction == 'cw' else sweep_angle
-                        orientation = [
-                            [base_orientation[0], base_orientation[1], base_orientation[2]],
-                            [base_orientation[0] + rx_delta / 2.0, base_orientation[1], base_orientation[2]],
-                            [base_orientation[0] + rx_delta, base_orientation[1], base_orientation[2]],
-                        ]
-                        direction_text = "顺时针" if arc_direction == 'cw' else "逆时针"
+                        p = module.get('params', {})
+                        axis = p.get('axis', 'Z')
+                        distance = float(p.get('distance', 50.0))
+                        force_limit = float(p.get('force_limit', 20.0))
+                        speed = int(p.get('speed', 20))
                         self.flow_log.emit(
-                            f"↪️ 圆弧运动: 当前点={current_pose[:3]}, 圆心={center}, "
-                            f"距离={center_offset_z:.1f}mm, 角度={sweep_angle:.1f}°, "
-                            f"方向={direction_text}, Rx={base_orientation[0]:.1f}->{orientation[-1][0]:.1f}"
+                            f"➡️ 力阈值移动: 方向={axis}, 距离={distance:.1f}mm, "
+                            f"力上限={force_limit:.1f}N, 速度={speed}%"
                         )
-                        fa_ctrl = ForceArcController()
-                        fa_ctrl.set_dashboard(self.controller.dashboard)
-                        fa_ctrl.configure_arc(
-                            center=center,
-                            radius=center_offset_z,
-                            start_angle=start_angle,
-                            end_angle=end_angle,
-                            rotation_axis='X',
-                            num_waypoints=3,
-                            orientation=orientation,
-                            speed_factor=p.get('speed', 20)
+                        cmd_start = time.perf_counter()
+                        success = self.controller.move_until_force_limit(
+                            axis=axis,
+                            distance=distance,
+                            force_limit=force_limit,
+                            speed_percentage=speed,
                         )
-                        fa_ctrl.execute()
-                        arc_length = abs(center_offset_z * np.deg2rad(sweep_angle))
-                        timeout = min(max(arc_length / 20.0 + 5.0, 5.0), 60.0)
-                        if not self.controller.wait_for_motion_completion(timeout=timeout, poll_interval=0.1):
-                            self.flow_log.emit(f"❌ 模块{i+1}圆弧运动等待完成失败")
-                            self.flow_finished.emit(False)
+                        cmd_elapsed = time.perf_counter() - cmd_start
+                        wait_elapsed = 0.0
+                        if not success:
+                            self._fail_module(ctx, i, name, "力阈值移动失败")
                             return
-                        self.flow_log.emit(f"✅ 模块{i+1}圆弧运动完成")
-                    except Exception as e:
-                        self.flow_log.emit(f"❌ 模块{i+1}圆弧运动失败: {e}")
-                        self.flow_finished.emit(False)
-                        return
-                elif module['type'] == "force_guard_move":
-                    if not self.controller.is_connected:
-                        self.flow_log.emit("❌ 机器人未连接，无法执行力阈值移动")
-                        self.flow_finished.emit(False)
-                        return
-                    p = module.get('params', {})
-                    axis = p.get('axis', 'Z')
-                    distance = float(p.get('distance', 50.0))
-                    force_limit = float(p.get('force_limit', 20.0))
-                    speed = int(p.get('speed', 20))
-                    self.flow_log.emit(
-                        f"➡️ 力阈值移动: 方向={axis}, 距离={distance:.1f}mm, "
-                        f"力上限={force_limit:.1f}N, 速度={speed}%"
-                    )
-                    success = self.controller.move_until_force_limit(
-                        axis=axis,
-                        distance=distance,
-                        force_limit=force_limit,
-                        speed_percentage=speed,
-                    )
-                    if not success:
-                        self.flow_log.emit(f"❌ 模块{i+1}力阈值移动失败")
-                        self.flow_finished.emit(False)
-                        return
-                    self.flow_log.emit(f"✅ 模块{i+1}力阈值移动完成")
-                elif module['type'] == "relative_move":
-                    if not self.controller.is_connected:
-                        self.flow_log.emit("❌ 机器人未连接，无法执行相对移动")
-                        self.flow_finished.emit(False)
-                        return
-                    if not self.controller.is_enabled:
-                        self.flow_log.emit("❌ 机器人未使能，无法执行相对移动")
-                        self.flow_finished.emit(False)
-                        return
-                    p = module.get('params', {})
-                    offsets = p.get('offsets', [0, 0, 0, 0, 0, 0])
-                    coord_system = p.get('coord_system', 'user')
-                    motion_type = p.get('motion_type', 'linear')
-                    speed = int(p.get('speed', 30))
-                    acceleration = int(p.get('acceleration', 20))
-                    cp = int(p.get('cp', 100))
-                    self.flow_log.emit(
-                        f"➡️ 相对移动: 坐标系={coord_system}, 方式={motion_type}, "
-                        f"偏移={offsets}, 速度={speed}%"
-                    )
-                    success = self.controller.move_relative(
-                        offsets=offsets,
-                        coord_system=coord_system,
-                        motion_type=motion_type,
-                        speed=speed,
-                        acceleration=acceleration,
-                        cp=cp,
-                        wait_poll_interval=0.1,
-                    )
-                    if not success:
-                        self.flow_log.emit(f"❌ 模块{i+1}相对移动失败")
-                        self.flow_finished.emit(False)
-                        return
-                    self.flow_log.emit(f"✅ 模块{i+1}相对移动完成")
-                elif module['type'] == "camera":
-                    camera_type = module['params'].get('camera_type', 'D435i')
-                    if camera_type == "D405":
-                        vision_to_use = self.vision_d405
-                    else:
-                        vision_to_use = self.vision_d435i
+                        self.flow_log.emit(f"✅ 模块{i+1}力阈值移动完成")
+                        ctx.increment_motion_generation()
 
-                    if vision_to_use is None:
-                        self.flow_log.emit(f"❌ {camera_type} 相机未连接，无法识别物体")
-                        self.flow_finished.emit(False)
-                        return
-
-                    vision_to_use.reset_tracking()
-
-                    N_FRAMES = 5
-                    best_result = None
-                    best_confidence = 0.0
-
-                    for frame_idx in range(N_FRAMES):
-                        if self._stop_requested:
-                            self.flow_finished.emit(False)
+                    elif module['type'] == "relative_move":
+                        if not self.controller.is_connected:
+                            self._fail_module(ctx, i, name, "机器人未连接，无法执行相对移动")
                             return
-                        depth_frame, color_frame = vision_to_use.capture_frames()
-                        if not depth_frame or not color_frame:
-                            continue
-                        color_image = np.asanyarray(color_frame.get_data())
+                        if not self.controller.is_enabled:
+                            self._fail_module(ctx, i, name, "机器人未使能，无法执行相对移动")
+                            return
+                        p = module.get('params', {})
+                        offsets = p.get('offsets', [0, 0, 0, 0, 0, 0])
+                        coord_system = p.get('coord_system', 'user')
+                        motion_type = p.get('motion_type', 'linear')
+                        speed = int(p.get('speed', 30))
+                        acceleration = int(p.get('acceleration', 20))
+                        cp = int(p.get('cp', 100))
+                        self.flow_log.emit(
+                            f"➡️ 相对移动: 坐标系={coord_system}, 方式={motion_type}, "
+                            f"偏移={offsets}, 速度={speed}%"
+                        )
+                        cmd_start = time.perf_counter()
+                        success = self.controller.move_relative(
+                            offsets=offsets,
+                            coord_system=coord_system,
+                            motion_type=motion_type,
+                            speed=speed,
+                            acceleration=acceleration,
+                            cp=cp,
+                            wait_poll_interval=wait_poll_interval,
+                        )
+                        cmd_elapsed = time.perf_counter() - cmd_start
+                        wait_elapsed = 0.0
+                        if not success:
+                            self._fail_module(ctx, i, name, "相对移动失败")
+                            return
+                        self.flow_log.emit(f"✅ 模块{i+1}相对移动完成")
+                        ctx.increment_motion_generation()
 
-                        target = vision_to_use.run_detection_tracked(color_image)
-                        object_position = vision_to_use.calculate_object_position_smoothed(depth_frame, color_frame, target)
+                    elif module['type'] == "camera":
+                        camera_type = module['params'].get('camera_type', 'D435i')
+                        if camera_type == "D405":
+                            vision_to_use = self.vision_d405
+                        else:
+                            vision_to_use = self.vision_d435i
 
-                        if object_position:
-                            conf = object_position.get('confidence', 0.0)
-                            self.flow_log.emit(f"📊 帧{frame_idx+1}/{N_FRAMES} 置信度={conf:.2f} 来源={object_position.get('source', 'unknown')}")
-                            if conf > best_confidence:
-                                best_result = object_position
-                                best_confidence = conf
-                            if best_confidence > 0.9:
-                                self.flow_log.emit(f"✅ 置信度充足({best_confidence:.2f})，提前退出")
-                                break
+                        if vision_to_use is None:
+                            self._fail_module(ctx, i, name, f"{camera_type} 相机未连接，无法识别物体")
+                            return
 
-                    if not best_result or best_confidence < 0.3:
-                        self.flow_log.emit(f"❌ 多帧检测失败，最高置信度={best_confidence:.2f}")
-                        self.flow_finished.emit(False)
-                        return
+                        cache_ttl = float(self.performance_config.get("flow_detection_cache_ttl", 1.0))
+                        if ctx.is_cache_valid(camera_type):
+                            entry = ctx._flow_detection_cache[camera_type]
+                            if time.perf_counter() - entry["time"] <= cache_ttl:
+                                best_result = entry["result"]
+                                best_confidence = entry["confidence"]
+                                self.flow_log.emit(f"✅ 复用{camera_type}最近识别结果，置信度={best_confidence:.2f}")
+                            else:
+                                best_result = None
+                                best_confidence = 0.0
+                        else:
+                            best_result = None
+                            best_confidence = 0.0
 
-                    object_position = best_result
-                    self.flow_log.emit(f"✅ 最终结果: 置信度={best_confidence:.2f}")
+                        if best_result is None:
+                            vision_to_use.reset_tracking()
+                            camera_start = time.perf_counter()
+                            N_FRAMES = max(1, int(self.performance_config.get("flow_camera_frames", 3)))
+                            early_confidence = float(self.performance_config.get("flow_camera_early_confidence", 0.85))
+                            best_result = None
+                            best_confidence = 0.0
 
-                    end_coords = vision_to_use.convert_to_end_coords(object_position['camera_coords'])
-                    current_pose = self.controller.get_current_pose_fast()
-                    if not current_pose:
-                        self.flow_log.emit("❌ 无法获取当前机器人位姿")
-                        self.flow_finished.emit(False)
-                        return
-                    base_coords = vision_to_use.convert_to_base_coords(end_coords, current_pose)
+                            for frame_idx in range(N_FRAMES):
+                                if ctx.stop_event.is_set():
+                                    self._fail_module(ctx, i, name, "用户停止")
+                                    return
+                                depth_frame, color_frame = vision_to_use.capture_frames()
+                                if not depth_frame or not color_frame:
+                                    continue
+                                color_image = np.asanyarray(color_frame.get_data())
 
-                    if base_coords is not None and current_pose is not None:
-                        point_name = "d435i" if camera_type == "D435i" else "d405"
-                        point_data = get_point(point_name) or {"coords": [0]*6, "is_relative": False, "relative_to": None, "offset": [0]*6, "is_default": True}
-                        point_data["coords"] = list(base_coords) + list(current_pose[3:])
-                        set_point(point_name, point_data)
-                        self.flow_log.emit(f"📍 已更新点位 {point_name}")
-                elif module['type'] == "visual_servo":
-                    if self.vision_d405 is None:
-                        self.flow_log.emit("❌ D405 相机未连接，无法执行视觉伺服")
-                        self.flow_finished.emit(False)
-                        return
+                                target = vision_to_use.run_detection_tracked(color_image)
+                                object_position = vision_to_use.calculate_object_position_smoothed(depth_frame, color_frame, target)
 
-                    converge_threshold = module['params'].get('converge_threshold', 3.0)
-                    max_iterations = module['params'].get('max_iterations', 60)
+                                if object_position:
+                                    conf = object_position.get('confidence', 0.0)
+                                    self.flow_log.emit(f"📊 帧{frame_idx+1}/{N_FRAMES} 置信度={conf:.2f} 来源={object_position.get('source', 'unknown')}")
+                                    if conf > best_confidence:
+                                        best_result = object_position
+                                        best_confidence = conf
+                                    if best_confidence >= early_confidence:
+                                        self.flow_log.emit(f"✅ 置信度充足({best_confidence:.2f})，提前退出")
+                                        break
+                            camera_elapsed = time.perf_counter() - camera_start
+                            if best_result:
+                                ctx._flow_detection_cache[camera_type] = {
+                                    "time": time.perf_counter(),
+                                    "result": best_result,
+                                    "confidence": best_confidence,
+                                    "motion_generation": ctx.motion_generation,
+                                }
 
-                    servo_ctrl = VisualServoController(
-                        vision=self.vision_d405,
-                        controller=self.controller,
-                        converge_threshold=converge_threshold,
-                        max_iterations=max_iterations,
-                    )
+                        min_confidence = float(self.performance_config.get("flow_camera_min_confidence", 0.3))
+                        if not best_result or best_confidence < min_confidence:
+                            self._fail_module(ctx, i, name, f"多帧检测失败，最高置信度={best_confidence:.2f}")
+                            return
 
-                    def servo_log(msg):
-                        self.flow_log.emit(msg)
+                        object_position = best_result
+                        self.flow_log.emit(f"✅ 最终结果: 置信度={best_confidence:.2f}")
 
-                    success, final_error, iterations = servo_ctrl.servo_to_target(
-                        log_callback=servo_log,
-                    )
+                        end_coords = vision_to_use.convert_to_end_coords(object_position['camera_coords'])
+                        current_pose = self.controller.get_current_pose_fast(max_age=pose_cache_max_age)
+                        if not current_pose:
+                            self._fail_module(ctx, i, name, "无法获取当前机器人位姿")
+                            return
+                        base_coords = vision_to_use.convert_to_base_coords(end_coords, current_pose)
 
-                    if not success:
-                        self.flow_log.emit(f"❌ 视觉伺服失败，最终误差={final_error:.1f}mm")
-                        self.flow_finished.emit(False)
-                        return
+                        if base_coords is not None and current_pose is not None:
+                            point_name = "d435i" if camera_type == "D435i" else "d405"
+                            point_data = get_point(point_name) or {"coords": [0]*6, "is_relative": False, "relative_to": None, "offset": [0]*6, "is_default": True}
+                            point_data["coords"] = list(base_coords) + list(current_pose[3:])
+                            set_point(point_name, point_data)
+                            self.flow_log.emit(f"📍 已更新点位 {point_name}")
 
-                    self.flow_log.emit(f"✅ 视觉伺服完成，误差={final_error:.1f}mm，迭代={iterations}次")
-                elif module['type'] == "joint_move":
-                    offsets = module['params'].get('offsets', [0]*6)
-                    acceleration = module['params'].get('acceleration', 20)
-                    speed = module['params'].get('speed', 50)
-                    success = self.controller.move_joint_relative(
-                        offsets,
-                        a=acceleration,
-                        v=speed,
-                        verify_end_pose=False,
-                        wait_poll_interval=0.1,
-                    )
-                    if not success:
-                        self.flow_log.emit(f"❌ 模块{i+1}关节旋转运动失败")
-                        self.flow_finished.emit(False)
-                        return
-            self.flow_log.emit("✅ 抓取流程执行完成")
-            self.flow_finished.emit(True)
+                    elif module['type'] == "visual_servo":
+                        if self.vision_d405 is None:
+                            self._fail_module(ctx, i, name, "D405 相机未连接，无法执行视觉伺服")
+                            return
+
+                        converge_threshold = module['params'].get('converge_threshold', 3.0)
+                        max_iterations = module['params'].get('max_iterations', 60)
+
+                        servo_ctrl = VisualServoController(
+                            vision=self.vision_d405,
+                            controller=self.controller,
+                            converge_threshold=converge_threshold,
+                            max_iterations=max_iterations,
+                        )
+
+                        def servo_log(msg):
+                            self.flow_log.emit(msg)
+
+                        success, final_error, iterations = servo_ctrl.servo_to_target(
+                            log_callback=servo_log,
+                        )
+
+                        if not success:
+                            self._fail_module(ctx, i, name, f"视觉伺服失败，最终误差={final_error:.1f}mm")
+                            return
+
+                        self.flow_log.emit(f"✅ 视觉伺服完成，误差={final_error:.1f}mm，迭代={iterations}次")
+                        ctx.increment_motion_generation()
+
+                    elif module['type'] == "joint_move":
+                        offsets = module['params'].get('offsets', [0]*6)
+                        acceleration = module['params'].get('acceleration', 20)
+                        speed = module['params'].get('speed', 50)
+                        cmd_start = time.perf_counter()
+                        success = self.controller.move_joint_relative(
+                            offsets,
+                            a=acceleration,
+                            v=speed,
+                            verify_end_pose=False,
+                            wait_poll_interval=wait_poll_interval,
+                        )
+                        cmd_elapsed = time.perf_counter() - cmd_start
+                        wait_elapsed = 0.0
+                        if not success:
+                            self._fail_module(ctx, i, name, "关节旋转运动失败")
+                            return
+                        ctx.increment_motion_generation()
+
+                    module_elapsed = time.perf_counter() - module_start
+                    # For non-motion modules, cmd_elapsed equals total module time
+                    if module['type'] not in ("move", "force_arc", "force_guard_move", "relative_move", "joint_move"):
+                        cmd_elapsed = module_elapsed
+                    ctx.module_timings.append((i + 1, name, module_elapsed, camera_elapsed, cmd_elapsed, wait_elapsed))
+                    logger.info("flow module %s/%s finished: %s total=%.3fs camera=%.3fs cmd=%.3fs wait=%.3fs", i + 1, total, name, module_elapsed, camera_elapsed, cmd_elapsed, wait_elapsed)
+                    if module_elapsed > 1.0:
+                        logger.warning("flow module %s/%s SLOW: %s total=%.3fs cmd=%.3fs wait=%.3fs", i + 1, total, name, module_elapsed, cmd_elapsed, wait_elapsed)
+
+                self.flow_log.emit("✅ 抓取流程执行完成")
+                total_elapsed = time.perf_counter() - flow_start
+                summary = "; ".join(
+                    f"{idx}.{module_name}={elapsed:.2f}s(cmd={cmd:.2f}s,wait={wait:.2f}s)"
+                    for idx, module_name, elapsed, _, cmd, wait in ctx.module_timings
+                )
+                logger.info("flow finished total=%.3fs modules=[%s]", total_elapsed, summary)
+                self.flow_log.emit(f"流程总耗时 {total_elapsed:.2f}s")
+                self.flow_finished.emit(True)
+            finally:
+                self.controller.release_motion("flow")
+                self._ctx = None
         except Exception as e:
             self.flow_log.emit(f"❌ 流程异常: {e}")
             self.flow_finished.emit(False)

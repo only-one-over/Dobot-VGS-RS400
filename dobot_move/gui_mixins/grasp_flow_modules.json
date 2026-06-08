@@ -7,5 +7,35 @@
       "motion_type": "MovJ",
       "speed": 20
     }
+  },
+  {
+    "type": "move",
+    "name": "\u76f4\u7ebf\u8fd0\u52a8\u5230\u76ee\u6807",
+    "params": {
+      "target": "camera_detected",
+      "motion_type": "MovL",
+      "speed": 30,
+      "point_name": ""
+    }
+  },
+  {
+    "type": "move",
+    "name": "\u76f4\u7ebf\u8fd0\u52a8\u5230\u76ee\u6807",
+    "params": {
+      "target": "camera_detected",
+      "motion_type": "MovL",
+      "speed": 30,
+      "point_name": ""
+    }
+  },
+  {
+    "type": "move",
+    "name": "\u76f4\u7ebf\u8fd0\u52a8\u5230\u76ee\u6807",
+    "params": {
+      "target": "camera_detected",
+      "motion_type": "MovL",
+      "speed": 30,
+      "point_name": ""
+    }
   }
 ]

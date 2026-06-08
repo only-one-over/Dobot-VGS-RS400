@@ -72,12 +72,13 @@ class ForceArcController:
     def _i(value):
         return int(round(float(value)))
 
-    def execute(self):
+    def execute(self, set_speed=True):
         if self.dashboard is None:
             raise RuntimeError("ForceArcController dashboard is not configured")
         if not self.waypoints:
             raise RuntimeError("Force arc waypoints are empty")
-        self._check_response("SpeedFactor", self.dashboard.SpeedFactor(self._i(self.speed_factor)))
+        if set_speed:
+            self._check_response("SpeedFactor", self.dashboard.SpeedFactor(self._i(self.speed_factor)))
         mid = self.waypoints[len(self.waypoints) // 2]
         end = self.waypoints[-1]
         self._check_response(

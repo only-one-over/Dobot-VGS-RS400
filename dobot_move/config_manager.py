@@ -17,6 +17,19 @@ GRASP_FLOW_FILE = os.path.join(_MODULE_DIR, "gui_mixins", "grasp_flow_modules.js
 _config_cache = None
 _cache_valid = False
 
+DEFAULT_PERFORMANCE_CONFIG = {
+    "flow_wait_poll_interval": 0.05,
+    "robot_mode_dashboard_fallback_interval": 0.5,
+    "pose_cache_max_age": 0.3,
+    "motion_settle_time": 0.15,
+    "flow_camera_frames": 3,
+    "flow_camera_early_confidence": 0.85,
+    "flow_camera_min_confidence": 0.3,
+    "flow_detection_cache_ttl": 1.0,
+    "feedback_stale_warn_age": 0.5,
+    "feedback_stale_fail_age": 2.0,
+}
+
 
 def load_config():
     """加载配置文件"""
@@ -119,6 +132,14 @@ def set_modbus_port(port):
 def get_config():
     """获取完整配置"""
     return load_config()
+
+
+def get_performance_config():
+    config = load_config()
+    performance = dict(DEFAULT_PERFORMANCE_CONFIG)
+    if isinstance(config.get("performance"), dict):
+        performance.update(config["performance"])
+    return performance
 
 
 def update_config(key, value):

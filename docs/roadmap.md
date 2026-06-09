@@ -21,6 +21,15 @@
 - ✅ Modbus 异步执行：运动命令投递独立线程、cmd=9 急停快速路径
 - ✅ UI 连接状态修复：反馈断流不判为断开
 - ✅ UI 主题一致性修复：深色工业仪表盘主题
+- ✅ 命令 ID 优先短路运动完成判定：有 command_id 且 30004 新鲜时仅走官方模式判定
+- ✅ 急停独立连接响应码校验：非 0 走主连接兜底，空响应记录"已发送未确认"
+- ✅ 急停按钮防抖：始终可点击 + 500ms 时间戳防抖
+- ✅ Arc/MovJ/MovL 统一 user/tool 参数：从配置读取 user_index/tool_index
+- ✅ queued 模式 send_relative_command 统一封装：替换直接 dashboard 调用
+- ✅ ServoP 队列延迟保护：超周期跳帧降频 + 连续失败暂停
+- ✅ 报警详情异步补全报警记录：GetError 详情追加到 alarm_history
+- ✅ QEvent ImportError 修复：qt_compat.py 导出 QEvent
+- ✅ 全项目官方文档审查：move_jog user/tool、move_joint_relative is_connected、MovC v 参数
 
 ## 短期任务
 

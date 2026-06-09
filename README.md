@@ -6,7 +6,7 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-green.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-基于 Python + PyQt6 的越疆 CR 系列机械臂视觉定位控制系统。集成双 RealSense 深度相机（D435i + D405）、YOLO 实例分割、ByteTrack 目标跟踪、3D 卡尔曼滤波、手眼标定、视觉伺服和普通圆弧运动，实现从目标识别到精准定位的全自动化流程。
+基于 Python + PySide6 的越疆 CR 系列机械臂视觉定位控制系统。集成双 RealSense 深度相机（D435i + D405）、YOLO 实例分割、ByteTrack 目标跟踪、3D 卡尔曼滤波、手眼标定、视觉伺服和普通圆弧运动，实现从目标识别到精准定位的全自动化流程。
 
 ## 目录
 
@@ -31,7 +31,7 @@
 - ⚡ **C++ 加速** — 可选 dobot_core pybind11 模块，5-20 倍加速，Python 回退
 - 🔀 **流程步骤编辑器** — 拖拽排序步骤，实时状态图标（待执行/执行中/已完成/失败）
 - 💾 **ConfigService** — 统一防抖配置写入，避免频繁磁盘 I/O
-- 🎨 **PyQt6 兼容** — qt_compat.py 抽象层，实现 Qt 框架无关性
+- 🎨 **PySide6 兼容** — qt_compat.py 抽象层，实现 Qt 框架无关性
 - 🔒 **运动互斥锁** — acquire_motion/release_motion，流程和 Modbus 运动互斥，急停始终优先
 - ⚡ **30004 反馈状态机** — 速度归零+位姿到位+连续稳定判定运动完成，减少 Dashboard 查询
 - 🆔 **指令 ID 追踪** — 按官方 TCP-IP-Python-V4 模式，CurrentCommandId 精确判定运动完成
@@ -40,6 +40,10 @@
 - 🔄 **Modbus 异步执行** — 运动命令投递独立线程，cmd=9 急停走快速路径，200ms 周期不阻塞
 - 📋 **连续相对路径编辑器** — 15 列段表、stop_each/queued 执行模式、模板按钮、段级参数覆盖
 - 🎯 **saved_point 目标** — 直线运动支持已保存点位/相机识别坐标/初始位置三种目标
+- 🔧 **统一 user/tool 参数** — Arc/MovJ/MovL/RelMovL/RelMovJ 从配置统一传入 user_index/tool_index
+- 📦 **send_relative_command 封装** — queued 和单段相对移动复用统一命令发送、响应解析、command_id 追踪
+- 🛡️ **ServoP 队列保护** — TCP 往返超伺服周期时自动跳帧降频，连续失败暂停重试
+- 📝 **报警详情补全** — 异步获取 GetError 详情后自动追加到报警记录
 
 ## 快速开始
 
@@ -72,17 +76,20 @@ python build_cpp.py
 ### 验证安装
 
 ```bash
-python -c "import PyQt6, numpy, cv2, pyrealsense2, onnxruntime; print('All dependencies OK')"
+python -c "import PySide6, numpy, cv2, pyrealsense2, onnxruntime; print('All dependencies OK')"
 
 # 可选：验证 C++ 模块
 python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
+
+# 可选：验证 GPU 加速
+python -c "import onnxruntime as ort; print('Providers:', ort.get_available_providers())"
 ```
 
 ## 架构
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                   GUI (PyQt6)                    │
+│                   GUI (PySide6)                    │
 │           DobotMainWindow + 7 Mixins             │
 ├─────────┬──────────┬──────────┬─────────────────┤
 │  机器人   │  视觉     │  力控     │   Modbus        │
@@ -101,7 +108,7 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 
 | 模块 | 文件 | 描述 |
 |------|------|------|
-| 主界面 | `gui_app.py` | PyQt6 主窗口 + 7 个 Mixin |
+| 主界面 | `gui_app.py` | PySide6 主窗口 + 7 个 Mixin |
 | 机器人控制器 | `robot_controller.py` | 运动控制、状态管理 |
 | 通信 | `dobot_api.py` | TCP/IP Dashboard (29999) + Feedback (30004) |
 | 视觉系统 | `vision_system.py` | YOLO 推理、目标检测、3D 定位 |
@@ -117,7 +124,7 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 | 配置管理 | `config_manager.py` | JSON 配置读写 |
 | 主控面板 | `main_control_panel.py` | 主控面板组件，基于信号通信 |
 | 流程步骤列表 | `flow_step_list.py` | 流程步骤列表，拖拽排序+状态图标 |
-| Qt 兼容层 | `qt_compat.py` | Qt 框架兼容层（PyQt6） |
+| Qt 兼容层 | `qt_compat.py` | Qt 框架兼容层（PySide6） |
 | 工作线程 | `workers.py` | 流程执行、FlowRunContext、模块验证、运动互斥锁 |
 | C++ 核心 | `cpp_core/` | pybind11 加速模块 |
 
@@ -187,8 +194,8 @@ python gui_app.py
 
 运动完成判定采用三级优先级机制：
 
-1. **指令 ID 判定**（最高优先级）：30004 反馈中 `CurrentCommandId == command_id` 且运行状态显示完成
-2. **30004 反馈状态机**：线速度+角速度归零 + 位姿到位（绝对运动）或 RunningStatus/RunQueuedCmd 完成（相对运动）+ 连续稳定 3 次
+1. **指令 ID 优先短路**（最高优先级）：当有 command_id 且 30004 反馈新鲜时，仅使用官方模式判定（`CurrentCommandId == command_id && RobotMode == 5`），判定完成后立即返回，跳过通用速度/状态判定
+2. **30004 反馈状态机**（兜底）：仅在无 command_id 或 30004 反馈失效时使用。线速度+角速度归零 + 位姿到位（绝对运动）或 RunningStatus/RunQueuedCmd 完成（相对运动）+ 连续稳定 3 次
 3. **Dashboard 兜底**：仅在 30004 反馈过期时按 1.0s 冷却间隔查询 RobotMode
 
 安全守卫：最小稳定时间（0.15s）+ 必须见过运动状态才允许判定完成。
@@ -200,6 +207,8 @@ python gui_app.py
 - **急停立即停止**：急停触发时立即设置 stop_event，流程线程马上停止下发
 - **反馈包校验**：30004 反馈 TestValue 严格校验，校验失败不更新缓存
 - **连接状态分离**：Dashboard 连接状态和 30004 反馈健康状态分开显示
+- **急停响应码校验**：独立连接返回响应码非 0 时走主连接兜底；空响应（超时）记录"已发送未确认"
+- **急停按钮防抖**：急停按钮始终可点击，内部 500ms 时间戳防抖，不受命令执行状态禁用
 
 ## 配置
 
@@ -218,6 +227,8 @@ python gui_app.py
 | `calibration.D405` | object | D405 手眼标定参数 | 见下方 |
 | `points` | object | 点位表 | 见下方 | 小车 IP 地址 | `"192.168.5.2"` | 小车 Modbus 端口 | `502` |
 | `modbus_port` | int | 本地 Modbus 服务器端口 | `502` |
+| `user_index` | int | 用户坐标系索引 | `0` |
+| `tool_index` | int | 工具坐标系索引 | `0` |
 
 #### 性能配置
 
@@ -346,6 +357,32 @@ pip install opencv-python
 - 确认已安装 CMake 3.15+ 和 C++17 编译器
 - Windows 需要安装 Visual Studio Build Tools
 - 不构建 C++ 模块不影响使用——程序会回退到 Python
+
+### YOLO 推理（CUDA 必需）
+
+本项目 YOLO 推理**必须**使用 NVIDIA GPU + CUDA，不支持 CPU 推理。请确保已安装 CUDA Toolkit 和 `onnxruntime-gpu`：
+
+```bash
+# 1. 确认有 NVIDIA 显卡
+nvidia-smi
+
+# 2. 卸载 CPU 版 onnxruntime（如果已安装）
+pip uninstall onnxruntime
+
+# 3. 安装 GPU 版
+pip install onnxruntime-gpu
+
+# 4. 验证 GPU 可用
+python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+# 输出必须包含 'CUDAExecutionProvider'，否则程序无法启动
+```
+
+| 模式 | YOLO 推理耗时 | 视觉伺服闭环频率 | 安装要求 | 支持状态 |
+|------|--------------|-----------------|----------|----------|
+| GPU (CUDA) | ~20-50ms | ~10-15 Hz | NVIDIA GPU + CUDA Toolkit + onnxruntime-gpu | ✅ 必需 |
+| CPU | — | — | — | ❌ 不支持 |
+
+> **注意**：`onnxruntime` 和 `onnxruntime-gpu` 不能同时安装，装了 GPU 版后 CPU 版需先卸载。程序启动时会检测 CUDA 可用性，若不可用将直接报错退出。
 
 ### YOLO 模型检测效果差
 - 确认 `dobot_move/` 目录下存在 `best.onnx` 模型文件

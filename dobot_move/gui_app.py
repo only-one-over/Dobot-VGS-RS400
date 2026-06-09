@@ -72,7 +72,7 @@ if _missing_deps:
     logger.error("视觉系统导入失败，缺少以下依赖：")
     for dep_name, dep_hint in _missing_deps:
         logger.error(f"  ✗ {dep_name}")
-        logger.error(f"     安装命令: {dep_hint}")
+        logger.error(f" 安装命令: {dep_hint}")
     logger.error("=" * 60)
     VISION_AVAILABLE = False
     rs = None
@@ -155,6 +155,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self._flow_running = False
         self._software_emergency_active = False
         self._emergency_cmd_running = False
+        self._last_emergency_click_ts = 0.0
         self._editing_point_row = -1
         self._editing_point_name = None
         
@@ -1046,6 +1047,8 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             axis_target_layout.addWidget(spinbox, i // 2, (i % 2) * 2 + 1)
         self.axis_move_btn = QPushButton("运动到目标")
         self.axis_move_btn.setMinimumHeight(40)
+        self.axis_move_btn.setEnabled(False)
+        self.axis_move_btn.setToolTip("需补齐 J1-J6 后启用")
         self.axis_move_btn.clicked.connect(self._on_axis_move_to_target)
         axis_target_layout.addWidget(self.axis_move_btn, 2, 0, 1, 4)
         axis_target_group.setLayout(axis_target_layout)
@@ -1287,7 +1290,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         if hasattr(self, "continue_btn"):
             self.continue_btn.setEnabled(flow_running and self.is_paused)
         if hasattr(self, "emergency_stop_btn"):
-            self.emergency_stop_btn.setEnabled(robot_ready and not getattr(self, "_emergency_cmd_running", False))
+            self.emergency_stop_btn.setEnabled(robot_ready)
             self._update_emergency_stop_button()
 
     def _start_status_timer(self):
@@ -1347,10 +1350,23 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self._refresh_action_states()
 
     def on_emergency_stop(self):
+        # 防抖：500ms 内重复点击忽略
+        import time as _time
+        now = _time.monotonic()
+        if now - getattr(self, '_last_emergency_click_ts', 0.0) < 0.5:
+            return
+        self._last_emergency_click_ts = now
+
         active = bool(
             getattr(self, "_software_emergency_active", False) or
             getattr(self.controller, "software_emergency_active", False)
         )
+        if getattr(self, "_emergency_cmd_running", False):
+            if not active:
+                logger.warning("急停命令正在执行中，忽略重复点击")
+                return
+            # 解除急停时允许覆盖正在执行的急停命令
+            logger.info("急停命令执行中，允许解除操作")
         if active:
             self.statusBar().showMessage("正在解除软件急停...")
             thread = RobotCmdThread("解除软件急停", self.controller.release_emergency_stop, self)

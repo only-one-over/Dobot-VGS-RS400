@@ -1,11 +1,22 @@
-PyQt6>=6.0
+PySide6>=6.0
 numpy
 requests
 pymodbus>=3.0
 opencv-python
-onnxruntime
+onnxruntime-gpu
 scipy
 pyrealsense2
 minimalmodbus
+pyserial             # 夹爪控制器串口通信
 python-can
 lapx
+
+# === 可选：GPU 加速 ===
+# 如需 CUDA 加速 YOLO 推理，先卸载 onnxruntime 再安装：
+#   pip uninstall onnxruntime
+#   pip install onnxruntime-gpu
+# 要求：NVIDIA GPU + CUDA Toolkit
+
+# === 可选：C++ 加速模块 ===
+# pip install pybind11 cmake
+# python build_cpp.py

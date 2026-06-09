@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 class ArcMotionController:
     """Generate and execute a native Dobot Arc motion."""
 
-    def __init__(self, ip=None, dashboard_port=29999):
+    def __init__(self, ip=None, dashboard_port=29999, user_index=0, tool_index=0):
         self.ip = ip
         self.dashboard_port = dashboard_port
         self.dashboard = None
@@ -18,6 +18,8 @@ class ArcMotionController:
         self.planner = None
         self.waypoints = []
         self.speed_factor = 20
+        self._user_index = user_index
+        self._tool_index = tool_index
 
     def set_dashboard(self, dashboard):
         self.dashboard = dashboard
@@ -88,18 +90,27 @@ class ArcMotionController:
             self._check_response("SpeedFactor", self.dashboard.SpeedFactor(self._i(self.speed_factor)))
         mid = self.waypoints[len(self.waypoints) // 2]
         end = self.waypoints[-1]
-        self._check_response(
-            "Arc",
-            self.dashboard.Arc(
-                mid[0], mid[1], mid[2], mid[3], mid[4], mid[5],
-                end[0], end[1], end[2], end[3], end[4], end[5],
-                coordinateMode=0,
-                speed=self._i(self.speed_factor),
-            )
-        )
-        logger.debug(
-            "Arc command: mid=[%.2f, %.2f, %.2f, %.2f, %.2f, %.2f] "
-            "end=[%.2f, %.2f, %.2f, %.2f, %.2f, %.2f]",
+        resp = self.dashboard.Arc(
             mid[0], mid[1], mid[2], mid[3], mid[4], mid[5],
             end[0], end[1], end[2], end[3], end[4], end[5],
+            coordinateMode=0,
+            user=self._i(self._user_index),
+            tool=self._i(self._tool_index),
+            v=self._i(self.speed_factor),
         )
+        command_id = None
+        resp_str = str(resp)
+        ids = [int(n) for n in re.findall(r"-?\d+", resp_str)]
+        code = ids[0] if ids else -1
+        if code != 0:
+            raise RuntimeError(f"Arc failed, response={resp_str}, code={code}")
+        if len(ids) > 1:
+            command_id = ids[1]
+        logger.debug(
+            "Arc command: mid=[%.2f, %.2f, %.2f, %.2f, %.2f, %.2f] "
+            "end=[%.2f, %.2f, %.2f, %.2f, %.2f, %.2f] command_id=%s",
+            mid[0], mid[1], mid[2], mid[3], mid[4], mid[5],
+            end[0], end[1], end[2], end[3], end[4], end[5],
+            command_id,
+        )
+        return command_id

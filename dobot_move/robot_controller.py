@@ -14,7 +14,7 @@ import math
 import threading
 import numpy as np
 from dobot_api import DobotApiDashboard, DobotApiFeedBack
-from config_manager import get_initial_point, get_performance_config
+from config_manager import get_initial_point, get_performance_config, get_config
 from alarm_history import AlarmHistory
 
 logger = logging.getLogger(__name__)
@@ -92,6 +92,10 @@ class DobotController:
         self._last_command_id = None
         self._feed_packet_drops = 0
 
+        _cfg = get_config()
+        self._user_index = _cfg.get("user_index", 0)
+        self._tool_index = _cfg.get("tool_index", 0)
+
     def record_alarm(self, source, code="", level="报警", description="", solution="", raw=""):
         try:
             return self.alarm_history.add(source, code, level, description, solution, raw)
@@ -99,7 +103,58 @@ class DobotController:
             logger.error(f"记录报警失败: {e}")
             return None
 
+    def _get_error_detail(self):
+        """调用 GetError("zh_cn") 获取报警详情，返回第一个错误的 id/level/description/solution 字典。
+
+        GetError 通过 HTTP 接口返回 JSON，格式:
+        {"errMsg": [{"id": xxx, "level": xxx, "description": "xxx", "solution": "xxx", ...}]}
+        若无报警或解析失败则返回 None。
+        """
+        if not self.dashboard:
+            return None
+        try:
+            result = self.dashboard.GetError("zh_cn")
+            if not result or not isinstance(result, dict):
+                return None
+            err_msg = result.get("errMsg")
+            if not err_msg or not isinstance(err_msg, list) or len(err_msg) == 0:
+                return None
+            first = err_msg[0]
+            return {
+                "id": first.get("id", ""),
+                "level": first.get("level", ""),
+                "description": first.get("description", ""),
+                "solution": first.get("solution", ""),
+            }
+        except Exception as e:
+            logger.debug(f"GetError详情获取失败: {e}")
+            return None
+
+    def _fetch_error_detail_async(self, robot_mode, error_code, raw_error):
+        """后台线程获取 GetError 详情，成功后追加到日志"""
+        def _worker():
+            try:
+                detail = self._get_error_detail()
+                if detail:
+                    desc = detail.get("description", "")
+                    solution = detail.get("solution", "")
+                    level = detail.get("level", "")
+                    logger.info(f"报警详情(异步): code={error_code}, desc={desc}, solution={solution}, level={level}")
+                    self.record_alarm(
+                        source="报警详情",
+                        code=str(error_code),
+                        level=level,
+                        description=desc,
+                        solution=solution,
+                    )
+            except Exception as e:
+                logger.debug(f"异步获取报警详情失败: {e}")
+        import threading
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
     def _read_robot_error_raw(self):
+        """仅调用 GetErrorID() 获取错误码，不调用 GetError() 以避免阻塞 Modbus 循环。"""
         if not self.dashboard:
             return "", 0
         try:
@@ -1069,6 +1124,28 @@ class DobotController:
             snapshot_health = snapshot["health"]
             snapshot_timestamp = snapshot["timestamp"]
 
+            # --- Command ID completion check (official pattern) ---
+            # Official DobotDemo: RobotMode == 5 && CurrentCommandId == command_id
+            if command_id is not None and snapshot_health == "ok":
+                feedback_cmd_id = snapshot.get("current_command_id")
+                if feedback_cmd_id is not None and feedback_cmd_id == command_id:
+                    robot_mode = snapshot.get("robot_mode")
+                    if robot_mode == 5:
+                        self._motion_done_stable_count = getattr(self, '_motion_done_stable_count', 0) + 1
+                        if self._motion_done_stable_count >= stable_samples:
+                            logger.info("官方模式判定完成: CurrentCommandId=%d匹配+RobotMode=5, 连续%d次", command_id, stable_samples)
+                            self._motion_done_stable_count = 0
+                            return True
+                    else:
+                        self._motion_done_stable_count = 0
+                else:
+                    self._motion_done_stable_count = 0
+
+            # 有 command_id 且 30004 新鲜时，仅走命令 ID 判定，跳过通用速度/状态判定
+            if command_id is not None and snapshot_health == "ok":
+                time.sleep(poll_interval)
+                continue
+
             # --- Motion state guard: must have seen motion before allowing completion ---
             if cur_speed is not None:
                 has_speed = any(abs(v) > speed_threshold for v in cur_speed[:3]) or any(abs(v) > rotation_speed_threshold for v in cur_speed[3:6])
@@ -1078,38 +1155,9 @@ class DobotController:
                 self._has_seen_motion_state = True
 
             if not self._has_seen_motion_state:
-                # Haven't seen motion yet, can't judge completion
+                # Haven't seen motion yet, can't judge completion via 30004 feedback state machine
                 time.sleep(poll_interval)
                 continue
-
-            # --- Command ID completion check (official pattern) ---
-            if command_id is not None and snapshot_health == "ok":
-                feedback_cmd_id = snapshot.get("current_command_id")
-                if feedback_cmd_id is not None and feedback_cmd_id == command_id:
-                    # Our command is still current; check if it's done via status
-                    cmd_done = False
-                    if running_status is not None and running_status == 0:
-                        cmd_done = True
-                    if cur_speed is not None:
-                        linear_speed_ok = all(abs(v) < speed_threshold for v in cur_speed[:3])
-                        if len(cur_speed) >= 6:
-                            rotation_speed_ok = all(abs(v) < rotation_speed_threshold for v in cur_speed[3:6])
-                        else:
-                            rotation_speed_ok = True
-                        if linear_speed_ok and rotation_speed_ok:
-                            cmd_done = True
-                    if snapshot.get("robot_mode") == 5:
-                        cmd_done = True
-                    if cmd_done:
-                        self._motion_done_stable_count = getattr(self, '_motion_done_stable_count', 0) + 1
-                        if self._motion_done_stable_count >= stable_samples:
-                            logger.info("30004反馈辅助判定完成: CurrentCommandId匹配+完成状态, 连续%d次", stable_samples)
-                            self._motion_done_stable_count = 0
-                            return True
-                    else:
-                        self._motion_done_stable_count = 0
-                else:
-                    self._motion_done_stable_count = 0
 
             # --- 30004 feedback-assisted completion check ---
             if use_feedback and cur_speed is not None:
@@ -1206,6 +1254,46 @@ class DobotController:
         logger.error("等待超时 (%.1f秒)", timeout)
         return False
 
+    def _check_arc_non_collinear(self, current, middle, target, tolerance=0.5):
+        """检查三点是否共线，仅检查XYZ分量。
+
+        Args:
+            current: 起始点 [x, y, z, rx, ry, rz]
+            middle: 中间点 [x, y, z, rx, ry, rz]
+            target: 目标点 [x, y, z, rx, ry, rz]
+            tolerance: 共线判定容差（mm），默认0.5mm
+
+        Returns:
+            True: 三点不共线，可执行圆弧运动
+            False: 三点共线或起止点重合，无法执行圆弧运动
+        """
+        import numpy as np
+
+        p0 = np.array(current[:3], dtype=float)
+        p1 = np.array(middle[:3], dtype=float)
+        p2 = np.array(target[:3], dtype=float)
+
+        vec_02 = p2 - p0
+        vec_01 = p1 - p0
+
+        length_02 = np.linalg.norm(vec_02)
+        if length_02 < 1e-6:
+            logger.error("三点共线校验: 起始点与目标点重合，无法执行圆弧运动")
+            return False
+
+        cross = np.cross(vec_02, vec_01)
+        distance = np.linalg.norm(cross) / length_02
+
+        if distance < tolerance:
+            logger.error(
+                "三点共线校验: 中间点到起止连线的距离 %.3fmm < 容差 %.1fmm，三点共线，无法执行圆弧运动",
+                distance, tolerance,
+            )
+            return False
+
+        logger.debug("三点共线校验通过: 中间点偏移距离 %.3fmm", distance)
+        return True
+
     def move_to_point(
         self,
         target_pose,
@@ -1220,15 +1308,6 @@ class DobotController:
         if not self.is_enabled:
             logger.error(" 机器人未使能")
             return False
-
-        if speed_percentage is not None:
-            _speed_start = time.perf_counter()
-            self.set_speed(speed_percentage)
-            _speed_elapsed = time.perf_counter() - _speed_start
-        else:
-            _speed_start = time.perf_counter()
-            self.set_speed(self.current_speed)
-            _speed_elapsed = time.perf_counter() - _speed_start
 
         x, y, z, rx, ry, rz = target_pose
 
@@ -1265,18 +1344,28 @@ class DobotController:
         logger.info(f"  预计运动时间: {estimated_time:.1f}秒")
         logger.info("=" * 60)
 
+        _cmd_speed = speed_percentage if speed_percentage is not None else self.current_speed
+
         logger.info(f" 发送{move_type}指令...")
         _cmd_start = time.perf_counter()
         if move_type == "MovJ":
-            response = self.dashboard.MovJ(x, y, z, rx, ry, rz, 0)
+            response = self.dashboard.MovJ(x, y, z, rx, ry, rz, 0, user=self._user_index, tool=self._tool_index, v=_cmd_speed)
         elif move_type == "MovL":
-            response = self.dashboard.MovL(x, y, z, rx, ry, rz, 0)
+            response = self.dashboard.MovL(x, y, z, rx, ry, rz, 0, user=self._user_index, tool=self._tool_index, v=_cmd_speed)
         elif move_type == "MovC":
             if not middle_pose:
                 logger.error(" MovC需要提供中间点参数 middle_pose")
                 return False
+            # 三点共线校验
+            current_pose = self.get_current_pose_from_feedback()
+            if current_pose is not None:
+                if not self._check_arc_non_collinear(current_pose, middle_pose, target_pose):
+                    logger.error("三点共线，无法执行圆弧运动")
+                    return False
+            else:
+                logger.warning("无法获取当前位姿，跳过三点共线校验")
             mx, my, mz, mrx, mry, mrz = middle_pose
-            response = self.dashboard.MovC(x, y, z, rx, ry, rz, mx, my, mz, mrx, mry, mrz, 0)
+            response = self.dashboard.MovC(x, y, z, rx, ry, rz, mx, my, mz, mrx, mry, mrz, 0, user=self._user_index, tool=self._tool_index, v=_cmd_speed)
         else:
             logger.error(f" 不支持的运动类型: {move_type}")
             return False
@@ -1295,12 +1384,12 @@ class DobotController:
 
                 logger.info(" 重试发送运动指令...")
                 if move_type == "MovJ":
-                    response = self.dashboard.MovJ(x, y, z, rx, ry, rz, 0)
+                    response = self.dashboard.MovJ(x, y, z, rx, ry, rz, 0, user=self._user_index, tool=self._tool_index, v=_cmd_speed)
                 elif move_type == "MovL":
-                    response = self.dashboard.MovL(x, y, z, rx, ry, rz, 0)
+                    response = self.dashboard.MovL(x, y, z, rx, ry, rz, 0, user=self._user_index, tool=self._tool_index, v=_cmd_speed)
                 elif move_type == "MovC":
                     mx, my, mz, mrx, mry, mrz = middle_pose
-                    response = self.dashboard.MovC(x, y, z, rx, ry, rz, mx, my, mz, mrx, mry, mrz, 0)
+                    response = self.dashboard.MovC(x, y, z, rx, ry, rz, mx, my, mz, mrx, mry, mrz, 0, user=self._user_index, tool=self._tool_index, v=_cmd_speed)
 
                 logger.debug(f" 重试运动响应: {response}")
                 response_code = self.parse_response_code(response)
@@ -1327,7 +1416,7 @@ class DobotController:
         _wait_elapsed = time.perf_counter() - _wait_start
 
         self._last_move_timing = {
-            "speed_set": _speed_elapsed,
+            "speed_set": 0.0,
             "command_send": _cmd_elapsed,
             "motion_wait": _wait_elapsed,
         }
@@ -1392,8 +1481,11 @@ class DobotController:
 
     def move_joint_relative(self, offsets, a=20, v=50, cp=100, verify_end_pose=True, wait_poll_interval=0.05):
         """关节相对运动"""
+        if not self.is_connected:
+            logger.error("机器人未连接，无法执行关节相对运动")
+            return False
         if not self.is_enabled:
-            logger.error(" 机器人未使能")
+            logger.error("  机器人未使能")
             return False
 
         logger.info("\n" + "=" * 60)
@@ -1440,7 +1532,7 @@ class DobotController:
         self._has_seen_motion_state = False
 
         estimated_time = 10
-        success = self.wait_for_motion_completion(timeout=estimated_time + 10, poll_interval=wait_poll_interval)
+        success = self.wait_for_motion_completion(timeout=estimated_time + 10, poll_interval=wait_poll_interval, command_id=self._last_command_id)
 
         if not success:
             logger.error("  运动可能未完成，强制停止...")
@@ -1468,6 +1560,7 @@ class DobotController:
         speed=30,
         acceleration=20,
         cp=100,
+        r=-1,
         wait_poll_interval=0.05,
     ):
         """Relative motion without force control."""
@@ -1486,6 +1579,7 @@ class DobotController:
         speed = int(speed)
         acceleration = int(acceleration)
         cp = int(cp)
+        r = int(r)
 
         if coord_system == "joint":
             return self.move_joint_relative(
@@ -1497,36 +1591,51 @@ class DobotController:
                 wait_poll_interval=wait_poll_interval,
             )
 
-        self.set_speed(speed)
         logger.info(
-            "相对移动: coord=%s motion=%s offsets=%s speed=%s acceleration=%s cp=%s",
-            coord_system, motion_type, offsets, speed, acceleration, cp
+            "相对移动: coord=%s motion=%s offsets=%s speed=%s acceleration=%s cp=%s r=%s",
+            coord_system, motion_type, offsets, speed, acceleration, cp, r
         )
 
         if coord_system == "tool":
             if motion_type == "joint":
                 response = self.dashboard.RelMovJTool(
                     offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                    a=acceleration, v=speed, cp=cp
+                    a=acceleration, v=speed, cp=cp,
+                    user=self._user_index, tool=self._tool_index,
                 )
                 command_name = "RelMovJTool"
             else:
+                movl_kwargs = dict(a=acceleration, v=speed)
+                if r > 0:
+                    movl_kwargs['r'] = r
+                else:
+                    movl_kwargs['cp'] = cp
+                movl_kwargs['user'] = self._user_index
+                movl_kwargs['tool'] = self._tool_index
                 response = self.dashboard.RelMovLTool(
                     offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                    a=acceleration, v=speed, speed=speed, cp=cp
+                    **movl_kwargs
                 )
                 command_name = "RelMovLTool"
         else:
             if motion_type == "joint":
                 response = self.dashboard.RelMovJUser(
                     offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                    a=acceleration, v=speed, cp=cp
+                    a=acceleration, v=speed, cp=cp,
+                    user=self._user_index, tool=self._tool_index,
                 )
                 command_name = "RelMovJUser"
             else:
+                movl_kwargs = dict(a=acceleration, v=speed)
+                if r > 0:
+                    movl_kwargs['r'] = r
+                else:
+                    movl_kwargs['cp'] = cp
+                movl_kwargs['user'] = self._user_index
+                movl_kwargs['tool'] = self._tool_index
                 response = self.dashboard.RelMovLUser(
                     offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                    a=acceleration, v=speed, speed=speed, cp=cp
+                    **movl_kwargs
                 )
                 command_name = "RelMovLUser"
 
@@ -1545,7 +1654,115 @@ class DobotController:
         linear_distance = math.sqrt(offsets[0] ** 2 + offsets[1] ** 2 + offsets[2] ** 2)
         angular_distance = max(abs(offsets[3]), abs(offsets[4]), abs(offsets[5]))
         timeout = min(max(max(linear_distance / 20.0, angular_distance / 20.0) + 5.0, 5.0), 60.0)
-        if not self.wait_for_motion_completion(timeout=timeout, poll_interval=wait_poll_interval):
+        if not self.wait_for_motion_completion(timeout=timeout, poll_interval=wait_poll_interval, command_id=self._last_command_id):
+            logger.error("相对移动等待完成失败")
+            self.dashboard.Stop()
+            return False
+        return True
+
+    def send_relative_command(self, offsets, coord_system="user", motion_type="linear",
+                              speed=30, acceleration=20, cp=100, r=-1, wait=True,
+                              wait_poll_interval=0.05):
+        """Send a relative motion command with unified logging, response parsing, and command_id tracking.
+
+        Args:
+            wait: If True, wait for motion completion (same as move_relative).
+                  If False, only send the command and return (response_code, command_id).
+
+        Returns:
+            If wait=True: bool (success/failure, same as move_relative)
+            If wait=False: tuple (response_code, command_id)
+        """
+        if not self.is_connected:
+            logger.error("机器人未连接，无法执行相对移动")
+            return (False, None) if not wait else False
+        if not self.is_enabled:
+            logger.error("机器人未使能，无法执行相对移动")
+            return (False, None) if not wait else False
+
+        offsets = [float(v) for v in list(offsets)[:6]]
+        if len(offsets) < 6:
+            offsets.extend([0.0] * (6 - len(offsets)))
+        coord_system = str(coord_system or "user").lower()
+        motion_type = str(motion_type or "linear").lower()
+        speed = int(speed)
+        acceleration = int(acceleration)
+        cp = int(cp)
+        r = int(r)
+
+        if coord_system == "joint":
+            response = self.dashboard.RelJointMovJ(
+                offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
+                a=acceleration, v=speed, cp=cp
+            )
+            command_name = "RelJointMovJ"
+        elif coord_system == "tool":
+            if motion_type == "joint":
+                response = self.dashboard.RelMovJTool(
+                    offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
+                    a=acceleration, v=speed, cp=cp,
+                    user=self._user_index, tool=self._tool_index,
+                )
+                command_name = "RelMovJTool"
+            else:
+                movl_kwargs = dict(a=acceleration, v=speed)
+                if r > 0:
+                    movl_kwargs['r'] = r
+                else:
+                    movl_kwargs['cp'] = cp
+                movl_kwargs['user'] = self._user_index
+                movl_kwargs['tool'] = self._tool_index
+                response = self.dashboard.RelMovLTool(
+                    offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
+                    **movl_kwargs
+                )
+                command_name = "RelMovLTool"
+        else:  # user
+            if motion_type == "joint":
+                response = self.dashboard.RelMovJUser(
+                    offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
+                    a=acceleration, v=speed, cp=cp,
+                    user=self._user_index, tool=self._tool_index,
+                )
+                command_name = "RelMovJUser"
+            else:
+                movl_kwargs = dict(a=acceleration, v=speed)
+                if r > 0:
+                    movl_kwargs['r'] = r
+                else:
+                    movl_kwargs['cp'] = cp
+                movl_kwargs['user'] = self._user_index
+                movl_kwargs['tool'] = self._tool_index
+                response = self.dashboard.RelMovLUser(
+                    offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
+                    **movl_kwargs
+                )
+                command_name = "RelMovLUser"
+
+        logger.debug(f"{command_name}响应: {response}")
+        response_code = self.parse_response_code(response)
+        ids = self.parse_response_ids(response)
+        command_id = ids[1] if len(ids) > 1 else None
+
+        if response_code != 0:
+            logger.error(f"{command_name}指令被拒绝，响应码: {response_code}")
+            if not wait:
+                return (response_code, command_id)
+            return False
+
+        if not wait:
+            self._last_command_id = command_id
+            logger.info("send_relative_command(no-wait): %s cmd_id=%s offsets=%s", command_name, command_id, offsets)
+            return (response_code, command_id)
+
+        # wait=True: same as move_relative
+        self._last_command_id = command_id
+        self._motion_command_sent_time = time.time()
+        self._has_seen_motion_state = False
+        linear_distance = math.sqrt(offsets[0] ** 2 + offsets[1] ** 2 + offsets[2] ** 2)
+        angular_distance = max(abs(offsets[3]), abs(offsets[4]), abs(offsets[5]))
+        timeout = min(max(max(linear_distance / 20.0, angular_distance / 20.0) + 5.0, 5.0), 60.0)
+        if not self.wait_for_motion_completion(timeout=timeout, poll_interval=wait_poll_interval, command_id=command_id):
             logger.error("相对移动等待完成失败")
             self.dashboard.Stop()
             return False
@@ -1623,7 +1840,7 @@ class DobotController:
                 result = self.feed_four.feedBackData()
                 if result is not None and len(result) > 0:
                     try:
-                        magic_ok = result[0][0] == 0x123456789abcdef
+                        magic_ok = result[0]['TestValue'] == 0x123456789abcdef
                     except Exception:
                         magic_ok = False
 
@@ -1782,6 +1999,8 @@ class DobotController:
                                 raw=f"RobotMode={robot_mode}; {raw_error}",
                             )
                             self._robot_alarm_recorded = True
+                            # 异步获取详细报警信息
+                            self._fetch_error_detail_async(robot_mode, error_code, raw_error)
                     elif robot_mode in [2, 3, 4, 6]:
                         status = 2
                     if robot_mode not in [9, 11]:
@@ -1901,8 +2120,18 @@ class DobotController:
             except socket.timeout:
                 response = ""
             temp_socket.close()
-            logger.info("急停独立连接发送成功: EmergencyStop(%d), 响应=%s", mode, response)
-            return True
+
+            if not response:
+                logger.warning("急停独立连接已发送但未确认: EmergencyStop(%d)", mode)
+                return True
+
+            code = self.parse_response_code(response)
+            if code == 0:
+                logger.info("急停独立连接成功: EmergencyStop(%d), 响应=%s", mode, response)
+                return True
+            else:
+                logger.warning("急停独立连接响应码非0: EmergencyStop(%d), code=%s, 响应=%s", mode, code, response)
+                return False
         except Exception as e:
             logger.warning("急停独立连接发送失败: %s", e)
             return False
@@ -1918,6 +2147,9 @@ class DobotController:
         self._modbus_status_override = 5
         self.is_enabled = False
         self._last_speed_factor = None
+
+        # Release jog motion lock during emergency stop
+        self.release_motion("jog")
 
         # Signal active flow thread to stop immediately
         if self._active_flow_thread is not None and hasattr(self._active_flow_thread, '_ctx') and self._active_flow_thread._ctx is not None:
@@ -2017,24 +2249,38 @@ class DobotController:
 
     def move_jog(self, axis_id, coordtype=1):
         if not self.is_connected:
-            logger.error("❌ 机器人未连接，无法点动")
+            logger.warning("机器人未连接，无法点动")
+            return False
+        if not self.is_enabled:
+            logger.warning("机器人未使能，无法点动")
+            return False
+        if not self.acquire_motion("jog"):
+            logger.warning("无法获取运动控制权(jog)，可能被其他操作占用")
             return False
         try:
-            self.dashboard.MoveJog(axis_id, coordtype)
+            if axis_id.startswith("J"):
+                response = self.dashboard.MoveJog(axis_id)
+            else:
+                response = self.dashboard.MoveJog(axis_id, coordtype=coordtype, user=self._user_index, tool=self._tool_index)
+            response_code = self.parse_response_code(response)
+            if response_code != 0:
+                logger.error("点动控制失败，响应码: %s, axis_id=%s", response_code, axis_id)
+                self.release_motion("jog")
+                return False
             return True
         except Exception as e:
             logger.error(f"❌ 点动控制失败: {e}")
+            self.release_motion("jog")
             return False
 
     def stop_jog(self):
-        if not self.is_connected:
-            return False
         try:
             self.dashboard.MoveJog("")
-            return True
         except Exception as e:
             logger.error(f"❌ 停止点动失败: {e}")
-            return False
+        finally:
+            self.release_motion("jog")
+        return True
 
     def _modbus_go_safe_position(self):
         """回安全位"""

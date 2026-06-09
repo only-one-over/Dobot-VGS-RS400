@@ -324,7 +324,6 @@ class FlowThread(QThread):
                             )
                             fa_ctrl = ArcMotionController()
                             fa_ctrl.set_dashboard(self.controller.dashboard)
-                            self.controller.set_speed(p.get('speed', 20))
                             fa_ctrl.configure_arc(
                                 center=center,
                                 radius=center_offset_z,
@@ -336,12 +335,12 @@ class FlowThread(QThread):
                                 speed_factor=p.get('speed', 20)
                             )
                             cmd_start = time.perf_counter()
-                            fa_ctrl.execute(set_speed=False)
+                            arc_command_id = fa_ctrl.execute(set_speed=False)
                             cmd_elapsed = time.perf_counter() - cmd_start
                             arc_length = abs(center_offset_z * np.deg2rad(sweep_angle))
                             timeout = min(max(arc_length / 20.0 + 5.0, 5.0), 60.0)
                             wait_start = time.perf_counter()
-                            if not self.controller.wait_for_motion_completion(timeout=timeout, poll_interval=wait_poll_interval, stop_checker=stop_checker):
+                            if not self.controller.wait_for_motion_completion(timeout=timeout, poll_interval=wait_poll_interval, stop_checker=stop_checker, command_id=arc_command_id):
                                 self._fail_module(ctx, i, name, "圆弧运动等待完成失败")
                                 return
                             wait_elapsed = time.perf_counter() - wait_start
@@ -414,6 +413,7 @@ class FlowThread(QThread):
                             return
 
                         self.flow_log.emit(f"  连续相对路径: {len(active_segments)}/{len(segments)}段有效, 模式={execution_mode}")
+                        last_enabled_seg_idx = [i for i, s in enumerate(segments) if s.get('enabled', True)][-1]
 
                         if execution_mode == "queued":
                             # Queued mode: send all commands, then wait once
@@ -433,45 +433,25 @@ class FlowThread(QThread):
                                 seg_speed = int(seg.get('speed', g_speed))
                                 seg_accel = int(seg.get('acceleration', g_accel))
                                 seg_cp = int(seg.get('cp', g_cp))
+                                seg_r = int(seg.get('r', -1))
+                                # 最后一个启用段强制 r=-1，确保精确到达终点
+                                if seg_idx == last_enabled_seg_idx:
+                                    seg_r = -1
                                 
                                 # Direct command send without waiting
-                                self.controller.set_speed(seg_speed)
-                                if seg_coord == "tool":
-                                    if seg_motion == "joint":
-                                        resp = self.controller.dashboard.RelMovJTool(
-                                            offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                                            a=seg_accel, v=seg_speed, cp=seg_cp
-                                        )
-                                    else:
-                                        resp = self.controller.dashboard.RelMovLTool(
-                                            offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                                            a=seg_accel, v=seg_speed, speed=seg_speed, cp=seg_cp
-                                        )
-                                elif seg_coord == "joint":
-                                    resp = self.controller.dashboard.RelJointMovJ(
-                                        offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                                        a=seg_accel, v=seg_speed, cp=seg_cp
-                                    )
-                                else:  # user
-                                    if seg_motion == "joint":
-                                        resp = self.controller.dashboard.RelMovJUser(
-                                            offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                                            a=seg_accel, v=seg_speed, cp=seg_cp
-                                        )
-                                    else:
-                                        resp = self.controller.dashboard.RelMovLUser(
-                                            offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                                            a=seg_accel, v=seg_speed, speed=seg_speed, cp=seg_cp
-                                        )
-                                
-                                resp_code = self.controller.parse_response_code(resp) if resp is not None else -1
+                                resp_code, seg_cmd_id = self.controller.send_relative_command(
+                                    offsets=offsets,
+                                    coord_system=seg_coord,
+                                    motion_type=seg_motion,
+                                    speed=seg_speed,
+                                    acceleration=seg_accel,
+                                    cp=seg_cp,
+                                    r=seg_r,
+                                    wait=False,
+                                )
                                 if resp_code == 0:
                                     queued_count += 1
-                                    ids = self.controller.parse_response_ids(resp) if resp is not None else [0]
-                                    seg_cmd_id = ids[1] if len(ids) > 1 else None
-                                    if seg_cmd_id is not None:
-                                        self.controller._last_command_id = seg_cmd_id
-                                    logger.info("relative_path queued seg %d: offsets=%s coord=%s speed=%d cp=%d cmd_id=%s", queued_count, offsets, seg_coord, seg_speed, seg_cp, seg_cmd_id)
+                                    logger.info("relative_path queued seg %d: offsets=%s coord=%s speed=%d cp=%d r=%d cmd_id=%s", queued_count, offsets, seg_coord, seg_speed, seg_cp, seg_r, seg_cmd_id)
                                 else:
                                     self._fail_module(ctx, i, name, f"第{seg_idx+1}段下发失败: offsets={offsets}")
                                     return
@@ -506,6 +486,7 @@ class FlowThread(QThread):
                                 seg_speed = int(seg.get('speed', g_speed))
                                 seg_accel = int(seg.get('acceleration', g_accel))
                                 seg_cp = int(seg.get('cp', g_cp))
+                                seg_r = int(seg.get('r', -1))
 
                                 seg_start = time.perf_counter()
                                 success = self.controller.move_relative(
@@ -515,6 +496,7 @@ class FlowThread(QThread):
                                     speed=seg_speed,
                                     acceleration=seg_accel,
                                     cp=seg_cp,
+                                    r=seg_r,
                                 )
                                 seg_elapsed = time.perf_counter() - seg_start
 
@@ -523,8 +505,8 @@ class FlowThread(QThread):
                                     return
 
                                 seg_name = seg.get('name', f'段{seg_idx+1}')
-                                logger.info("relative_path seg %d/%d: name=%s offsets=%s coord=%s speed=%d cp=%d elapsed=%.3fs", seg_idx + 1, len(segments), seg_name, offsets, seg_coord, seg_speed, seg_cp, seg_elapsed)
-                                self.flow_log.emit(f"  段{seg_idx+1}/{len(segments)}「{seg_name}」: [{offsets[0]:.1f},{offsets[1]:.1f},{offsets[2]:.1f}] coord={seg_coord} speed={seg_speed}% cp={seg_cp} %.3fs" % seg_elapsed)
+                                logger.info("relative_path seg %d/%d: name=%s offsets=%s coord=%s speed=%d cp=%d r=%d elapsed=%.3fs", seg_idx + 1, len(segments), seg_name, offsets, seg_coord, seg_speed, seg_cp, seg_r, seg_elapsed)
+                                self.flow_log.emit(f"  段{seg_idx+1}/{len(segments)}「{seg_name}」: [{offsets[0]:.1f},{offsets[1]:.1f},{offsets[2]:.1f}] coord={seg_coord} speed={seg_speed}% cp={seg_cp} r={seg_r} %.3fs" % seg_elapsed)
 
                         ctx.increment_motion_generation()
                         cmd_elapsed = time.perf_counter() - module_start - camera_elapsed

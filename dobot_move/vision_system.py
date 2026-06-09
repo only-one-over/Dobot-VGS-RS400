@@ -135,55 +135,57 @@ class VisionSystem:
         logger.debug(f"模型路径: {self.model_path}, 文件存在: {os.path.exists(self.model_path)}")
 
         # 创建ONNX Runtime session
-        try:
-            import onnxruntime as ort
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-            self.session = ort.InferenceSession(self.model_path, providers=providers)
-            logger.info("实例分割模型加载成功")
+        import onnxruntime as ort
+        available_providers = ort.get_available_providers()
+        if 'CUDAExecutionProvider' not in available_providers:
+            raise RuntimeError(
+                "CUDA 不可用！本项目需要 NVIDIA GPU + CUDA + onnxruntime-gpu。\n"
+                "请安装: pip uninstall onnxruntime && pip install onnxruntime-gpu\n"
+                f"当前可用 providers: {available_providers}"
+            )
+        self.session = ort.InferenceSession(self.model_path, providers=['CUDAExecutionProvider'])
+        # Verify CUDA is actually being used
+        active_providers = self.session.get_providers()
+        if 'CUDAExecutionProvider' not in active_providers:
+            raise RuntimeError(
+                f"CUDAExecutionProvider 未激活！活跃 providers: {active_providers}\n"
+                "请检查 CUDA 安装和 onnxruntime-gpu 版本兼容性"
+            )
+        logger.info("实例分割模型加载成功（CUDA模式）")
 
-            # 获取模型输入输出信息
-            self.input_name = self.session.get_inputs()[0].name
-            self.input_shape = self.session.get_inputs()[0].shape
-            logger.debug(f"模型输入: {self.input_name}, 形状: {self.input_shape}")
+        # 获取模型输入输出信息
+        self.input_name = self.session.get_inputs()[0].name
+        self.input_shape = self.session.get_inputs()[0].shape
+        logger.debug(f"模型输入: {self.input_name}, 形状: {self.input_shape}")
 
-            output_infos = self.session.get_outputs()
-            self.model_format = "yolov8"  # 默认格式
-            if len(output_infos) >= 2:
-                self.is_seg_model = True
-                output_shape = output_infos[0].shape
-                if len(output_shape) == 3:
-                    # YOLO26: [1, N, C] where N < C (e.g. [1, 300, 38])
-                    # YOLO11: [1, C, N] where C < N (e.g. [1, 37, 8400])
-                    dim1, dim2 = output_shape[1], output_shape[2]
-                    if dim1 < dim2:
-                        # YOLO11 format: [1, C, N]
-                        self.num_classes = dim1 - 4 - 32
-                    else:
-                        # YOLO26 format: [1, N, C]
-                        self.model_format = "yolo26"
-                        self.num_classes = 1  # will be inferred from detections
-                logger.debug(f"模型输出: seg模式, num_classes={self.num_classes}, model_format={self.model_format}")
-            else:
-                self.is_seg_model = False
-                output_shape = output_infos[0].shape
-                if len(output_shape) == 3:
-                    dim1, dim2 = output_shape[1], output_shape[2]
-                    if dim1 < dim2:
-                        self.num_classes = dim1 - 4
-                    else:
-                        self.model_format = "yolo26"
-                        self.num_classes = 1
-                logger.debug(f"模型输出: detect模式, num_classes={self.num_classes}, model_format={self.model_format}")
-
-        except Exception as e:
-            logger.warning(f"加载模型时出错(CUDA): {e}")
-            logger.warning("尝试使用CPU运行...")
-            try:
-                self.session = ort.InferenceSession(self.model_path, providers=['CPUExecutionProvider'])
-                logger.info("实例分割模型加载成功（CPU模式）")
-                self.input_name = self.session.get_inputs()[0].name
-            except Exception as e2:
-                raise RuntimeError(f"ONNX模型加载失败: {e2}")
+        output_infos = self.session.get_outputs()
+        self.model_format = "yolov8"  # 默认格式
+        if len(output_infos) >= 2:
+            self.is_seg_model = True
+            output_shape = output_infos[0].shape
+            if len(output_shape) == 3:
+                # YOLO26: [1, N, C] where N < C (e.g. [1, 300, 38])
+                # YOLO11: [1, C, N] where C < N (e.g. [1, 37, 8400])
+                dim1, dim2 = output_shape[1], output_shape[2]
+                if dim1 < dim2:
+                    # YOLO11 format: [1, C, N]
+                    self.num_classes = dim1 - 4 - 32
+                else:
+                    # YOLO26 format: [1, N, C]
+                    self.model_format = "yolo26"
+                    self.num_classes = 1  # will be inferred from detections
+            logger.debug(f"模型输出: seg模式, num_classes={self.num_classes}, model_format={self.model_format}")
+        else:
+            self.is_seg_model = False
+            output_shape = output_infos[0].shape
+            if len(output_shape) == 3:
+                dim1, dim2 = output_shape[1], output_shape[2]
+                if dim1 < dim2:
+                    self.num_classes = dim1 - 4
+                else:
+                    self.model_format = "yolo26"
+                    self.num_classes = 1
+            logger.debug(f"模型输出: detect模式, num_classes={self.num_classes}, model_format={self.model_format}")
 
         if self.enable_tracking:
             self.tracker = BYTETracker(track_thresh=0.5, match_thresh=0.8, track_buffer=30)

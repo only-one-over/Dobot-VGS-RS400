@@ -305,6 +305,7 @@ class ServoThread:
         self.max_iterations = max_iterations
         self.stop_on_converge = stop_on_converge
 
+        self._consecutive_servo_fail = 0
         self._running = False
         self._thread: Optional[threading.Thread] = None
         # 结果
@@ -514,6 +515,15 @@ class ServoThread:
             cmd_pose = list(cmd_pos) + list(current_pose[3:])
             self.last_compute_ms = (time.monotonic() - t0) * 1000
 
+            # ── 6.5 队列延迟保护 ──
+            if self.last_servo_ms > self.servo_period * 1000:
+                logger.warning(
+                    " 伺服降频跳帧: last_servo_ms=%.1fms > period=%.1fms",
+                    self.last_servo_ms, self.servo_period * 1000,
+                )
+                self._sleep_to_next(t_iter_start)
+                continue
+
             # ── 7. 下发 ServoP ──
             # ServoP 仍是队列指令，返回成功只表示发送成功，不表示运动完成
             t0 = time.monotonic()
@@ -526,9 +536,17 @@ class ServoThread:
             self.last_servo_ms = (time.monotonic() - t0) * 1000
 
             if not success:
-                logger.warning(" 伺服跳过: ServoP指令失败")
+                self._consecutive_servo_fail += 1
+                if self._consecutive_servo_fail >= 3:
+                    logger.warning(" 伺服连续%d次失败，暂停1周期", self._consecutive_servo_fail)
+                    time.sleep(self.servo_period)
+                    self._consecutive_servo_fail = 0
+                else:
+                    logger.warning(" 伺服跳过: ServoP指令失败 (连续%d次)", self._consecutive_servo_fail)
                 self._sleep_to_next(t_iter_start)
                 continue
+
+            self._consecutive_servo_fail = 0  # Reset on success
 
             iteration += 1
             self.iterations = iteration

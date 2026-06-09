@@ -96,14 +96,49 @@ FlowThread 在 `run()` 开始时注册为 `controller._active_flow_thread`，在
 - 急停始终优先，不受锁限制
 - `wait_for_motion_completion()` 接受 `stop_checker` 参数，每轮轮询检查停止信号
 
+## 运动完成判定
+
+`wait_for_motion_completion()` 采用命令 ID 优先短路机制：
+
+- **有 command_id 且 30004 新鲜时**：仅走官方模式判定（`CurrentCommandId == command_id && RobotMode == 5`），判定完成后直接返回 True，跳过通用速度/状态判定
+- **无 command_id 或 30004 失效时**：走 30004 反馈状态机兜底（速度归零+位姿到位/运行状态完成+连续稳定）
+- **30004 反馈断流时**：走 Dashboard RobotMode 兜底
+
+## send_relative_command 统一封装
+
+`send_relative_command()` 封装了所有相对移动命令的发送、响应解析和 command_id 追踪：
+
+- 支持 `wait=True`（发送+等待完成）和 `wait=False`（仅发送，返回 response_code 和 command_id）
+- queued 模式通过 `wait=False` 批量下发，最后统一等待
+- 统一传入 `user_index`/`tool_index` 坐标系参数
+- 统一日志、响应码校验、r/cp 互斥处理
+
+## ServoP 队列保护
+
+视觉伺服控制器内置 ServoP 队列延迟保护：
+
+- 当 `last_servo_ms > servo_period * 1000`（TCP 往返超过伺服周期）时跳过当前帧，避免队列堆积
+- 连续 3 次 ServoP 失败时暂停 1 个伺服周期后重试
+- 成功时重置连续失败计数器
+
+## user/tool 统一参数
+
+所有运动命令（MovJ、MovL、MovC、Arc、RelMovLUser/Tool、RelMovJUser/Tool、MoveJog）统一从 `config.json` 读取 `user_index` 和 `tool_index` 并传入对应 API 参数：
+
+- 配置默认值：`user_index=0`, `tool_index=0`
+- `RelJointMovJ` 不支持 user/tool 参数（官方 API 签名无此参数）
+- `move_jog()` 坐标点动使用配置索引，关节点动仅传 axis_id
+
 ## 急停独立连接
 
 `_emergency_stop_direct(mode)` 通过独立临时 TCP 连接（端口 29999）发送 `EmergencyStop`：
 
 - 优先使用独立连接，避免主 Dashboard 连接 `__globalLock` 阻塞
-- 主连接作为备份
+- 响应码校验：code==0 返回成功；code!=0 返回失败走主连接兜底；空响应（超时）返回成功但记录"已发送未确认"
+- 主连接作为备份，同样校验响应码
 - 急停触发时立即设置 `software_emergency_active = True`，不等待响应确认
 - 同时设置 `stop_event`，流程线程马上停止下发
+- 急停按钮始终可点击，内部 500ms 时间戳防抖，不受命令执行状态禁用
 
 ## Modbus 异步执行
 

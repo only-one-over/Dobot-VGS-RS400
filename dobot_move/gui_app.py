@@ -6,28 +6,23 @@
 
 import sys
 import time
-import math
 import numpy as np
 import os
 import json
 import logging
-from qt_compat import (
+from .qt_compat import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QGroupBox, QGridLayout, QStatusBar,
     QMessageBox, QLineEdit, QDoubleSpinBox, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QFrame, QScrollArea, QStackedWidget,
-    QCheckBox, QInputDialog, QSizePolicy,
-    Qt, QThread, pyqtSignal, QTimer,
-    QImage, QPixmap,
+    QCheckBox, QSizePolicy,
+    Qt, QTimer,
 )
 
-# 添加当前目录到Python路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from robot_controller import DobotController
-from config_manager import get_robot_ip, get_modbus_port, get_grasp_flow_file, ConfigService
-from workers import RobotCmdThread, FlowThread, CameraTestWorker, D435iLowFpsWorker
-from gui_mixins import (
+from .robot_controller import DobotController
+from .config_manager import get_robot_ip, get_modbus_port, get_modbus_slave_id, get_grasp_flow_file, ConfigService
+from .workers import RobotCmdThread
+from .gui_mixins import (
     RobotControlMixin,
     VisionMixin,
     ModbusMixin,
@@ -35,15 +30,14 @@ from gui_mixins import (
     GraspFlowMixin,
     JogMixin,
 )
-from visual_servo_controller import VisualServoController
-from ui_theme import apply_theme, apply_status_visual, set_button_role, NAV_ICONS, card_style, metric_label_style, metric_title_style
-from flow_step_list import FlowStepList
-from main_control_panel import MainControlPanel
+from .ui_theme import apply_theme, apply_status_visual, set_button_role, NAV_ICONS, card_style, metric_label_style, metric_title_style
+from .flow_step_list import FlowStepList
+from .main_control_panel import MainControlPanel
 
 logger = logging.getLogger(__name__)
 
 try:
-    from hand_eye_calib import HandEyeCalibManager
+    from .hand_eye_calib import HandEyeCalibManager
     HANDEYE_AVAILABLE = True
 except Exception:
     HANDEYE_AVAILABLE = False
@@ -84,7 +78,7 @@ if _missing_deps:
             pass
 else:
     try:
-        from vision_system import VisionSystem
+        from .vision_system import VisionSystem
         VISION_AVAILABLE = True
     except Exception as e:
         logger.error(f"视觉系统导入失败: {e}")
@@ -140,16 +134,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.vision_d435i = None
         self.vision_d405 = None
         
-        file_path = get_grasp_flow_file()
-        if os.path.exists(file_path):
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    self.grasp_flow_modules = json.load(f)
-            except Exception as e:
-                logger.error(f"加载抓取流程失败: {e}")
-                self.grasp_flow_modules = list(_DEFAULT_GRASP_FLOW_MODULES)
-        else:
-            self.grasp_flow_modules = list(_DEFAULT_GRASP_FLOW_MODULES)
+        self._load_grasp_flow_modules()
         
         self.is_paused = False
         self._flow_running = False
@@ -165,6 +150,19 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             self._load_calib_matrix("D435i")
         self.statusBar().showMessage("正在初始化状态监控...")
         QTimer.singleShot(100, self.start_monitor_threads)
+
+    def _load_grasp_flow_modules(self):
+        """加载抓取流程配置文件"""
+        file_path = get_grasp_flow_file()
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    self.grasp_flow_modules = json.load(f)
+            except Exception as e:
+                logger.error(f"加载抓取流程失败: {e}")
+                self.grasp_flow_modules = list(_DEFAULT_GRASP_FLOW_MODULES)
+        else:
+            self.grasp_flow_modules = list(_DEFAULT_GRASP_FLOW_MODULES)
 
     @staticmethod
     def _wrap_in_scroll(widget):
@@ -196,6 +194,25 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         for i, btn in enumerate(self.sidebar.findChildren(QPushButton)):
             btn.setChecked(i == index)
 
+    def _create_status_card(self, title, card_color, label_name, initial_text, label_color="#94a3b8"):
+        """创建状态仪表盘卡片，返回 QFrame 卡片组件。"""
+        card = QFrame()
+        card.setObjectName("statusCard")
+        card.setStyleSheet(card_style(card_color))
+        card_layout = QVBoxLayout(card)
+        card_layout.setSpacing(2)
+        card_layout.setContentsMargins(10, 8, 10, 8)
+        title_label = QLabel(title)
+        title_label.setObjectName("cardTitle")
+        title_label.setStyleSheet(metric_title_style())
+        value_label = QLabel(initial_text)
+        value_label.setObjectName("cardValue")
+        value_label.setStyleSheet(metric_label_style(label_color))
+        setattr(self, label_name, value_label)
+        card_layout.addWidget(title_label)
+        card_layout.addWidget(value_label)
+        return card
+
     def set_dark_theme(self):
         """设置深色主题"""
         apply_theme(self)
@@ -220,71 +237,17 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         status_layout.setContentsMargins(12, 10, 12, 10)
         
         # 机器人状态卡片
-        robot_card = QFrame()
-        robot_card.setObjectName("statusCard")
-        robot_card.setStyleSheet(card_style("#3b82f6"))
-        robot_card_layout = QVBoxLayout(robot_card)
-        robot_card_layout.setSpacing(2)
-        robot_card_layout.setContentsMargins(10, 8, 10, 8)
-        robot_title = QLabel("机器人")
-        robot_title.setObjectName("cardTitle")
-        robot_title.setStyleSheet(metric_title_style())
-        self.robot_status_label = QLabel("未连接")
-        self.robot_status_label.setObjectName("cardValue")
-        self.robot_status_label.setStyleSheet(metric_label_style("#94a3b8"))
-        robot_card_layout.addWidget(robot_title)
-        robot_card_layout.addWidget(self.robot_status_label)
-        status_layout.addWidget(robot_card)
-        
+        status_layout.addWidget(self._create_status_card("机器人", "#3b82f6", "robot_status_label", "未连接"))
+
         # 相机状态卡片
-        camera_card = QFrame()
-        camera_card.setObjectName("statusCard")
-        camera_card.setStyleSheet(card_style("#06b6d4"))
-        camera_card_layout = QVBoxLayout(camera_card)
-        camera_card_layout.setSpacing(2)
-        camera_card_layout.setContentsMargins(10, 8, 10, 8)
-        camera_title = QLabel("相机")
-        camera_title.setObjectName("cardTitle")
-        camera_title.setStyleSheet(metric_title_style())
-        self.camera_status_label = QLabel("未连接")
-        self.camera_status_label.setObjectName("cardValue")
-        self.camera_status_label.setStyleSheet(metric_label_style("#94a3b8"))
-        camera_card_layout.addWidget(camera_title)
-        camera_card_layout.addWidget(self.camera_status_label)
-        status_layout.addWidget(camera_card)
-        
+        status_layout.addWidget(self._create_status_card("相机", "#06b6d4", "camera_status_label", "未连接"))
+
+        # GPU推理模式卡片
+        status_layout.addWidget(self._create_status_card("推理", "#f59e0b", "gpu_status_label", "未检测"))
+
         # 初始位置卡片
-        pos_card = QFrame()
-        pos_card.setObjectName("statusCard")
-        pos_card.setStyleSheet(card_style("#8b5cf6"))
-        pos_card_layout = QVBoxLayout(pos_card)
-        pos_card_layout.setSpacing(2)
-        pos_card_layout.setContentsMargins(10, 8, 10, 8)
-        pos_title = QLabel("位置")
-        pos_title.setObjectName("cardTitle")
-        pos_title.setStyleSheet(metric_title_style())
-        self.photo_position_label = QLabel(f"{self.controller.initial_pose}")
-        self.photo_position_label.setObjectName("cardValue")
-        self.photo_position_label.setStyleSheet(metric_label_style("#8b5cf6"))
-        pos_card_layout.addWidget(pos_title)
-        pos_card_layout.addWidget(self.photo_position_label)
-        status_layout.addWidget(pos_card)
-        # 力矩卡片
-        torque_card = QFrame()
-        torque_card.setObjectName("statusCard")
-        torque_card.setStyleSheet(card_style("#f59e0b"))
-        torque_card_layout = QVBoxLayout(torque_card)
-        torque_card_layout.setSpacing(2)
-        torque_card_layout.setContentsMargins(10, 8, 10, 8)
-        torque_title = QLabel("力矩")
-        torque_title.setObjectName("cardTitle")
-        torque_title.setStyleSheet(metric_title_style())
-        self.torque_label = QLabel("未连接")
-        self.torque_label.setObjectName("cardValue")
-        self.torque_label.setStyleSheet(metric_label_style("#94a3b8"))
-        torque_card_layout.addWidget(torque_title)
-        torque_card_layout.addWidget(self.torque_label)
-        status_layout.addWidget(torque_card)
+        status_layout.addWidget(self._create_status_card("位置", "#8b5cf6", "photo_position_label", f"{self.controller.initial_pose}", label_color="#8b5cf6"))
+
         
         # 右侧操作区
         right_actions = QVBoxLayout()
@@ -817,35 +780,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         point_tab_layout.setContentsMargins(10, 10, 10, 10)
         point_tab_layout.addWidget(point_mgmt_group)
         self._add_nav_page("点位管理", self._wrap_in_scroll(point_tab))
-        # 机器人力控显示选项卡
-        torque_tab = QWidget()
-        torque_tab_layout = QVBoxLayout(torque_tab)
-        torque_tab_layout.setSpacing(10)
-        torque_tab_layout.setContentsMargins(10, 10, 10, 10)
-        
-        # 力矩数据显示
-        torque_data_group = QGroupBox("关节力矩数据")
-        torque_data_layout = QGridLayout()
-        torque_data_layout.setSpacing(10)
-        
-        self.torque_joint1_label = QLabel("关节1: -- A")
-        self.torque_joint2_label = QLabel("关节2: -- A")
-        self.torque_joint3_label = QLabel("关节3: -- A")
-        self.torque_joint4_label = QLabel("关节4: -- A")
-        self.torque_joint5_label = QLabel("关节5: -- A")
-        self.torque_joint6_label = QLabel("关节6: -- A")
-        
-        torque_data_layout.addWidget(self.torque_joint1_label, 0, 0)
-        torque_data_layout.addWidget(self.torque_joint2_label, 0, 1)
-        torque_data_layout.addWidget(self.torque_joint3_label, 1, 0)
-        torque_data_layout.addWidget(self.torque_joint4_label, 1, 1)
-        torque_data_layout.addWidget(self.torque_joint5_label, 2, 0)
-        torque_data_layout.addWidget(self.torque_joint6_label, 2, 1)
-        
-        torque_data_group.setLayout(torque_data_layout)
-        torque_tab_layout.addWidget(torque_data_group)
-        
-        self._add_nav_page("机器人力控", self._wrap_in_scroll(torque_tab))
+
 
         # Modbus 通信选项卡
         modbus_tab = QWidget()
@@ -864,6 +799,12 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.modbus_port_input.editingFinished.connect(lambda: ConfigService.instance().set('modbus_port', int(self.modbus_port_input.text().strip() or 502)))
         modbus_ctrl_layout.addWidget(self.modbus_port_input, 0, 1)
 
+        modbus_ctrl_layout.addWidget(QLabel("从站地址:"), 1, 0)
+        self.modbus_slave_id_input = QLineEdit(str(get_modbus_slave_id()))
+        self.modbus_slave_id_input.setMaximumWidth(100)
+        self.modbus_slave_id_input.editingFinished.connect(lambda: ConfigService.instance().set('modbus_slave_id', int(self.modbus_slave_id_input.text().strip() or 5)))
+        modbus_ctrl_layout.addWidget(self.modbus_slave_id_input, 1, 1)
+
         self.modbus_start_btn = QPushButton("启动从站服务")
         self.modbus_start_btn.setMinimumWidth(120)
         self.modbus_start_btn.setMinimumHeight(40)
@@ -878,7 +819,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         modbus_ctrl_layout.addWidget(self.modbus_stop_btn, 0, 3)
 
         self.modbus_status_label = QLabel("状态: 未启动")
-        modbus_ctrl_layout.addWidget(self.modbus_status_label, 1, 0, 1, 4)
+        modbus_ctrl_layout.addWidget(self.modbus_status_label, 2, 0, 1, 4)
 
         modbus_ctrl_group.setLayout(modbus_ctrl_layout)
         modbus_layout.addWidget(modbus_ctrl_group)
@@ -1189,44 +1130,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         cam_test_content.addWidget(coord_group)
         camera_test_layout.addLayout(cam_test_content)
 
-        low_fps_group = QGroupBox("D435i 低帧率识别 (5fps)")
-        low_fps_layout = QVBoxLayout()
-        low_fps_layout.setSpacing(8)
 
-        low_fps_btn_layout = QHBoxLayout()
-        self.d435i_low_fps_start_btn = QPushButton("启动")
-        self.d435i_low_fps_start_btn.clicked.connect(self.start_d435i_low_fps)
-        low_fps_btn_layout.addWidget(self.d435i_low_fps_start_btn)
-
-        self.d435i_low_fps_stop_btn = QPushButton("停止")
-        self.d435i_low_fps_stop_btn.setEnabled(False)
-        self.d435i_low_fps_stop_btn.clicked.connect(self.stop_d435i_low_fps)
-        low_fps_btn_layout.addWidget(self.d435i_low_fps_stop_btn)
-
-        self.d435i_low_fps_status = QLabel("状态: 已停止")
-        apply_status_visual(self.d435i_low_fps_status, "已停止")
-        low_fps_btn_layout.addWidget(self.d435i_low_fps_status)
-        low_fps_btn_layout.addStretch()
-        low_fps_layout.addLayout(low_fps_btn_layout)
-
-        low_fps_coords_layout = QGridLayout()
-        low_fps_coords_layout.setSpacing(6)
-
-        low_fps_coords_layout.addWidget(QLabel("相机坐标:"), 0, 0)
-        self.d435i_low_fps_cam_coords = QLabel("X: ---  Y: ---  Z: ---")
-        low_fps_coords_layout.addWidget(self.d435i_low_fps_cam_coords, 0, 1)
-
-        low_fps_coords_layout.addWidget(QLabel("末端坐标:"), 1, 0)
-        self.d435i_low_fps_end_coords = QLabel("X: ---  Y: ---  Z: ---")
-        low_fps_coords_layout.addWidget(self.d435i_low_fps_end_coords, 1, 1)
-
-        low_fps_coords_layout.addWidget(QLabel("基座坐标:"), 2, 0)
-        self.d435i_low_fps_base_coords = QLabel("X: ---  Y: ---  Z: ---")
-        low_fps_coords_layout.addWidget(self.d435i_low_fps_base_coords, 2, 1)
-
-        low_fps_layout.addLayout(low_fps_coords_layout)
-        low_fps_group.setLayout(low_fps_layout)
-        camera_test_layout.addWidget(low_fps_group)
 
         self.cam_test_worker = None
 
@@ -1322,6 +1226,18 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         camera_status = "已连接(" + "+".join(cameras) + ")" if cameras else "未连接"
         self.update_status("camera", camera_status)
     
+    def update_gpu_status(self, provider_text=None):
+        """更新GPU推理模式状态显示。"""
+        if provider_text is None:
+            self.gpu_status_label.setText("未检测")
+            self.gpu_status_label.setStyleSheet(metric_label_style("#94a3b8"))
+        elif "GPU" in provider_text:
+            self.gpu_status_label.setText("GPU")
+            self.gpu_status_label.setStyleSheet(metric_label_style("#22c55e"))
+        else:
+            self.gpu_status_label.setText("CPU")
+            self.gpu_status_label.setStyleSheet(metric_label_style("#f59e0b"))
+
     def update_status(self, status_type, status_value):
         """更新状态显示。"""
         if status_type == "robot":
@@ -1513,38 +1429,67 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self._load_calib_matrix(camera_type)
 
     def closeEvent(self, event):
+        """窗口关闭 - 按顺序停止所有线程和服务"""
+        logger.info("正在关闭应用程序...")
+
+        # 0. 停止状态定时器
         if hasattr(self, '_status_timer') and self._status_timer is not None:
             self._status_timer.stop()
+
+        # 1. 停止流程
+        if hasattr(self, '_flow_thread') and self._flow_thread is not None:
+            self._flow_thread.stop()
+            self._flow_thread.wait(3000)
+            if self._flow_thread.isRunning():
+                logger.warning("FlowThread 未能正常退出")
+            self._flow_thread = None
+
+        # 2. 停止视觉伺服
+        # (visual servo is managed within FlowThread, so it should be stopped already)
+
+        # 3. 停止 Modbus server
+        try:
+            self.stop_modbus_server()
+            logger.info("Modbus server 已停止")
+        except Exception as e:
+            logger.warning("停止 Modbus server 时出错: %s", e)
+
+        # 4. 停止相机 workers 和关闭相机
         if hasattr(self, 'cam_test_worker') and self.cam_test_worker is not None:
             self.cam_test_worker.stop()
             self.cam_test_worker.wait(3000)
+            if self.cam_test_worker.isRunning():
+                logger.warning("CameraTestWorker 未能正常退出")
             self.cam_test_worker = None
-        if hasattr(self, '_low_fps_worker') and self._low_fps_worker is not None:
-            self._low_fps_worker.stop()
-            self._low_fps_worker.wait(3000)
-            self._low_fps_worker = None
-        if hasattr(self, '_flow_thread') and self._flow_thread is not None and self._flow_thread.isRunning():
-            self._flow_thread.stop()
-            self._flow_thread.wait(3000)
 
-        self.stop_modbus_server()
-        self.stop_monitor_threads()
-        
-        # 关闭相机
-        if self.vision_d435i is not None:
+
+
+        if hasattr(self, 'vision_d435i') and self.vision_d435i is not None:
             self.vision_d435i.close()
-        if self.vision_d405 is not None:
+            self.vision_d435i = None
+
+        if hasattr(self, 'vision_d405') and self.vision_d405 is not None:
             self.vision_d405.close()
-        
-        # 断开机器人连接
-        if self.controller.is_connected:
-            self.controller.disconnect()
-        
+            self.vision_d405 = None
+
+        # 5. 停止实时反馈和监控线程
+        self.stop_monitor_threads()
+
+        # 6. 断开机器人连接
+        if hasattr(self, 'controller') and self.controller is not None:
+            try:
+                if self.controller.is_connected:
+                    self.controller.disconnect()
+                    logger.info("机器人已断开连接")
+            except Exception as e:
+                logger.warning("断开机器人连接时出错: %s", e)
+
+        logger.info("应用程序关闭完成")
         event.accept()
 
 def main():
     """应用入口。"""
-    from logging_config import setup_logging
+    from .logging_config import setup_logging
     setup_logging()
     app = QApplication(sys.argv)
     window = DobotMainWindow()
@@ -1552,4 +1497,14 @@ def main():
     sys.exit(app.exec())
 
 if __name__ == "__main__":
-    main()
+    import warnings
+    warnings.warn(
+        "直接运行 gui_app.py 已不再支持（使用了包内相对导入）。"
+        "请使用: python -m dobot_move",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    # 尝试以包模式重新启动
+    import subprocess
+    import sys
+    sys.exit(subprocess.call([sys.executable, "-m", "dobot_move"]))

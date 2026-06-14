@@ -7,6 +7,10 @@
 import json
 import logging
 import os
+import re
+import shutil
+import tempfile
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -38,8 +42,32 @@ DEFAULT_PERFORMANCE_CONFIG = {
 }
 
 
+DEFAULT_VISUAL_SERVO_CONFIG = {
+    "servo_period": 0.06,
+    "gain_far": 0.8,
+    "gain_mid": 0.5,
+    "gain_near": 0.2,
+    "max_step_far": 35.0,
+    "max_step_mid": 18.0,
+    "max_step_near": 6.0,
+    "max_step_fine": 2.0,
+    "yolo_every_n": 3,
+    "stop_on_converge": False,
+}
+
+
+def get_visual_servo_config():
+    """获取视觉伺服配置，优先从 config.json 读取，缺失时使用默认值"""
+    config = load_config()
+    vs_config = dict(DEFAULT_VISUAL_SERVO_CONFIG)
+    perf = config.get("performance", {})
+    if isinstance(perf.get("visual_servo"), dict):
+        vs_config.update(perf["visual_servo"])
+    return vs_config
+
+
 def load_config():
-    """加载配置文件"""
+    """加载配置文件（支持备份恢复）"""
     global _config_cache, _cache_valid
     if _cache_valid and _config_cache is not None:
         return _config_cache
@@ -48,28 +76,64 @@ def load_config():
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 _config_cache = json.load(f)
             _cache_valid = True
-            logger.info(f"✅ 配置文件加载成功: {CONFIG_FILE}")
+            logger.info("✅ 配置文件加载成功: %s", CONFIG_FILE)
             return _config_cache
-        except Exception as e:
-            logger.error(f"❌ 配置文件加载失败: {e}")
+        except (json.JSONDecodeError, Exception) as e:
+            logger.error("❌ 配置文件加载失败: %s，尝试从备份恢复", e)
+            # 尝试从备份恢复
+            bak_file = CONFIG_FILE + ".bak"
+            if os.path.exists(bak_file):
+                try:
+                    with open(bak_file, 'r', encoding='utf-8') as f:
+                        _config_cache = json.load(f)
+                    _cache_valid = True
+                    logger.info("✅ 从备份恢复配置成功: %s", bak_file)
+                    # 恢复成功后立即保存回主文件
+                    save_config(_config_cache)
+                    return _config_cache
+                except Exception as bak_e:
+                    logger.error("❌ 备份文件也损坏: %s", bak_e)
             return {}
     else:
-        logger.warning(f"⚠️ 配置文件不存在，使用默认配置: {CONFIG_FILE}")
+        logger.warning("⚠️ 配置文件不存在，使用默认配置: %s", CONFIG_FILE)
         return {}
 
 
 def save_config(config):
-    """保存配置文件"""
+    """保存配置文件（原子写入 + 备份）"""
     global _config_cache, _cache_valid
     try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+        # 写入前备份旧文件
+        if os.path.exists(CONFIG_FILE):
+            bak_file = CONFIG_FILE + ".bak"
+            try:
+                shutil.copy2(CONFIG_FILE, bak_file)
+            except Exception as e:
+                logger.warning("备份配置文件失败: %s", e)
+        
+        # 写入临时文件
+        dir_name = os.path.dirname(CONFIG_FILE)
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            # 原子替换
+            os.replace(tmp_path, CONFIG_FILE)
+            tmp_path = None  # 标记已成功替换
+        finally:
+            # 清理临时文件（如果替换未成功）
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        
         _config_cache = config
         _cache_valid = True
-        logger.info(f"✅ 配置文件保存成功: {CONFIG_FILE}")
+        logger.info("✅ 配置文件保存成功: %s", CONFIG_FILE)
         return True
     except Exception as e:
-        logger.error(f"❌ 配置文件保存失败: {e}")
+        logger.error("❌ 配置文件保存失败: %s", e)
         return False
 
 
@@ -97,7 +161,15 @@ def get_robot_ip():
 
 
 def set_robot_ip(ip):
-    """设置机器人IP地址"""
+    """设置机器人IP地址，带格式校验"""
+    ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+    if not re.match(ip_pattern, ip):
+        logger.error("IP 地址格式无效: %s", ip)
+        return False
+    parts = ip.split('.')
+    if not all(0 <= int(p) <= 255 for p in parts):
+        logger.error("IP 地址范围无效: %s", ip)
+        return False
     config = load_config()
     config['robot_ip'] = ip
     return save_config(config)
@@ -111,6 +183,42 @@ def get_modbus_port():
 def set_modbus_port(port):
     config = load_config()
     config['modbus_port'] = port
+    return save_config(config)
+
+
+def get_modbus_slave_id():
+    """获取Modbus从站地址"""
+    config = load_config()
+    return config.get('modbus_slave_id', 5)
+
+
+def set_modbus_slave_id(slave_id):
+    """设置Modbus从站地址"""
+    config = load_config()
+    config['modbus_slave_id'] = int(slave_id)
+    return save_config(config)
+
+
+def get_hook_target():
+    """获取提钩目标位姿（从配置文件读取，替代原Modbus寄存器传入）"""
+    config = load_config()
+    target = config.get('hook_target', None)
+    if target is None:
+        # 默认提钩目标：使用 photo_position 作为默认值
+        target = {
+            "x": 0.0, "y": 0.0, "z": 0.0,
+            "rx": 0.0, "ry": 0.0, "rz": 0.0,
+            "speed_mm_s": 50.0,
+        }
+        config['hook_target'] = target
+        save_config(config)
+    return target
+
+
+def set_hook_target(target):
+    """设置提钩目标位姿"""
+    config = load_config()
+    config['hook_target'] = target
     return save_config(config)
 
 
@@ -134,7 +242,7 @@ def update_config(key, value):
     return save_config(config)
 
 
-from transform_utils import euler2rot as _euler2rot, pose2matrix as _pose2matrix
+from .transform_utils import euler2rot as _euler2rot, pose2matrix as _pose2matrix
 
 
 _DEFAULT_D405_TOOL_BASE_CALIB = [-210, 0, 310, 90, 0, -90]
@@ -316,7 +424,7 @@ class ConfigService:
     _instance = None
 
     def __init__(self):
-        from qt_compat import QTimer
+        from .qt_compat import QTimer
         self._pending = {}
         self._timer = QTimer()
         self._timer.setSingleShot(True)

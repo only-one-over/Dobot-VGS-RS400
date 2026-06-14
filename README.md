@@ -69,21 +69,27 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # 3. （可选）构建 C++ 加速模块
-pip install pybind11 cmake
+pip install -r requirements-cpp.txt
 python build_cpp.py
 ```
+
+> 依赖文件说明：`requirements.txt` 为聚合入口（基础 + GPU），分层文件见 `requirements-base.txt`、`requirements-gpu-cu12.txt`、`requirements-cpp.txt`。GPU 环境详细部署指南见 [docs/gpu_environment.md](docs/gpu_environment.md)。
 
 ### 验证安装
 
 ```bash
+# 基础依赖验证
 python -c "import PySide6, numpy, cv2, pyrealsense2, onnxruntime; print('All dependencies OK')"
+
+# GPU 真实启用验证（必须用 best.onnx 创建 session 确认 provider）
+python -c "import onnxruntime as ort; s = ort.InferenceSession('dobot_move/best.onnx', providers=['CUDAExecutionProvider']); print('Active providers:', s.get_providers())"
+# 通过标准：输出包含 CUDAExecutionProvider
 
 # 可选：验证 C++ 模块
 python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
-
-# 可选：验证 GPU 加速
-python -c "import onnxruntime as ort; print('Providers:', ort.get_available_providers())"
 ```
+
+> 仅检查 `get_available_providers()` 不够——它只说明 onnxruntime 识别 CUDA provider，不代表实际能创建 CUDA session。正确验证方式是创建 InferenceSession 并确认 active provider。详见 [docs/gpu_environment.md](docs/gpu_environment.md)。
 
 ## 架构
 
@@ -360,29 +366,25 @@ pip install opencv-python
 
 ### YOLO 推理（CUDA 必需）
 
-本项目 YOLO 推理**必须**使用 NVIDIA GPU + CUDA，不支持 CPU 推理。请确保已安装 CUDA Toolkit 和 `onnxruntime-gpu`：
+本项目 YOLO 推理需要 NVIDIA GPU + CUDA。GPU 依赖通过 `requirements-gpu-cu12.txt` 安装，CUDA runtime 和 cuDNN 随 pip 包自动安装到虚拟环境中。
 
 ```bash
-# 1. 确认有 NVIDIA 显卡
+# 确认 GPU 可用
 nvidia-smi
 
-# 2. 卸载 CPU 版 onnxruntime（如果已安装）
-pip uninstall onnxruntime
+# 安装 GPU 推理依赖
+pip install -r requirements-gpu-cu12.txt
 
-# 3. 安装 GPU 版
-pip install onnxruntime-gpu
-
-# 4. 验证 GPU 可用
-python -c "import onnxruntime as ort; print(ort.get_available_providers())"
-# 输出必须包含 'CUDAExecutionProvider'，否则程序无法启动
+# 验证 GPU 真实启用
+python -c "import onnxruntime as ort; s = ort.InferenceSession('dobot_move/best.onnx', providers=['CUDAExecutionProvider']); print('Active providers:', s.get_providers())"
 ```
 
 | 模式 | YOLO 推理耗时 | 视觉伺服闭环频率 | 安装要求 | 支持状态 |
 |------|--------------|-----------------|----------|----------|
-| GPU (CUDA) | ~20-50ms | ~10-15 Hz | NVIDIA GPU + CUDA Toolkit + onnxruntime-gpu | ✅ 必需 |
+| GPU (CUDA) | ~20-50ms | ~10-15 Hz | NVIDIA GPU + 驱动 + onnxruntime-gpu[cuda,cudnn] | ✅ 必需 |
 | CPU | — | — | — | ❌ 不支持 |
 
-> **注意**：`onnxruntime` 和 `onnxruntime-gpu` 不能同时安装，装了 GPU 版后 CPU 版需先卸载。程序启动时会检测 CUDA 可用性，若不可用将直接报错退出。
+> 完整 GPU 环境部署指南见 [docs/gpu_environment.md](docs/gpu_environment.md)。注意 `onnxruntime` 和 `onnxruntime-gpu` 不能同时安装，装了 GPU 版后 CPU 版需先卸载。
 
 ### YOLO 模型检测效果差
 - 确认 `dobot_move/` 目录下存在 `best.onnx` 模型文件

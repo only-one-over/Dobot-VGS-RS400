@@ -1,8 +1,8 @@
 import logging
 import re
 
-from arc_trajectory_planner import ArcTrajectoryPlanner
-from dobot_api import DobotApiDashboard
+from .arc_trajectory_planner import ArcTrajectoryPlanner
+from .dobot_api import DobotApiDashboard
 
 logger = logging.getLogger(__name__)
 

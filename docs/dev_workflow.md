@@ -2,6 +2,15 @@
 
 ## 安装依赖
 
+项目依赖分为三层：
+
+| 文件 | 内容 | 用途 |
+|------|------|------|
+| `requirements.txt` | 聚合入口（引用 base + gpu） | 默认安装 |
+| `requirements-base.txt` | PySide6、OpenCV、RealSense、Modbus 等 | 无 GPU 推理的基础环境 |
+| `requirements-gpu-cu12.txt` | onnxruntime-gpu[cuda,cudnn] | CUDA 12.x GPU 推理 |
+| `requirements-cpp.txt` | pybind11、cmake | 可选 C++ 加速模块构建 |
+
 从仓库根目录：
 
 ```powershell
@@ -9,6 +18,8 @@ python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+GPU 环境详细部署指南见 [gpu_environment.md](gpu_environment.md)。
 
 RealSense 工作还需要在 Python 之外安装 Intel RealSense SDK 2.0。原生加速需要 CMake、C++17 编译器和 pybind11。
 

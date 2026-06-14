@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import sys
 import numpy as np
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import config_manager
-from transform_utils import euler2rot as _euler2rot, pose2matrix as _pose2matrix
+from . import config_manager
+from .transform_utils import euler2rot as _euler2rot, pose2matrix as _pose2matrix
 
 
 def _rot2euler(R, degree=True):

@@ -5,11 +5,11 @@
 卡片式分组布局，深色工业仪表盘风格
 """
 
-from qt_compat import (
+from .qt_compat import (
     QWidget, QVBoxLayout, QGridLayout, QPushButton, QLabel, QComboBox,
     QLineEdit, QHBoxLayout, QFrame, pyqtSignal,
 )
-from ui_theme import apply_status_visual, set_button_role, card_style, metric_title_style
+from .ui_theme import apply_status_visual, set_button_role, card_style, metric_title_style
 
 
 class MainControlPanel(QWidget):

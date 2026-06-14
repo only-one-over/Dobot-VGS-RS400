@@ -8,10 +8,11 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
-from qt_compat import QImage, QThread, pyqtSignal
-from config_manager import get_point, set_point, resolve_point, get_performance_config
-from arc_motion_controller import ArcMotionController
-from visual_servo_controller import VisualServoController
+from .qt_compat import QImage, QThread, pyqtSignal
+from .config_manager import get_point, set_point, resolve_point, get_performance_config
+from .vision_system import FramePacket
+from .arc_motion_controller import ArcMotionController
+from .visual_servo_controller import VisualServoController
 
 try:
     import cv2
@@ -95,11 +96,11 @@ def validate_grasp_flow_modules(modules: list) -> list:
                 if motion_type == "MovL" and not point_name.strip():
                     errors.append(f"第{step}步「{name}」：直线运动目标为 camera_detected，但未指定目标点位")
             elif target == "initial_position":
-                from config_manager import get_point
+                from .config_manager import get_point
                 if not get_point("initial_point"):
                     errors.append(f"第{step}步「{name}」：初始位置点位 initial_point 不存在")
             elif target == "saved_point":
-                from config_manager import get_point
+                from .config_manager import get_point
                 point_name = params.get("point_name", "")
                 if not point_name.strip():
                     errors.append(f"第{step}步「{name}」：已保存点位未指定点位名称")
@@ -156,7 +157,6 @@ class FlowThread(QThread):
         self.flow_log.emit(f"❌ 模块{module_index + 1}失败: {reason}")
         self.controller.record_alarm("流程执行", f"模块{module_index + 1}", "故障", reason)
         self.flow_finished.emit(False)
-        self.controller.release_motion("flow")
 
     def stop(self):
         if self._ctx is not None:
@@ -215,6 +215,13 @@ class FlowThread(QThread):
                         if fb["health"] == "disconnected":
                             self._fail_module(ctx, i, name, f"反馈缓存断流({stale_fail_age:.1f}s)")
                             return
+
+                    # --- Auto-sync is_enabled from feedback RobotMode ---
+                    if not self.controller.is_enabled and module['type'] in ("move", "arc_motion", "relative_move", "joint_move"):
+                        robot_mode = self.controller.get_robot_mode_fast()
+                        if robot_mode in (5, 7):
+                            self.controller.is_enabled = True
+                            self.flow_log.emit(f"🔄 检测到机器人模式{robot_mode}，自动同步使能状态")
 
                     stop_checker = lambda: ctx.stop_event.is_set()
 
@@ -310,17 +317,16 @@ class FlowThread(QThread):
                             start_angle = -90.0
                             end_angle = start_angle - sweep_angle if arc_direction == 'cw' else start_angle + sweep_angle
                             base_orientation = [float(v) for v in current_pose[3:6]]
-                            rx_delta = -sweep_angle if arc_direction == 'cw' else sweep_angle
                             orientation = [
                                 [base_orientation[0], base_orientation[1], base_orientation[2]],
-                                [base_orientation[0] + rx_delta / 2.0, base_orientation[1], base_orientation[2]],
-                                [base_orientation[0] + rx_delta, base_orientation[1], base_orientation[2]],
+                                [base_orientation[0], base_orientation[1], base_orientation[2]],
+                                [base_orientation[0], base_orientation[1], base_orientation[2]],
                             ]
                             direction_text = "顺时针" if arc_direction == 'cw' else "逆时针"
                             self.flow_log.emit(
                                 f"↪️ 圆弧运动: 当前点={current_pose[:3]}, 圆心={center}, "
                                 f"距离={center_offset_z:.1f}mm, 角度={sweep_angle:.1f}°, "
-                                f"方向={direction_text}, Rx={base_orientation[0]:.1f}->{orientation[-1][0]:.1f}"
+                                f"方向={direction_text}, Rx={base_orientation[0]:.1f}(保持不变)"
                             )
                             fa_ctrl = ArcMotionController()
                             fa_ctrl.set_dashboard(self.controller.dashboard)
@@ -602,14 +608,33 @@ class FlowThread(QThread):
                             self._fail_module(ctx, i, name, "D405 相机未连接，无法执行视觉伺服")
                             return
 
-                        converge_threshold = module['params'].get('converge_threshold', 3.0)
-                        max_iterations = module['params'].get('max_iterations', 60)
-
+                        _vs_cfg = get_visual_servo_config()
+                        p = module['params']
                         servo_ctrl = VisualServoController(
                             vision=self.vision_d405,
                             controller=self.controller,
-                            converge_threshold=converge_threshold,
-                            max_iterations=max_iterations,
+                            servo_period=float(p.get('servo_period', _vs_cfg.get('servo_period', 0.06))),
+                            servo_p_t=float(p['servo_p_t']) if p.get('servo_p_t') is not None else None,
+                            servo_p_aheadtime=int(p.get('servo_p_aheadtime', 50)),
+                            servo_p_gain=int(p.get('servo_p_gain', 500)),
+                            gain_far=float(p.get('gain_far', _vs_cfg.get('gain_far', 0.8))),
+                            gain_mid=float(p.get('gain_mid', _vs_cfg.get('gain_mid', 0.5))),
+                            gain_near=float(p.get('gain_near', _vs_cfg.get('gain_near', 0.2))),
+                            threshold_far=float(p.get('threshold_far', 50.0)),
+                            threshold_mid=float(p.get('threshold_mid', 10.0)),
+                            converge_threshold=float(p.get('converge_threshold', 3.0)),
+                            max_iterations=int(p.get('max_iterations', 60)),
+                            max_target_age=float(p.get('max_target_age', 0.3)),
+                            max_pose_age=float(p.get('max_pose_age', 0.1)),
+                            max_error_mm=float(p.get('max_error_mm', 300.0)),
+                            z_safety_limit=float(p.get('z_safety_limit', 0.0)),
+                            enable_feedforward=bool(p.get('enable_feedforward', False)),
+                            yolo_every_n=int(p.get('yolo_every_n', _vs_cfg.get('yolo_every_n', 3))),
+                            stop_on_converge=bool(p.get('stop_on_converge', _vs_cfg.get('stop_on_converge', False))),
+                            max_step_far=float(p.get('max_step_far', _vs_cfg.get('max_step_far', 35.0))),
+                            max_step_mid=float(p.get('max_step_mid', _vs_cfg.get('max_step_mid', 18.0))),
+                            max_step_near=float(p.get('max_step_near', _vs_cfg.get('max_step_near', 6.0))),
+                            max_step_fine=float(p.get('max_step_fine', _vs_cfg.get('max_step_fine', 2.0))),
                         )
 
                         def servo_log(msg):
@@ -678,6 +703,44 @@ class FlowThread(QThread):
             self.flow_finished.emit(False)
 
 
+class CaptureThread(threading.Thread):
+    """Background thread that continuously captures frames into a latest-frame buffer."""
+
+    def __init__(self, vision):
+        super().__init__(daemon=True)
+        self.vision = vision
+        self.running = True
+        self._lock = threading.Lock()
+        self._latest_packet: Optional[FramePacket] = None
+        self._seq = 0
+        self._capture_ms = 0.0
+        self._dropped = 0
+
+    def run(self):
+        while self.running:
+            try:
+                capture_start = time.perf_counter()
+                packet = self.vision.capture_numpy_packet(self._seq)
+                if packet is not None:
+                    with self._lock:
+                        if self._latest_packet is not None:
+                            self._dropped += 1
+                        self._latest_packet = packet
+                        self._seq += 1
+                    self._capture_ms = (time.perf_counter() - capture_start) * 1000.0
+            except Exception:
+                pass
+
+    def get_latest(self):
+        with self._lock:
+            if self._latest_packet is None:
+                return None, 0.0
+            return self._latest_packet, self._capture_ms
+
+    def stop(self):
+        self.running = False
+
+
 class CameraTestWorker(QThread):
     result_ready = pyqtSignal(dict)
 
@@ -687,7 +750,6 @@ class CameraTestWorker(QThread):
         self.cam_type = cam_type
         self.controller = controller
         self.running = True
-        self.last_frame_time = 0
         perf_config = getattr(self.vision, "performance_config", {})
         detection_fps = max(1.0, float(perf_config.get("camera_test_detection_fps", 10)))
         display_fps = max(1.0, float(perf_config.get("camera_test_display_fps", 10)))
@@ -695,13 +757,15 @@ class CameraTestWorker(QThread):
         self.display_interval = 1.0 / display_fps
         self.frame_interval = min(self.detection_interval, self.display_interval)
         self.performance_log_interval_frames = max(1, int(perf_config.get("performance_log_interval_frames", 30)))
-        self.last_detection_time = 0
-        self.last_display_time = 0
         self.last_target = None
         self.last_object_position = None
         self._perf_count = 0
         self._perf_totals = {}
         self._last_perf_log = 0.0
+        self._capture_thread = None
+        self._frame_count = 0
+        self._last_processed_seq = -1
+        self._detect_every_n_frames = max(1, int(round(self.detection_interval / max(0.001, self.frame_interval))))
 
     def _record_performance(self, timings):
         self._perf_count += 1
@@ -714,7 +778,7 @@ class CameraTestWorker(QThread):
 
         count = max(1, self._perf_count)
         parts = [
-            f"{key}={total / count:.1f}ms"
+            f"{key}={total / count:.1f}ms" if key not in ('fps', 'dropped') else f"{key}={total / count:.1f}"
             for key, total in sorted(self._perf_totals.items())
         ]
         logger.info("performance[camera_test_worker] frames=%s %s", self._perf_count, " ".join(parts))
@@ -724,42 +788,43 @@ class CameraTestWorker(QThread):
 
     def run(self):
         self.vision.reset_tracking()
+        self._capture_thread = CaptureThread(self.vision)
+        self._capture_thread.start()
+
         while self.running:
             try:
-                loop_start = time.perf_counter()
-                elapsed = time.time() - self.last_frame_time
-                if elapsed < self.frame_interval:
-                    self.msleep(int((self.frame_interval - elapsed) * 1000))
-                    if not self.running:
-                        break
-                self.last_frame_time = time.time()
-
-                depth_frame, color_frame = self.vision.capture_frames()
-                if not depth_frame or not color_frame:
-                    self.result_ready.emit({'status': 'no_frame'})
+                packet, capture_ms = self._capture_thread.get_latest()
+                if packet is None or packet.seq == self._last_processed_seq:
+                    self.msleep(5)
                     continue
-                capture_done = time.perf_counter()
 
-                color_image = np.asanyarray(color_frame.get_data())
-                now = time.time()
-                should_detect = now - self.last_detection_time >= self.detection_interval
-                should_display = now - self.last_display_time >= self.display_interval
+                self._last_processed_seq = packet.seq
+                self._frame_count += 1
+                loop_start = time.perf_counter()
+
+                # Detection (frame count based)
+                should_detect = (self._frame_count % self._detect_every_n_frames) == 0
+                should_display = True  # display every processed frame
+
                 detection_start = time.perf_counter()
-
                 if should_detect:
-                    target = self.vision.run_detection_tracked(color_image)
-                    self.last_detection_time = now
+                    target = self.vision.run_detection_tracked(packet.color_image)
                     self.last_target = target
-                    self.last_object_position = self.vision.calculate_object_position_smoothed(depth_frame, color_frame, target)
+                    # Use numpy depth_image directly (calculate_object_position now accepts numpy)
+                    self.last_object_position = self.vision.calculate_object_position_smoothed(
+                        packet.depth_image, packet.color_image, target
+                    )
                 else:
                     target = self.last_target
                 detection_done = time.perf_counter()
 
                 object_position = self.last_object_position
+
+                # Draw
                 draw_start = time.perf_counter()
                 q_img = None
                 if should_display:
-                    display_image = color_image.copy()
+                    display_image = packet.color_image.copy()
                     if target and not target.get('predicted', False):
                         bbox = target.get('bbox')
                         if bbox:
@@ -774,9 +839,9 @@ class CameraTestWorker(QThread):
                     h, w, ch = rgb_image.shape
                     bytes_per_line = ch * w
                     q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
-                    self.last_display_time = now
                 draw_done = time.perf_counter()
 
+                # Build result
                 result = {
                     'status': 'ok',
                     'object_position': object_position,
@@ -799,118 +864,31 @@ class CameraTestWorker(QThread):
                             base_coords = self.vision.convert_to_base_coords(end_coords, current_pose)
                             result['base_coords'] = base_coords
 
-
                 self.result_ready.emit(result)
                 emit_done = time.perf_counter()
+
+                # Performance logging
+                dropped = self._capture_thread._dropped
                 timings = {
-                    "capture": (capture_done - loop_start) * 1000.0,
-                    "emit": (emit_done - draw_done) * 1000.0,
+                    "capture_thread": capture_ms,
+                    "detection_loop": (detection_done - detection_start) * 1000.0 if should_detect else 0.0,
+                    "draw_emit": (emit_done - draw_start) * 1000.0,
                     "total": (emit_done - loop_start) * 1000.0,
+                    "fps": 1000.0 / max(0.1, (emit_done - loop_start) * 1000.0),
+                    "dropped": float(dropped),
                 }
-                if should_detect:
-                    timings["detect"] = (detection_done - detection_start) * 1000.0
-                if should_display:
-                    timings["draw_emit"] = (draw_done - draw_start) * 1000.0
                 self._record_performance(timings)
 
             except Exception as e:
                 self.result_ready.emit({'status': 'error', 'error_msg': str(e)[:100]})
 
-    def stop(self):
-        self.running = False
-
-
-class D435iLowFpsWorker(QThread):
-    low_fps_result = pyqtSignal(dict)
-
-    def __init__(self, vision, controller):
-        super().__init__()
-        self.vision = vision
-        self.controller = controller
-        self.running = True
-        perf_config = getattr(self.vision, "performance_config", {})
-        low_fps = max(1.0, float(perf_config.get("low_fps_detection_fps", 5)))
-        self.frame_interval = 1.0 / low_fps
-        self.last_frame_time = 0
-        self.performance_log_interval_frames = max(1, int(perf_config.get("performance_log_interval_frames", 30)))
-        self._perf_count = 0
-        self._perf_totals = {}
-        self._last_perf_log = 0.0
-
-    def _record_performance(self, timings):
-        self._perf_count += 1
-        for key, value in timings.items():
-            self._perf_totals[key] = self._perf_totals.get(key, 0.0) + value
-
-        now = time.perf_counter()
-        if self._perf_count % self.performance_log_interval_frames != 0 or now - self._last_perf_log < 3.0:
-            return
-
-        count = max(1, self._perf_count)
-        parts = [
-            f"{key}={total / count:.1f}ms"
-            for key, total in sorted(self._perf_totals.items())
-        ]
-        logger.info("performance[d435i_low_fps_worker] frames=%s %s", self._perf_count, " ".join(parts))
-        self._perf_count = 0
-        self._perf_totals = {}
-        self._last_perf_log = now
-
-    def run(self):
-        self.vision.reset_tracking()
-        while self.running:
-            try:
-                loop_start = time.perf_counter()
-                elapsed = time.time() - self.last_frame_time
-                if elapsed < self.frame_interval:
-                    self.msleep(int((self.frame_interval - elapsed) * 1000))
-                    if not self.running:
-                        break
-                self.last_frame_time = time.time()
-
-                depth_frame, color_frame = self.vision.capture_frames()
-                if not depth_frame or not color_frame:
-                    self.low_fps_result.emit({'status': 'no_frame'})
-                    continue
-                capture_done = time.perf_counter()
-
-                color_image = np.asanyarray(color_frame.get_data())
-                target = self.vision.run_detection_tracked(color_image)
-                detection_done = time.perf_counter()
-                object_position = self.vision.calculate_object_position_smoothed(depth_frame, color_frame, target)
-                position_done = time.perf_counter()
-
-                result = {'status': 'ok', 'object_position': object_position}
-
-                if object_position:
-                    cam_coords = object_position.get('camera_coords', [])
-                    result['cam_coords'] = cam_coords
-                    result['confidence'] = object_position.get('confidence', 0.0)
-                    result['source'] = object_position.get('source', 'unknown')
-
-                    if self.controller.is_connected and len(cam_coords) >= 3:
-                        end_coords = self.vision.convert_to_end_coords(cam_coords)
-                        result['end_coords'] = end_coords
-                        current_pose = self.controller.get_current_pose_fast()
-                        if current_pose:
-                            base_coords = self.vision.convert_to_base_coords(end_coords, current_pose)
-                            result['base_coords'] = base_coords
-                            result['current_pose'] = current_pose
-
-                self.low_fps_result.emit(result)
-                emit_done = time.perf_counter()
-                self._record_performance(
-                    {
-                        "capture": (capture_done - loop_start) * 1000.0,
-                        "detect": (detection_done - capture_done) * 1000.0,
-                        "position": (position_done - detection_done) * 1000.0,
-                        "emit": (emit_done - position_done) * 1000.0,
-                        "total": (emit_done - loop_start) * 1000.0,
-                    }
-                )
-
-            except Exception as e:
-                self.low_fps_result.emit({'status': 'error', 'error_msg': str(e)[:100]})
+        self._capture_thread.stop()
+        self._capture_thread.join(timeout=3.0)
 
     def stop(self):
         self.running = False
+        if self._capture_thread:
+            self._capture_thread.stop()
+            self._capture_thread.join(timeout=3.0)
+
+

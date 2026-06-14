@@ -1,4 +1,4 @@
-from qt_compat import QPushButton, QEvent
+from ..qt_compat import QPushButton, QEvent
 
 
 class JogMixin:
@@ -35,8 +35,10 @@ class JogMixin:
         self._jog_active = True
 
     def _on_jog_stop(self):
-        self.controller.stop_jog()
+        if not self._jog_active:
+            return
         self._jog_active = False
+        self.controller.stop_jog()
 
     def cleanup_jog(self):
         if self._jog_active:

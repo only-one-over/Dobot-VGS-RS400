@@ -1,0 +1,11 @@
+PySide6>=6.0
+numpy
+requests
+pymodbus>=3.0
+opencv-python
+scipy
+pyrealsense2
+minimalmodbus
+pyserial             # 夹爪控制器串口通信
+python-can
+lapx

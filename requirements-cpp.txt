@@ -1,0 +1,4 @@
+# 可选 C++ 加速模块构建依赖
+# 用法：pip install -r requirements-cpp.txt && python build_cpp.py
+pybind11
+cmake

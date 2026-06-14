@@ -9,13 +9,18 @@ import re
 import socket
 import logging
 from contextlib import contextmanager
-from modbus_server import DobotModbusServer
+from .modbus_server import DobotModbusServer, REG_CMD_STATUS, REG_MODE, STATUS_STANDBY, STATUS_RUNNING, STATUS_HOOK_OK, STATUS_HOOK_ERR, STATUS_ROBOT_ERR, STATUS_CAMERA_ERR, MODE_AUTO, MODE_MANUAL, CMD_STOP, CMD_RESET, CMD_HOOK
 import math
 import threading
 import numpy as np
-from dobot_api import DobotApiDashboard, DobotApiFeedBack
-from config_manager import get_initial_point, get_performance_config, get_config
-from alarm_history import AlarmHistory
+from .dobot_api import DobotApiDashboard, DobotApiFeedBack
+from .config_manager import get_initial_point, get_performance_config, get_config, get_hook_target, get_modbus_slave_id
+from .motion_safety import (
+    validate_absolute_pose, validate_relative_delta,
+    validate_motion_target, validate_servo_p_params,
+    MotionValidationResult, MotionSafetyState,
+)
+from .alarm_history import AlarmHistory
 
 logger = logging.getLogger(__name__)
 
@@ -72,14 +77,12 @@ class DobotController:
         self._feed_error_count = 0
         self.clear_error_retry_count = 0
         self.modbus_server = None
-        self._modbus_thread = None
-        self._modbus_event = threading.Event()
         self._modbus_exec_thread = None
         self._modbus_exec_lock = threading.Lock()
-        self._modbus_cycle_count = 0
-        self._modbus_last_duration = 0.0
+        self._modbus_hook_status = 0
         self.auto_hook_mode = False
         self._modbus_status_override = None
+        self._modbus_mode = 0  # MODE_AUTO
         self._last_fault_code = 0
         self._robot_alarm_recorded = False
         self.software_emergency_active = False
@@ -168,6 +171,9 @@ class DobotController:
 
     @contextmanager
     def _temp_timeout(self, seconds):
+        if self.dashboard is None:
+            yield
+            return
         old_timeout = self.dashboard.socket_dobot.gettimeout()
         self.dashboard.socket_dobot.settimeout(seconds)
         try:
@@ -497,6 +503,7 @@ class DobotController:
             self.dashboard.close()
         self.stop_modbus()
         self.is_connected = False
+        self.is_enabled = False
         self._last_speed_factor = None
         logger.info(" 已断开连接")
 
@@ -729,45 +736,54 @@ class DobotController:
         logger.error(" 获取位置失败，已达到最大重试次数")
         return None
 
-    def _extract_pose_from_feed_data(self, data):
+    def get_motion_safety_state(self):
+        """
+        获取运动安全状态（只读缓存，不发任何 Dashboard 查询）。
+        用于 motion_safety.py 的校验函数。
+        """
+        from .motion_safety import MotionSafetyState
+
+        # 计算反馈年龄
+        feedback_age = 999.0
+        if self.latest_feed_time > 0:
+            feedback_age = time.time() - self.latest_feed_time
+
+        # 从反馈数据读取 ErrorStatus 和 RobotMode
+        error_status = 0
+        robot_mode = 0
+        if self.feed_data is not None:
+            try:
+                error_status = int(self.feed_data[0][0]['ErrorStatus'])
+            except (IndexError, KeyError, ValueError, TypeError):
+                pass
+            try:
+                robot_mode = int(self.feed_data[0][0]['RobotMode'])
+            except (IndexError, KeyError, ValueError, TypeError):
+                pass
+
+        return MotionSafetyState(
+            is_connected=self.is_connected,
+            is_enabled=self.is_enabled,
+            software_emergency_active=self.software_emergency_active,
+            error_status=error_status,
+            robot_mode=robot_mode,
+            feedback_age=feedback_age,
+        )
+
+    def _extract_vector6_from_feed_data(self, data, field_name):
+        """从反馈数据中提取6元素向量字段"""
         try:
-            if data is None:
-                return None
-            names = getattr(getattr(data, "dtype", None), "names", None)
-            if names and "ToolVectorActual" in names:
-                pose = data["ToolVectorActual"][0]
-            elif hasattr(data, "get"):
-                pose = data.get("ToolVectorActual")
-                if pose is not None and len(pose) and hasattr(pose[0], "__iter__"):
-                    pose = pose[0]
-            else:
-                return None
-            pose = [float(v) for v in pose[:6]]
-            return pose if len(pose) == 6 and all(np.isfinite(pose)) else None
-        except Exception:
+            values = data[0][0][field_name]
+            return np.array([float(v) for v in values])
+        except (IndexError, KeyError, ValueError, TypeError) as e:
+            logger.debug("提取 %s 失败: %s", field_name, e)
             return None
+
+    def _extract_pose_from_feed_data(self, data):
+        return self._extract_vector6_from_feed_data(data, "ToolVectorActual")
 
     def _extract_tcp_speed_from_feed_data(self, data):
-        """Extract TCPSpeedActual from 30004 feedback data.
-
-        Returns a list of 6 floats [vx, vy, vz, vrx, vry, vrz] or None.
-        """
-        try:
-            if data is None:
-                return None
-            names = getattr(getattr(data, "dtype", None), "names", None)
-            if names and "TCPSpeedActual" in names:
-                speed = data["TCPSpeedActual"][0]
-            elif hasattr(data, "get"):
-                speed = data.get("TCPSpeedActual")
-                if speed is not None and len(speed) and hasattr(speed[0], "__iter__"):
-                    speed = speed[0]
-            else:
-                return None
-            speed = [float(v) for v in speed[:6]]
-            return speed if len(speed) == 6 and all(np.isfinite(speed)) else None
-        except Exception:
-            return None
+        return self._extract_vector6_from_feed_data(data, "TCPSpeedActual")
 
     def _extract_robot_mode_from_feed_data(self, data):
         try:
@@ -845,64 +861,13 @@ class DobotController:
         return None
 
     def _extract_tool_vector_target_from_feed_data(self, data):
-        """Extract ToolVectorTarget from 30004 feedback data. Returns list of 6 floats or None."""
-        try:
-            if data is None:
-                return None
-            if hasattr(data, "get"):
-                val = data.get("ToolVectorTarget")
-                if val is not None and len(val) and hasattr(val[0], "__iter__"):
-                    val = val[0]
-            else:
-                names = getattr(getattr(data, "dtype", None), "names", None)
-                if names and "ToolVectorTarget" in names:
-                    val = data["ToolVectorTarget"][0]
-                else:
-                    return None
-            result = [float(v) for v in val[:6]]
-            return result if len(result) == 6 and all(np.isfinite(result)) else None
-        except Exception:
-            return None
+        return self._extract_vector6_from_feed_data(data, "ToolVectorTarget")
 
     def _extract_q_actual_from_feed_data(self, data):
-        """Extract QActual from 30004 feedback data. Returns list of 6 floats or None."""
-        try:
-            if data is None:
-                return None
-            if hasattr(data, "get"):
-                val = data.get("QActual")
-                if val is not None and len(val) and hasattr(val[0], "__iter__"):
-                    val = val[0]
-            else:
-                names = getattr(getattr(data, "dtype", None), "names", None)
-                if names and "QActual" in names:
-                    val = data["QActual"][0]
-                else:
-                    return None
-            result = [float(v) for v in val[:6]]
-            return result if len(result) == 6 and all(np.isfinite(result)) else None
-        except Exception:
-            return None
+        return self._extract_vector6_from_feed_data(data, "QActual")
 
     def _extract_q_target_from_feed_data(self, data):
-        """Extract QTarget from 30004 feedback data. Returns list of 6 floats or None."""
-        try:
-            if data is None:
-                return None
-            if hasattr(data, "get"):
-                val = data.get("QTarget")
-                if val is not None and len(val) and hasattr(val[0], "__iter__"):
-                    val = val[0]
-            else:
-                names = getattr(getattr(data, "dtype", None), "names", None)
-                if names and "QTarget" in names:
-                    val = data["QTarget"][0]
-                else:
-                    return None
-            result = [float(v) for v in val[:6]]
-            return result if len(result) == 6 and all(np.isfinite(result)) else None
-        except Exception:
-            return None
+        return self._extract_vector6_from_feed_data(data, "QTarget")
 
     def get_cached_pose(self, max_age=0.3):
         """Read parsed TCP pose from the 30004 feedback cache."""
@@ -1305,6 +1270,11 @@ class DobotController:
         wait_poll_interval=0.05,
     ):
         """移动到目标点"""
+        _cmd_speed = speed_percentage if speed_percentage is not None else self.current_speed
+        result = validate_absolute_pose(self, target_pose, speed=_cmd_speed)
+        if not result:
+            logger.error("move_to_point 校验失败: %s (code=%d)", result.message, result.code)
+            return False
         if not self.is_enabled:
             logger.error(" 机器人未使能")
             return False
@@ -1463,9 +1433,18 @@ class DobotController:
         Returns:
             bool: 指令是否发送成功
         """
+        result = validate_absolute_pose(self, pose, speed=None)
+        if not result:
+            logger.error("servo_p 校验失败: %s (code=%d)", result.message, result.code)
+            return False
         if not self.is_connected or not self.is_enabled:
             logger.error(" 机器人未连接或未使能，无法执行ServoP")
             return False
+
+        # ServoP 参数最终防线
+        t = max(t, 0.02)  # t 不低于 20ms (官方下限)
+        aheadtime = max(20, min(100, int(aheadtime)))
+        gain = max(200, min(1000, int(gain)))
 
         try:
             x, y, z, rx, ry, rz = pose[:6]
@@ -1552,6 +1531,39 @@ class DobotController:
         logger.info(" 运动完成")
         return True
 
+    def _build_relative_command(self, offsets, coord_system, motion_type, speed=None, acceleration=None, cp=None, r=None):
+        """构建相对运动命令，返回 (response, command_name)"""
+        if not self.is_connected:
+            logger.error("机器人未连接，无法执行相对运动")
+            return None, None
+
+        if len(offsets) < 6:
+            logger.error("偏移量长度不足6")
+            return None, None
+
+        x, y, z, rx, ry, rz = offsets[:6]
+        user = self._user_index
+        tool = self._tool_index
+
+        if motion_type == 'movl':
+            cmd_speed = speed if speed is not None else self._cmd_speed
+            cmd_accel = acceleration if acceleration is not None else self._cmd_acceleration
+            if cp is not None and cp > 0:
+                response = self.dashboard.RelMovL(x, y, z, rx, ry, rz, v=cmd_speed, user=user, tool=tool, cp=cp)
+            elif r is not None and r > 0:
+                response = self.dashboard.RelMovL(x, y, z, rx, ry, rz, v=cmd_speed, user=user, tool=tool, r=r)
+            else:
+                response = self.dashboard.RelMovL(x, y, z, rx, ry, rz, v=cmd_speed, user=user, tool=tool)
+            return response, "RelMovL"
+        else:  # movj
+            cmd_speed = speed if speed is not None else self._cmd_speed
+            cmd_accel = acceleration if acceleration is not None else self._cmd_acceleration
+            if r is not None and r > 0:
+                response = self.dashboard.RelMovJ(x, y, z, rx, ry, rz, v=cmd_speed, user=user, tool=tool, r=r)
+            else:
+                response = self.dashboard.RelMovJ(x, y, z, rx, ry, rz, v=cmd_speed, user=user, tool=tool)
+            return response, "RelMovJ"
+
     def move_relative(
         self,
         offsets,
@@ -1564,11 +1576,9 @@ class DobotController:
         wait_poll_interval=0.05,
     ):
         """Relative motion without force control."""
-        if not self.is_connected:
-            logger.error("机器人未连接，无法执行相对移动")
-            return False
-        if not self.is_enabled:
-            logger.error("机器人未使能，无法执行相对移动")
+        result = validate_relative_delta(self, offsets, coord_system=coord_system, motion_type=motion_type, speed=speed)
+        if not result:
+            logger.error("move_relative 校验失败: %s (code=%d)", result.message, result.code)
             return False
 
         offsets = [float(v) for v in list(offsets)[:6]]
@@ -1596,48 +1606,10 @@ class DobotController:
             coord_system, motion_type, offsets, speed, acceleration, cp, r
         )
 
-        if coord_system == "tool":
-            if motion_type == "joint":
-                response = self.dashboard.RelMovJTool(
-                    offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                    a=acceleration, v=speed, cp=cp,
-                    user=self._user_index, tool=self._tool_index,
-                )
-                command_name = "RelMovJTool"
-            else:
-                movl_kwargs = dict(a=acceleration, v=speed)
-                if r > 0:
-                    movl_kwargs['r'] = r
-                else:
-                    movl_kwargs['cp'] = cp
-                movl_kwargs['user'] = self._user_index
-                movl_kwargs['tool'] = self._tool_index
-                response = self.dashboard.RelMovLTool(
-                    offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                    **movl_kwargs
-                )
-                command_name = "RelMovLTool"
-        else:
-            if motion_type == "joint":
-                response = self.dashboard.RelMovJUser(
-                    offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                    a=acceleration, v=speed, cp=cp,
-                    user=self._user_index, tool=self._tool_index,
-                )
-                command_name = "RelMovJUser"
-            else:
-                movl_kwargs = dict(a=acceleration, v=speed)
-                if r > 0:
-                    movl_kwargs['r'] = r
-                else:
-                    movl_kwargs['cp'] = cp
-                movl_kwargs['user'] = self._user_index
-                movl_kwargs['tool'] = self._tool_index
-                response = self.dashboard.RelMovLUser(
-                    offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                    **movl_kwargs
-                )
-                command_name = "RelMovLUser"
+        build_motion_type = 'movl' if motion_type != 'joint' else 'movj'
+        response, command_name = self._build_relative_command(offsets, coord_system, build_motion_type, speed, acceleration, cp, r)
+        if response is None:
+            return False
 
         logger.debug(f"{command_name}响应: {response}")
         response_code = self.parse_response_code(response)
@@ -1673,12 +1645,10 @@ class DobotController:
             If wait=True: bool (success/failure, same as move_relative)
             If wait=False: tuple (response_code, command_id)
         """
-        if not self.is_connected:
-            logger.error("机器人未连接，无法执行相对移动")
-            return (False, None) if not wait else False
-        if not self.is_enabled:
-            logger.error("机器人未使能，无法执行相对移动")
-            return (False, None) if not wait else False
+        result = validate_relative_delta(self, offsets, coord_system=coord_system, motion_type=motion_type, speed=speed)
+        if not result:
+            logger.error("send_relative_command 校验失败: %s (code=%d)", result.message, result.code)
+            return (result.code, None) if not wait else False
 
         offsets = [float(v) for v in list(offsets)[:6]]
         if len(offsets) < 6:
@@ -1696,48 +1666,11 @@ class DobotController:
                 a=acceleration, v=speed, cp=cp
             )
             command_name = "RelJointMovJ"
-        elif coord_system == "tool":
-            if motion_type == "joint":
-                response = self.dashboard.RelMovJTool(
-                    offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                    a=acceleration, v=speed, cp=cp,
-                    user=self._user_index, tool=self._tool_index,
-                )
-                command_name = "RelMovJTool"
-            else:
-                movl_kwargs = dict(a=acceleration, v=speed)
-                if r > 0:
-                    movl_kwargs['r'] = r
-                else:
-                    movl_kwargs['cp'] = cp
-                movl_kwargs['user'] = self._user_index
-                movl_kwargs['tool'] = self._tool_index
-                response = self.dashboard.RelMovLTool(
-                    offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                    **movl_kwargs
-                )
-                command_name = "RelMovLTool"
-        else:  # user
-            if motion_type == "joint":
-                response = self.dashboard.RelMovJUser(
-                    offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                    a=acceleration, v=speed, cp=cp,
-                    user=self._user_index, tool=self._tool_index,
-                )
-                command_name = "RelMovJUser"
-            else:
-                movl_kwargs = dict(a=acceleration, v=speed)
-                if r > 0:
-                    movl_kwargs['r'] = r
-                else:
-                    movl_kwargs['cp'] = cp
-                movl_kwargs['user'] = self._user_index
-                movl_kwargs['tool'] = self._tool_index
-                response = self.dashboard.RelMovLUser(
-                    offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
-                    **movl_kwargs
-                )
-                command_name = "RelMovLUser"
+        else:
+            build_motion_type = 'movl' if motion_type != 'joint' else 'movj'
+            response, command_name = self._build_relative_command(offsets, coord_system, build_motion_type, speed, acceleration, cp, r)
+            if response is None:
+                return (False, None) if not wait else False
 
         logger.debug(f"{command_name}响应: {response}")
         response_code = self.parse_response_code(response)
@@ -1912,81 +1845,59 @@ class DobotController:
         """获取最后收到反馈数据的时间戳"""
         return self.last_feed_time
 
-    def start_modbus(self, port=502):
+    def start_modbus(self, port=502, slave_id=5):
         """启动Modbus TCP服务器"""
         if self.modbus_server and self.modbus_server.is_running():
             logger.info(" Modbus服务已在运行")
             return True
 
-        self.modbus_server = DobotModbusServer(on_command_callback=self._on_modbus_command)
+        self.modbus_server = DobotModbusServer(on_command_callback=self._on_modbus_command, slave_id=slave_id)
         result = self.modbus_server.start(host="0.0.0.0", port=port)
-        if not result:
-            return False
-
-        self._modbus_cycle_count = 0
-        self._modbus_last_duration = 0.0
-        self._modbus_event.clear()
-        self._modbus_thread = threading.Thread(target=self._modbus_cycle_loop, daemon=True)
-        self._modbus_thread.start()
-        return True
+        return result
 
     def stop_modbus(self):
         """停止Modbus TCP服务器"""
-        self._modbus_event.set()
-        if self._modbus_thread and self._modbus_thread.is_alive():
-            self._modbus_thread.join(timeout=1.0)
-        self._modbus_thread = None
         if self.modbus_server:
             self.modbus_server.stop()
             self.modbus_server = None
 
-    def _modbus_cycle_loop(self):
-        """Modbus 200ms 严格周期循环"""
-        while not self._modbus_event.is_set():
-            t_start = time.time()
-            try:
-                if self.modbus_server and self.modbus_server.is_running():
-                    self.modbus_server.check_commands()
-                    self._update_modbus_status()
-            except Exception as e:
-                logger.error(f" Modbus周期异常: {e}")
-
-            self._modbus_last_duration = (time.time() - t_start) * 1000
-            self._modbus_cycle_count += 1
-
-            elapsed = time.time() - t_start
-            wait_time = max(0, 0.2 - elapsed)
-            self._modbus_event.wait(wait_time)
-
     def get_modbus_stats(self):
+        cycle_stats = self.modbus_server.get_cycle_stats() if self.modbus_server else {"cycle_count": 0, "last_duration_ms": 0}
         return {
-            "cycle_count": self._modbus_cycle_count,
-            "last_duration_ms": round(self._modbus_last_duration, 1),
             "is_running": self.modbus_server is not None and self.modbus_server.is_running(),
             "port": self.modbus_server._port if hasattr(self.modbus_server, '_port') else 502,
+            "cycle_count": cycle_stats["cycle_count"],
+            "last_duration_ms": cycle_stats["last_duration_ms"],
         }
 
     def _update_modbus_status(self):
-        """更新Modbus状态寄存器"""
-        if not self.modbus_server or not self.is_connected:
+        """更新Modbus状态寄存器（40001 和 40002）"""
+        if not self.modbus_server:
+            return
+        if not self.is_connected:
             return
 
-        status = self._modbus_status_override or 1
-        if not self.is_enabled:
-            status = self._modbus_status_override or 1
+        # 确定当前模式
+        mode = MODE_AUTO
+        if hasattr(self, '_modbus_mode'):
+            mode = self._modbus_mode
+
+        # 确定当前状态
+        if self._modbus_status_override:
+            status = self._modbus_status_override
+        elif not self.is_enabled:
+            status = STATUS_STANDBY
         else:
             feed_data = self.get_feed_data()
             if feed_data is not None:
                 try:
                     robot_mode = int(feed_data["RobotMode"][0])
-                    if self._modbus_status_override:
-                        status = self._modbus_status_override
-                    elif robot_mode == 7:
-                        status = 2
+                    if robot_mode == 7:
+                        status = STATUS_RUNNING
                     elif robot_mode == 5:
-                        status = 3
+                        status = STATUS_STANDBY
                     elif robot_mode in [9, 11]:
-                        status = 4
+                        status = STATUS_ROBOT_ERR
                         if not self._robot_alarm_recorded:
                             raw_error, error_code = self._read_robot_error_raw()
                             self._last_fault_code = error_code
@@ -1999,61 +1910,49 @@ class DobotController:
                                 raw=f"RobotMode={robot_mode}; {raw_error}",
                             )
                             self._robot_alarm_recorded = True
-                            # 异步获取详细报警信息
                             self._fetch_error_detail_async(robot_mode, error_code, raw_error)
                     elif robot_mode in [2, 3, 4, 6]:
-                        status = 2
+                        status = STATUS_RUNNING
+                    else:
+                        status = STATUS_STANDBY
                     if robot_mode not in [9, 11]:
                         self._robot_alarm_recorded = False
                 except Exception:
-                    status = self._modbus_status_override or 1
+                    status = STATUS_STANDBY
+            else:
+                status = STATUS_STANDBY
 
-        if self.is_connected:
-            try:
-                with self.feed_lock:
-                    if self.feed_data is not None:
-                        tcp_pose = self.feed_data["ToolVectorActual"][0]
-                        x_mm = float(tcp_pose[0])
-                        y_mm = float(tcp_pose[1])
-                        z_mm = float(tcp_pose[2])
-                        pose_valid = True
-                    else:
-                        pose_valid = False
-                if pose_valid:
-                    self.modbus_server.update_status_registers(
-                        status=status,
-                        fault_code=self._last_fault_code,
-                        in_position=1 if status == 3 else 0,
-                        x=x_mm, y=y_mm, z=z_mm,
-                        emergency=1 if status == 5 else 0,
-                    )
-                    return
-            except Exception:
-                pass
+        self.modbus_server.update_status_registers(status=status, mode=mode)
 
-        self.modbus_server.update_status_registers(
-            status=status,
-            fault_code=self._last_fault_code,
-            in_position=1 if status == 3 else 0,
-            x=0, y=0, z=0,
-            emergency=1 if status == 5 else 0,
-        )
+    def _on_modbus_command(self, cmd, mode=0):
+        """Modbus命令回调（底盘工控机协议）"""
+        logger.info("收到Modbus命令: cmd=%d, mode=%d", cmd, mode)
+        if not self.is_connected:
+            logger.info("机械臂未连接，仅记录命令不执行: cmd=%d, mode=%d", cmd, mode)
+            return
+        self._modbus_mode = mode
 
-    def _on_modbus_command(self, cmd):
-        """Modbus命令回调"""
-        logger.info(f" 收到Modbus命令: {cmd}")
-        if cmd == 1:
-            self._modbus_reset()
-        elif cmd == 2:
-            self._modbus_dispatch_motion(self._modbus_go_safe_position, "回安全位")
-        elif cmd == 3:
-            self._modbus_dispatch_motion(self._modbus_auto_hook, "目标运动")
-        elif cmd == 9:
-            self.emergency_stop()
+        if cmd == CMD_STOP:
+            # 中停
+            if mode == MODE_MANUAL:
+                # 手动模式：下线
+                logger.info("手动模式：机器人下线，等候人工干预")
+                self._modbus_status_override = STATUS_STANDBY
+            else:
+                # 自动模式：暂停运动
+                logger.info("自动模式：暂停运动")
+                self._modbus_status_override = STATUS_STANDBY
+        elif cmd == CMD_RESET:
+            # 复位
+            self._modbus_dispatch_motion(self._modbus_reset, "复位")
+        elif cmd == CMD_HOOK:
+            # 提钩
+            if mode == MODE_MANUAL:
+                logger.warning("手动模式下提钩被拒绝")
+                return
+            self._modbus_dispatch_motion(self._modbus_auto_hook, "自动提钩")
         else:
-            logger.warning(f" 未知Modbus命令: {cmd}")
-            self._last_fault_code = int(cmd)
-            self.record_alarm("Modbus命令", cmd, "故障", "收到未知Modbus命令")
+            logger.warning("未知Modbus命令: %d", cmd)
 
     def _modbus_dispatch_motion(self, func, name):
         """Dispatch Modbus motion command to a separate thread."""
@@ -2065,17 +1964,49 @@ class DobotController:
             self._modbus_exec_thread.start()
 
     def _modbus_reset(self):
-        """复位"""
+        """复位：清除故障、使能、移动到待机位，完成后写 40001=2"""
         if not self.is_connected:
             return
+        if not self.acquire_motion("modbus"):
+            logger.warning("流程运行中，Modbus复位被拒绝")
+            self._modbus_status_override = STATUS_HOOK_ERR
+            self.record_alarm("Modbus复位", "BUSY", "故障", "流程运行中，复位被拒绝")
+            if self.modbus_server:
+                self.modbus_server.update_status_registers(status=STATUS_HOOK_ERR, mode=MODE_AUTO)
+            return
         try:
+            self._modbus_status_override = STATUS_RUNNING
+            if self.modbus_server:
+                self.modbus_server.update_status_registers(status=STATUS_RUNNING, mode=getattr(self, '_modbus_mode', MODE_AUTO))
+            # 清除故障
             self.clear_error(auto_enable=True)
             self._modbus_status_override = None
+            self._modbus_hook_status = 0
             self._last_fault_code = 0
+            # 移动到待机位
+            pose = self.initial_pose
+            if pose:
+                success = self.move_to_point(
+                    pose,
+                    move_type="MovJ",
+                    speed_percentage=self.current_speed or 20,
+                    verify_start_pose=False,
+                    verify_end_pose=False,
+                )
+                if not success:
+                    logger.error("复位：移动到待机位失败")
+                    self._modbus_status_override = STATUS_ROBOT_ERR
+                    self.record_alarm("Modbus复位", "MOVE_FAILED", "故障", "移动到待机位失败")
+                else:
+                    # 复位完成，写 40001=2（待机）
+                    self._modbus_status_override = STATUS_STANDBY
+                    logger.info("复位完成，待机位准备好")
         except Exception as e:
-            logger.error(f" Modbus复位失败: {e}")
-            self._last_fault_code = 1
+            logger.error("Modbus复位失败: %s", e)
+            self._modbus_status_override = STATUS_ROBOT_ERR
             self.record_alarm("Modbus复位", "EXCEPTION", "故障", "Modbus复位失败", raw=e)
+        finally:
+            self.release_motion("modbus")
 
     def clear_error(self, auto_enable=True):
         if not self.is_connected:
@@ -2179,7 +2110,7 @@ class DobotController:
             self.record_alarm("软件急停", "ALL_FAILED", "故障", "软件急停独立连接和主连接均失败")
 
         if self.modbus_server:
-            self.modbus_server.update_status_registers(status=5, fault_code=0, in_position=0, emergency=1)
+            self.modbus_server.update_status_registers(status=STATUS_ROBOT_ERR, mode=MODE_AUTO)
 
         self.record_alarm("软件急停", "0", "急停", "软件急停信号已触发", "复位软件急停信号后清除报警并重新使能", "")
         logger.warning("软件急停已触发 (独立连接=%s)", "成功" if direct_ok else "失败")
@@ -2219,7 +2150,7 @@ class DobotController:
         if self._modbus_status_override == 5:
             self._modbus_status_override = None
         if self.modbus_server:
-            self.modbus_server.update_status_registers(status=1, fault_code=self._last_fault_code, in_position=0, emergency=0)
+            self.modbus_server.update_status_registers(status=STATUS_STANDBY, mode=MODE_AUTO)
         logger.info("软件急停信号已解除 (独立连接=%s)", "成功" if direct_ok else "失败")
         return True
 
@@ -2275,87 +2206,100 @@ class DobotController:
 
     def stop_jog(self):
         try:
-            self.dashboard.MoveJog("")
+            if self.dashboard is not None:
+                self.dashboard.MoveJog("")
+                logger.debug("点动停止指令已发送")
+            else:
+                logger.debug("Dashboard未连接，跳过MoveJog停止指令")
         except Exception as e:
-            logger.error(f"❌ 停止点动失败: {e}")
+            logger.error(f"停止点动失败: {e}")
         finally:
-            self.release_motion("jog")
+            # 仅在运动控制权属于 jog 时释放，避免重复释放警告
+            if self._motion_owner == "jog":
+                self.release_motion("jog")
         return True
 
-    def _modbus_go_safe_position(self):
-        """回安全位"""
-        if not self.is_connected:
-            return
-        if not self.acquire_motion("modbus"):
-            logger.warning("流程运行中，Modbus回安全位被拒绝")
-            self._modbus_status_override = 4
-            self._last_fault_code = 2
-            self.record_alarm("Modbus回安全位", "BUSY", "故障", "流程运行中，回安全位被拒绝")
-            if self.modbus_server:
-                self.modbus_server.update_status_registers(status=4, fault_code=2, in_position=0, emergency=0)
-            return
-        try:
-            self._modbus_status_override = 2
-            pose = self.initial_pose
-            success = self.move_to_point(
-                pose,
-                move_type="MovJ",
-                speed_percentage=self.current_speed or 20,
-                verify_start_pose=False,
-                verify_end_pose=False,
-            )
-            if not success:
-                self._modbus_status_override = 4
-                self._last_fault_code = 2
-                self.record_alarm("Modbus回安全位", "REJECTED", "故障", "回安全位指令被拒绝或超时")
-            else:
-                self._modbus_status_override = None
-        except Exception as e:
-            logger.error(f" Modbus回安全位失败: {e}")
-            self._modbus_status_override = 4
-            self._last_fault_code = 2
-            self.record_alarm("Modbus回安全位", "EXCEPTION", "故障", "Modbus回安全位执行异常", raw=e)
-        finally:
-            self.release_motion("modbus")
     def _modbus_auto_hook(self):
-        """执行外部主站写入的目标位姿"""
+        """执行自动提钩控制流程（状态机：3→4→5 或 3→4→110）"""
         if not self.is_connected:
             return
         if not self.acquire_motion("modbus"):
-            logger.warning("流程运行中，Modbus目标运动被拒绝")
-            self._modbus_status_override = 4
-            self._last_fault_code = 3
-            self.record_alarm("Modbus目标运动", "BUSY", "故障", "流程运行中，目标运动被拒绝")
+            logger.warning("流程运行中，自动提钩被拒绝")
+            self._modbus_status_override = STATUS_HOOK_ERR
+            self.record_alarm("Modbus提钩", "BUSY", "故障", "流程运行中，提钩被拒绝")
             if self.modbus_server:
-                self.modbus_server.update_status_registers(status=4, fault_code=3, in_position=0, emergency=0)
-            return
-        target = self.modbus_server.get_target_position() if self.modbus_server else None
-        if not target:
-            self.release_motion("modbus")
+                self.modbus_server.update_status_registers(status=STATUS_HOOK_ERR, mode=MODE_AUTO)
             return
         try:
-            speed = int(target.get("speed", 30))
-            speed = min(max(speed, 1), 100)
-            self._modbus_status_override = 2
-            target_pose = [target["x"], target["y"], target["z"], target["rx"], target.get("ry", 0.0), target.get("rz", 0.0)]
+            # 从 config.json 读取提钩目标
+            target = get_hook_target()
+            speed_mm_s = float(target.get("speed_mm_s", 50.0))
+            speed_mm_s = min(max(speed_mm_s, 1.0), 1000.0)
+            speed_pct = min(int(speed_mm_s / 10.0), 100)
+            speed_pct = max(speed_pct, 1)
+
+            target_pose = [
+                target.get("x", 0.0),
+                target.get("y", 0.0),
+                target.get("z", 0.0),
+                target.get("rx", 0.0),
+                target.get("ry", 0.0),
+                target.get("rz", 0.0),
+            ]
+
+            # 运动安全校验
+            result = validate_absolute_pose(self, target_pose)
+            if not result:
+                logger.error("提钩目标校验失败: %s (code=%d)", result.message, result.code)
+                self._modbus_hook_status = 3
+                self._modbus_status_override = STATUS_HOOK_ERR
+                self.record_alarm("Modbus提钩", str(result.code), "故障", f"提钩目标校验失败: {result.message}")
+                if self.modbus_server:
+                    self.modbus_server.update_status_registers(status=STATUS_HOOK_ERR, mode=MODE_AUTO)
+                return
+
+            # 设置状态：运行中 (40001=4)
+            self._modbus_hook_status = 1
+            self._modbus_status_override = STATUS_RUNNING
+            if self.modbus_server:
+                self.modbus_server.update_status_registers(status=STATUS_RUNNING, mode=MODE_AUTO)
+
+            # 执行运动到目标位姿
             success = self.move_to_point(
                 target_pose,
                 move_type="MovJ",
-                speed_percentage=speed,
+                speed_percentage=speed_pct,
                 verify_start_pose=False,
                 verify_end_pose=False,
             )
+
             if not success:
-                self._modbus_status_override = 4
-                self._last_fault_code = 3
-                self.record_alarm("Modbus目标运动", "REJECTED", "故障", "目标运动指令被拒绝或超时")
+                # 提钩失败 (40001=110)
+                self._modbus_hook_status = 3
+                self._modbus_status_override = STATUS_HOOK_ERR
+                self.record_alarm("Modbus提钩", "REJECTED", "故障", "提钩运动指令被拒绝或超时")
+                if self.modbus_server:
+                    self.modbus_server.update_status_registers(status=STATUS_HOOK_ERR, mode=MODE_AUTO)
             else:
-                self._modbus_status_override = None
+                # 提钩OK (40001=5)
+                self._modbus_hook_status = 2
+                self._modbus_status_override = STATUS_HOOK_OK
+                self._last_fault_code = 0
+                if self.modbus_server:
+                    self.modbus_server.update_status_registers(status=STATUS_HOOK_OK, mode=MODE_AUTO)
+                logger.info("自动提钩流程完成")
+                # 自动复位等待下次动作
+                time.sleep(0.5)
+                self._modbus_status_override = STATUS_STANDBY
+                if self.modbus_server:
+                    self.modbus_server.update_status_registers(status=STATUS_STANDBY, mode=MODE_AUTO)
         except Exception as e:
-            logger.error(f" Modbus目标运动失败: {e}")
-            self._modbus_status_override = 4
-            self._last_fault_code = 3
-            self.record_alarm("Modbus目标运动", "EXCEPTION", "故障", "目标运动执行异常", raw=e)
+            logger.error("自动提钩失败: %s", e)
+            self._modbus_hook_status = 3
+            self._modbus_status_override = STATUS_HOOK_ERR
+            self.record_alarm("Modbus提钩", "EXCEPTION", "故障", "提钩执行异常", raw=e)
+            if self.modbus_server:
+                self.modbus_server.update_status_registers(status=STATUS_HOOK_ERR, mode=MODE_AUTO)
         finally:
             self.release_motion("modbus")
 

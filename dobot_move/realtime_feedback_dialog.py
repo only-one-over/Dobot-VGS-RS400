@@ -3,12 +3,12 @@ import threading
 import time
 
 import numpy as np
-from qt_compat import (
+from .qt_compat import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QScrollArea, QWidget, QGroupBox, QGridLayout,
     QTimer, Qt, QFont,
 )
-from dobot_api import DobotApiFeedBack
+from .dobot_api import DobotApiFeedBack
 
 logger = logging.getLogger(__name__)
 

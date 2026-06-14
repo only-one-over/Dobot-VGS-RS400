@@ -13,13 +13,14 @@ except ImportError:
 import os
 import logging
 import time
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
-from config_manager import load_config, get_calibration, get_camera_handeye_matrix
+from .config_manager import load_config, get_calibration, get_camera_handeye_matrix
 
 
 
-from transform_utils import euler2rot as _euler2rot, pose2matrix as _pose2matrix
+from .transform_utils import euler2rot as _euler2rot, pose2matrix as _pose2matrix
 
 try:
     import dobot_core
@@ -27,15 +28,24 @@ try:
 except ImportError:
     DOBOT_CORE_AVAILABLE = False
 
-from tracker import BYTETracker, STrack
-from kalman_filter_3d import KalmanFilter3D
-from depth_processor import DepthProcessor
+from .tracker import BYTETracker, STrack
+from .kalman_filter_3d import KalmanFilter3D
+from .depth_processor import DepthProcessor
+
+
+@dataclass
+class FramePacket:
+    """线程安全的帧数据包，不持有 pyrealsense2 frame 对象"""
+    seq: int
+    timestamp: float
+    color_image: object  # numpy ndarray
+    depth_image: object  # numpy ndarray
+
 
 DEFAULT_PERFORMANCE_CONFIG = {
     "capture_timeout_ms": 300,
     "camera_test_detection_fps": 10,
     "camera_test_display_fps": 10,
-    "low_fps_detection_fps": 5,
     "performance_log_interval_frames": 30,
 }
 
@@ -61,16 +71,21 @@ class VisionSystem:
         )
         self._perf_stats = {}
         self.camera_available = False
+        self._consecutive_capture_failures = 0
+        self._max_consecutive_failures = 5
         self.pipeline = None
         self.profile = None
         self.depth_scale = 0.001
+        # 深度范围：优先从配置读取，无配置时使用默认值
+        depth_range_config = config.get("camera", {}).get("depth_range", {})
         if camera_type == "D405":
-            self.min_depth = 0.07
-            self.max_depth = 0.8
+            self.min_depth = float(depth_range_config.get("D405_min_depth", 0.07))
+            self.max_depth = float(depth_range_config.get("D405_max_depth", 0.8))
         else:
-            self.min_depth = 0.5
-            self.max_depth = 2.2
+            self.min_depth = float(depth_range_config.get("D435i_min_depth", 0.5))
+            self.max_depth = float(depth_range_config.get("D435i_max_depth", 2.2))
         self.session = None
+        self.inference_provider = "未检测"
         self.input_name = None
         self.input_shape = None
         self.class_names = ["hook"]
@@ -134,29 +149,40 @@ class VisionSystem:
         self.model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.onnx")
         logger.debug(f"模型路径: {self.model_path}, 文件存在: {os.path.exists(self.model_path)}")
 
-        # 创建ONNX Runtime session
+        # 创建ONNX Runtime session（优先GPU，回退CPU）
         import onnxruntime as ort
+        # 预加载 CUDA/cuDNN DLL（onnxruntime-gpu[cuda,cudnn] 安装到 nvidia/ site-packages 子目录）
+        if hasattr(ort, 'preload_dlls'):
+            ort.preload_dlls(directory="")
         available_providers = ort.get_available_providers()
-        if 'CUDAExecutionProvider' not in available_providers:
-            raise RuntimeError(
-                "CUDA 不可用！本项目需要 NVIDIA GPU + CUDA + onnxruntime-gpu。\n"
-                "请安装: pip uninstall onnxruntime && pip install onnxruntime-gpu\n"
-                f"当前可用 providers: {available_providers}"
+        self.inference_provider = "CPU"
+
+        if 'CUDAExecutionProvider' in available_providers:
+            self.session = ort.InferenceSession(self.model_path, providers=['CUDAExecutionProvider'])
+            active_providers = self.session.get_providers()
+            if 'CUDAExecutionProvider' in active_providers:
+                self.inference_provider = "GPU (CUDA)"
+                logger.info("实例分割模型加载成功（GPU CUDA 模式）")
+            else:
+                self.inference_provider = "CPU (CUDA回退)"
+                logger.warning(
+                    f"CUDAExecutionProvider 注册但未激活，已回退 CPU。活跃 providers: {active_providers}\n"
+                    "请检查 CUDA 安装和 onnxruntime-gpu 版本兼容性"
+                )
+        else:
+            self.session = ort.InferenceSession(self.model_path, providers=['CPUExecutionProvider'])
+            self.inference_provider = "CPU"
+            logger.warning(
+                f"CUDA 不可用，使用 CPU 推理。当前可用 providers: {available_providers}\n"
+                "如需 GPU 加速，请安装: pip uninstall onnxruntime && pip install onnxruntime-gpu"
             )
-        self.session = ort.InferenceSession(self.model_path, providers=['CUDAExecutionProvider'])
-        # Verify CUDA is actually being used
-        active_providers = self.session.get_providers()
-        if 'CUDAExecutionProvider' not in active_providers:
-            raise RuntimeError(
-                f"CUDAExecutionProvider 未激活！活跃 providers: {active_providers}\n"
-                "请检查 CUDA 安装和 onnxruntime-gpu 版本兼容性"
-            )
-        logger.info("实例分割模型加载成功（CUDA模式）")
 
         # 获取模型输入输出信息
         self.input_name = self.session.get_inputs()[0].name
         self.input_shape = self.session.get_inputs()[0].shape
         logger.debug(f"模型输入: {self.input_name}, 形状: {self.input_shape}")
+
+        self.warmup_onnx()
 
         output_infos = self.session.get_outputs()
         self.model_format = "yolov8"  # 默认格式
@@ -215,6 +241,17 @@ class VisionSystem:
             self.depth_processor = None
 
         self.last_valid_position = None
+
+    def warmup_onnx(self):
+        """ONNX session warmup：运行一次 dummy inference 消除 CUDA JIT 延迟"""
+        if self.session is None:
+            return
+        try:
+            dummy_input = np.zeros((1, 3, self.input_shape[2], self.input_shape[3]), dtype=np.float32)
+            self.session.run(None, {self.input_name: dummy_input})
+            logger.info("ONNX warmup 完成 (%s)", self.inference_provider)
+        except Exception as e:
+            logger.debug("ONNX warmup 跳过: %s", e)
 
     def _record_performance(self, scope, timings):
         stats = self._perf_stats.setdefault(
@@ -344,7 +381,7 @@ class VisionSystem:
             logger.debug("no detection for position calculation")
             return None
 
-        depth_image = np.asanyarray(depth_frame.get_data())
+        depth_image = depth_frame if isinstance(depth_frame, np.ndarray) else np.asanyarray(depth_frame.get_data())
         det = detections[0]
         mask = det.get('mask')
 
@@ -504,7 +541,10 @@ class VisionSystem:
         捕获一帧深度和彩色图像
         """
         if not self.pipeline:
-            logger.error("❌ 相机不可用，无法捕获帧")
+            logger.warning("相机不可用，无法捕获帧")
+            self._consecutive_capture_failures += 1
+            if self._consecutive_capture_failures >= self._max_consecutive_failures:
+                self.camera_available = False
             return None, None
         
         try:
@@ -517,6 +557,10 @@ class VisionSystem:
             color_frame = aligned_frames.get_color_frame()
 
             if not depth_frame or not color_frame:
+                self._consecutive_capture_failures += 1
+                if self._consecutive_capture_failures >= self._max_consecutive_failures:
+                    self.camera_available = False
+                    logger.warning("连续 %d 次捕获帧失败，标记相机不可用", self._consecutive_capture_failures)
                 return None, None
 
             if self.depth_processor is not None:
@@ -532,10 +576,32 @@ class VisionSystem:
                 },
             )
 
+            self._consecutive_capture_failures = 0
+
             return depth_frame, color_frame
         except Exception as e:
-            logger.debug(f"❌ 捕获帧失败: {e}")
+            self._consecutive_capture_failures += 1
+            if self._consecutive_capture_failures >= self._max_consecutive_failures:
+                self.camera_available = False
+            logger.warning("捕获帧失败: %s", e)
             return None, None
+
+    def capture_numpy_packet(self, seq):
+        """采集帧并转为 numpy 副本，返回 FramePacket（线程安全，不持有 pyrealsense2 frame）"""
+        depth_frame, color_frame = self.capture_frames()
+        if depth_frame is None or color_frame is None:
+            return None
+        return FramePacket(
+            seq=seq,
+            timestamp=time.time(),
+            color_image=np.asanyarray(color_frame.get_data()).copy(),
+            depth_image=np.asanyarray(depth_frame.get_data()).copy(),
+        )
+
+    @property
+    def is_available(self):
+        """相机是否可用（已连接且 pipeline 存在）"""
+        return self.camera_available and self.pipeline is not None
 
     def preprocess_image_yolov8(self, image, target_size=(640, 640)):
         """为YOLOv8模型预处理图像"""
@@ -1067,3 +1133,5 @@ class VisionSystem:
                 logger.info("✅ 相机已关闭")
             except Exception as e:
                 logger.error(f"❌ 关闭相机失败: {e}")
+            self.camera_available = False
+            self.pipeline = None

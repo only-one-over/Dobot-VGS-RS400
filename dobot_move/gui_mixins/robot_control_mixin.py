@@ -1,9 +1,7 @@
-import math
+from ..qt_compat import QMessageBox, QTimer
 
-from qt_compat import QMessageBox, QTimer
-
-from config_manager import ConfigService
-from workers import RobotCmdThread
+from ..config_manager import ConfigService
+from ..workers import RobotCmdThread
 
 
 class RobotControlMixin:
@@ -119,42 +117,14 @@ class RobotControlMixin:
         else:
             QMessageBox.critical(self, "错误", "获取位置失败")
 
-    def update_torque_data(self, data):
-        if data is None:
-            return
-        try:
-            tcp_force = data["ActualTCPForce"][0]
-            fx = float(tcp_force[0])
-            fy = float(tcp_force[1])
-            fz = float(tcp_force[2])
-            resultant = math.sqrt(fx*fx + fy*fy + fz*fz)
-            self.torque_label.setText(f"力矩: Fx:{fx:.2f}N Fy:{fy:.2f}N Fz:{fz:.2f}N 合力:{resultant:.2f}N")
-
-            if hasattr(data, 'get'):
-                i_actual = data.get("IActual")
-                if i_actual is not None and len(i_actual) > 0:
-                    current_values = i_actual[0]
-                    if len(current_values) >= 6:
-                        self.torque_joint1_label.setText(f"关节1: {float(current_values[0]):.2f} A")
-                        self.torque_joint2_label.setText(f"关节2: {float(current_values[1]):.2f} A")
-                        self.torque_joint3_label.setText(f"关节3: {float(current_values[2]):.2f} A")
-                        self.torque_joint4_label.setText(f"关节4: {float(current_values[3]):.2f} A")
-                        self.torque_joint5_label.setText(f"关节5: {float(current_values[4]):.2f} A")
-                        self.torque_joint6_label.setText(f"关节6: {float(current_values[5]):.2f} A")
-
-        except Exception as e:
-            print(f"更新力矩数据失败: {e}")
-            pass
-
     def start_monitor_threads(self):
-        self._torque_timer = QTimer()
-        self._torque_timer.timeout.connect(self._read_torque_from_controller)
-        self._torque_timer.start(200)
+        self._pose_monitor_timer = QTimer()
+        self._pose_monitor_timer.timeout.connect(self._update_pose_display)
+        self._pose_monitor_timer.start(200)
 
-    def _read_torque_from_controller(self):
+    def _update_pose_display(self):
         data = self.controller.get_feed_data()
         if data is not None:
-            self.update_torque_data(data)
             try:
                 tool_vector = data.get("ToolVectorActual")
                 if tool_vector is not None and len(tool_vector) > 0:
@@ -181,5 +151,5 @@ class RobotControlMixin:
                 pass
 
     def stop_monitor_threads(self):
-        if hasattr(self, '_torque_timer') and self._torque_timer:
-            self._torque_timer.stop()
+        if hasattr(self, '_pose_monitor_timer') and self._pose_monitor_timer:
+            self._pose_monitor_timer.stop()

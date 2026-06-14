@@ -32,6 +32,8 @@ from typing import Optional
 
 import numpy as np
 
+from .motion_safety import validate_servo_p_params
+
 logger = logging.getLogger(__name__)
 
 
@@ -128,6 +130,7 @@ class VisionThread:
         self._reuse_count = 0          # 连续复用帧计数
         self._last_target = None       # 上一帧 YOLO 检测结果
         self._last_confidence = 0.0    # 上一帧置信度
+        self.target_lost = False       # 相机断线等导致目标丢失标志
         # 耗时统计
         self.last_capture_ms = 0.0
         self.last_detect_ms = 0.0
@@ -176,6 +179,12 @@ class VisionThread:
 
     def _loop(self):
         while self._running:
+            # ── 0. 相机断线检测 ──
+            if not self.vision.is_available:
+                logger.warning("相机不可用，退出视觉采集线程")
+                self.target_lost = True
+                break
+
             t_start = time.monotonic()
 
             # ── 1. 捕获帧 ──
@@ -270,17 +279,21 @@ class ServoThread:
     """
 
     def __init__(self, vision, controller, target_cache: TargetCache,
-                 servo_period=0.08,
-                 servo_p_t=0.08,
+                 servo_period=0.06,
+                 servo_p_t=None,
                  servo_p_aheadtime=50,
                  servo_p_gain=500,
-                 gain_far=0.6, gain_mid=0.4, gain_near=0.2,
+                 gain_far=0.8, gain_mid=0.5, gain_near=0.2,
                  threshold_far=50.0, threshold_mid=10.0,
                  converge_threshold=3.0,
                  max_target_age=0.3,
                  max_pose_age=0.1,
                  max_error_mm=300.0,
                  z_safety_limit=0.0,
+                 max_step_far=35.0,
+                 max_step_mid=18.0,
+                 max_step_near=6.0,
+                 max_step_fine=2.0,
                  enable_feedforward=False,
                  max_iterations=60,
                  stop_on_converge=False):
@@ -289,6 +302,8 @@ class ServoThread:
         self.target_cache = target_cache
         self.servo_period = servo_period
         self.servo_p_t = servo_p_t
+        if self.servo_p_t is None:
+            self.servo_p_t = self.servo_period
         self.servo_p_aheadtime = servo_p_aheadtime
         self.servo_p_gain = servo_p_gain
         self.gain_far = gain_far
@@ -301,6 +316,10 @@ class ServoThread:
         self.max_pose_age = max_pose_age
         self.max_error_mm = max_error_mm
         self.z_safety_limit = z_safety_limit
+        self.max_step_far = max_step_far
+        self.max_step_mid = max_step_mid
+        self.max_step_near = max_step_near
+        self.max_step_fine = max_step_fine
         self.enable_feedforward = enable_feedforward
         self.max_iterations = max_iterations
         self.stop_on_converge = stop_on_converge
@@ -325,6 +344,9 @@ class ServoThread:
         self.last_servo_ms = 0.0
         self.last_total_ms = 0.0
         self.last_hz = 0.0
+        self.avg_servo_ms = 0.0
+        self.skip_frame_count = 0
+        self._servo_ms_history = []  # sliding window for avg_servo_ms
 
     def start(self):
         if self._running:
@@ -364,14 +386,14 @@ class ServoThread:
             return self.gain_near
 
     def _adaptive_max_step(self, error_mm):
-        if error_mm > 80:
-            return 20.0
-        elif error_mm > 30:
-            return 10.0
-        elif error_mm > 10:
-            return 5.0
+        if error_mm > self.threshold_far:
+            return self.max_step_far
+        elif error_mm > self.threshold_mid:
+            return self.max_step_mid
+        elif error_mm > self.converge_threshold:
+            return self.max_step_near
         else:
-            return 1.5
+            return self.max_step_fine
 
     def _safety_clamp(self, cmd_pos, current_pos, max_step):
         cmd_pos = np.array(cmd_pos, dtype=np.float64)
@@ -476,11 +498,14 @@ class ServoThread:
                     " ✅ 收敛成功! 误差=%.1fmm, 迭代=%d", error_mm, iteration,
                 )
                 # 收敛后 hold 当前位姿，避免 ServoP 队列残留导致末端继续小动
+                clamped_t, clamped_aheadtime, clamped_gain = validate_servo_p_params(
+                    self.servo_p_t, self.servo_p_aheadtime, self.servo_p_gain, self.servo_period,
+                )
                 self.controller.servo_p(
                     list(current_pose[:6]),
-                    t=self.servo_p_t,
-                    aheadtime=self.servo_p_aheadtime,
-                    gain=self.servo_p_gain,
+                    t=clamped_t,
+                    aheadtime=clamped_aheadtime,
+                    gain=clamped_gain,
                 )
                 if self.stop_on_converge:
                     # 可选：发送 Stop() 清空运动队列
@@ -521,17 +546,21 @@ class ServoThread:
                     " 伺服降频跳帧: last_servo_ms=%.1fms > period=%.1fms",
                     self.last_servo_ms, self.servo_period * 1000,
                 )
+                self.skip_frame_count += 1
                 self._sleep_to_next(t_iter_start)
                 continue
 
             # ── 7. 下发 ServoP ──
             # ServoP 仍是队列指令，返回成功只表示发送成功，不表示运动完成
             t0 = time.monotonic()
+            clamped_t, clamped_aheadtime, clamped_gain = validate_servo_p_params(
+                self.servo_p_t, self.servo_p_aheadtime, self.servo_p_gain, self.servo_period,
+            )
             success = self.controller.servo_p(
                 cmd_pose,
-                t=self.servo_p_t,
-                aheadtime=self.servo_p_aheadtime,
-                gain=self.servo_p_gain,
+                t=clamped_t,
+                aheadtime=clamped_aheadtime,
+                gain=clamped_gain,
             )
             self.last_servo_ms = (time.monotonic() - t0) * 1000
 
@@ -547,6 +576,12 @@ class ServoThread:
                 continue
 
             self._consecutive_servo_fail = 0  # Reset on success
+
+            # Update avg_servo_ms (sliding window of last 20)
+            self._servo_ms_history.append(self.last_servo_ms)
+            if len(self._servo_ms_history) > 20:
+                self._servo_ms_history.pop(0)
+            self.avg_servo_ms = sum(self._servo_ms_history) / len(self._servo_ms_history)
 
             iteration += 1
             self.iterations = iteration
@@ -619,12 +654,12 @@ class VisualServoController:
 
     def __init__(self, vision, controller,
                  # ServoP 参数
-                 servo_period=0.08,
-                 servo_p_t=0.08,
+                 servo_period=None,
+                 servo_p_t=None,
                  servo_p_aheadtime=50,
                  servo_p_gain=500,
                  # 增益
-                 gain_far=0.6, gain_mid=0.4, gain_near=0.2,
+                 gain_far=None, gain_mid=None, gain_near=None,
                  threshold_far=50.0, threshold_mid=10.0,
                  # 收敛
                  converge_threshold=3.0,
@@ -637,11 +672,18 @@ class VisualServoController:
                  # 前馈
                  enable_feedforward=False,
                  # YOLO 频率
-                 yolo_every_n=3,
+                 yolo_every_n=None,
                  # 收敛后行为
-                 stop_on_converge=False):
+                 stop_on_converge=None,
+                 # 自适应步长
+                 max_step_far=None,
+                 max_step_mid=None,
+                 max_step_near=None,
+                 max_step_fine=None):
         self.vision = vision
         self.controller = controller
+
+        _vs_defaults = get_visual_servo_config()
 
         # 共享目标缓存
         self.target_cache = TargetCache()
@@ -651,28 +693,36 @@ class VisualServoController:
             vision=vision,
             controller=controller,
             target_cache=self.target_cache,
-            yolo_every_n=yolo_every_n,
+            yolo_every_n=yolo_every_n if yolo_every_n is not None else _vs_defaults.get("yolo_every_n", 3),
         )
 
         # 伺服线程 (需要 vision 做 base 坐标转换)
+        _servo_period = servo_period if servo_period is not None else _vs_defaults.get("servo_period", 0.06)
+        effective_t = servo_p_t if servo_p_t is not None else _servo_period
         self.servo_thread = ServoThread(
             vision=vision,
             controller=controller,
             target_cache=self.target_cache,
-            servo_period=servo_period,
-            servo_p_t=servo_p_t,
+            servo_period=_servo_period,
+            servo_p_t=effective_t,
             servo_p_aheadtime=servo_p_aheadtime,
             servo_p_gain=servo_p_gain,
-            gain_far=gain_far, gain_mid=gain_mid, gain_near=gain_near,
+            gain_far=gain_far if gain_far is not None else _vs_defaults.get("gain_far", 0.8),
+            gain_mid=gain_mid if gain_mid is not None else _vs_defaults.get("gain_mid", 0.5),
+            gain_near=gain_near if gain_near is not None else _vs_defaults.get("gain_near", 0.2),
             threshold_far=threshold_far, threshold_mid=threshold_mid,
             converge_threshold=converge_threshold,
             max_target_age=max_target_age,
             max_pose_age=max_pose_age,
             max_error_mm=max_error_mm,
             z_safety_limit=z_safety_limit,
+            max_step_far=max_step_far if max_step_far is not None else _vs_defaults.get("max_step_far", 35.0),
+            max_step_mid=max_step_mid if max_step_mid is not None else _vs_defaults.get("max_step_mid", 18.0),
+            max_step_near=max_step_near if max_step_near is not None else _vs_defaults.get("max_step_near", 6.0),
+            max_step_fine=max_step_fine if max_step_fine is not None else _vs_defaults.get("max_step_fine", 2.0),
             enable_feedforward=enable_feedforward,
             max_iterations=max_iterations,
-            stop_on_converge=stop_on_converge,
+            stop_on_converge=stop_on_converge if stop_on_converge is not None else _vs_defaults.get("stop_on_converge", False),
         )
 
     def servo_to_target(self, log_callback=None):
@@ -731,7 +781,7 @@ class VisualServoController:
             "  VisionThread: capture=%.1fms detect=%.1fms depth=%.1fms "
             "end_convert=%.1fms total=%.1fms\n"
             "  ServoThread: read_pose=%.1fms base_convert=%.1fms "
-            "servo=%.1fms total=%.1fms hz=%.1f",
+            "servo=%.1fms total=%.1fms hz=%.1f avg_servo=%.1fms skip=%d",
             success, final_error, iterations,
             self.vision_thread.last_capture_ms,
             self.vision_thread.last_detect_ms,
@@ -743,6 +793,8 @@ class VisualServoController:
             self.servo_thread.last_servo_ms,
             self.servo_thread.last_total_ms,
             self.servo_thread.last_hz,
+            self.servo_thread.avg_servo_ms,
+            self.servo_thread.skip_frame_count,
         )
 
         if log_callback:

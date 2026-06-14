@@ -1,22 +1,8 @@
-PySide6>=6.0
-numpy
-requests
-pymodbus>=3.0
-opencv-python
-onnxruntime-gpu
-scipy
-pyrealsense2
-minimalmodbus
-pyserial             # 夹爪控制器串口通信
-python-can
-lapx
-
-# === 可选：GPU 加速 ===
-# 如需 CUDA 加速 YOLO 推理，先卸载 onnxruntime 再安装：
-#   pip uninstall onnxruntime
-#   pip install onnxruntime-gpu
-# 要求：NVIDIA GPU + CUDA Toolkit
+# 默认聚合入口 — 安装基础依赖 + GPU 推理依赖
+# 用法：pip install -r requirements.txt
+-r requirements-base.txt
+-r requirements-gpu-cu12.txt
 
 # === 可选：C++ 加速模块 ===
-# pip install pybind11 cmake
+# pip install -r requirements-cpp.txt
 # python build_cpp.py

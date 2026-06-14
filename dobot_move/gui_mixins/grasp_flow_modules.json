@@ -9,20 +9,112 @@
     }
   },
   {
-    "type": "camera",
-    "name": "识别物体并计算坐标",
+    "type": "move",
+    "name": "直线运动到目标",
     "params": {
-      "camera_type": "D435i"
+      "target": "saved_point",
+      "motion_type": "MovL",
+      "speed": 30,
+      "point_name": "p1"
     }
   },
   {
     "type": "move",
     "name": "直线运动到目标",
     "params": {
-      "target": "camera_detected",
+      "target": "saved_point",
       "motion_type": "MovL",
       "speed": 30,
-      "point_name": "d435i"
+      "point_name": "p2"
+    }
+  },
+  {
+    "type": "move",
+    "name": "直线运动到目标",
+    "params": {
+      "target": "saved_point",
+      "motion_type": "MovL",
+      "speed": 30,
+      "point_name": "p3"
+    }
+  },
+  {
+    "type": "move",
+    "name": "直线运动到目标",
+    "params": {
+      "target": "saved_point",
+      "motion_type": "MovL",
+      "speed": 30,
+      "point_name": "p4"
+    }
+  },
+  {
+    "type": "relative_path",
+    "name": "连续相对路径",
+    "params": {
+      "coord_system": "user",
+      "motion_type": "linear",
+      "speed": 30,
+      "acceleration": 30,
+      "cp": 0,
+      "execution_mode": "queued",
+      "segments": [
+        {
+          "enabled": true,
+          "name": "段1",
+          "x": 0.0,
+          "y": 40.0,
+          "z": 0.0,
+          "rx": 0.0,
+          "ry": 0.0,
+          "rz": 0.0,
+          "wait_after": true
+        },
+        {
+          "enabled": true,
+          "name": "段2",
+          "x": 0.0,
+          "y": 0.0,
+          "z": 65.0,
+          "rx": 0.0,
+          "ry": 0.0,
+          "rz": 0.0,
+          "wait_after": true
+        },
+        {
+          "enabled": true,
+          "name": "段3",
+          "x": 0.0,
+          "y": 70.0,
+          "z": 0.0,
+          "rx": 5.0,
+          "ry": 0.0,
+          "rz": 0.0,
+          "wait_after": true
+        },
+        {
+          "enabled": true,
+          "name": "段4",
+          "x": 0.0,
+          "y": 50.0,
+          "z": 60.0,
+          "rx": 15.0,
+          "ry": 0.0,
+          "rz": 0.0,
+          "wait_after": true
+        },
+        {
+          "enabled": true,
+          "name": "段5",
+          "x": 200.0,
+          "y": 0.0,
+          "z": 0.0,
+          "rx": 0.0,
+          "ry": 0.0,
+          "rz": 0.0,
+          "wait_after": true
+        }
+      ]
     }
   }
 ]

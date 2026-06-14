@@ -1,10 +1,10 @@
-from qt_compat import (
+from ..qt_compat import (
     Qt,
     QMessageBox, QInputDialog, QDoubleSpinBox, QCheckBox,
     QComboBox, QTableWidgetItem, QHBoxLayout, QWidget,
 )
 
-from config_manager import (
+from ..config_manager import (
     get_points, get_point, add_point, delete_point, resolve_point,
     ConfigService,
 )

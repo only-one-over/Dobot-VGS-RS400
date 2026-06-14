@@ -1,10 +1,10 @@
 import json
 import os
 
-from qt_compat import QMessageBox, QTableWidgetItem
+from ..qt_compat import QMessageBox, QTableWidgetItem
 
-from config_manager import get_grasp_flow_file
-from flow_step_list import STATUS_COMPLETED, STATUS_FAILED, STATUS_RUNNING
+from ..config_manager import get_grasp_flow_file
+from ..flow_step_list import STATUS_COMPLETED, STATUS_FAILED, STATUS_RUNNING
 
 
 class GraspFlowMixin:
@@ -400,7 +400,7 @@ class GraspFlowMixin:
         self._is_paused_ref = [False]
         self._normalize_flow_modules()
 
-        from workers import validate_grasp_flow_modules
+        from ..workers import validate_grasp_flow_modules
 
         errors = validate_grasp_flow_modules(self.grasp_flow_modules)
         if errors:
@@ -411,7 +411,7 @@ class GraspFlowMixin:
                 self._refresh_action_states()
             return
 
-        from workers import FlowThread
+        from ..workers import FlowThread
 
         self._flow_thread = FlowThread(
             self.controller,

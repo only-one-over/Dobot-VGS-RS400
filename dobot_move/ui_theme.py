@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from qt_compat import QColor, QPalette
+from .qt_compat import QColor, QPalette
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +33,6 @@ NAV_ICONS = {
     "主功能":    "\u2302",
     "运动编辑":  "\u27F3",
     "点位管理":  "\u25CE",
-    "机器人力控": "\u2388",
     "Modbus 通信": "\u229E",
     "报警记录":  "\u26A0",
     "点动控制":  "\u2725",

@@ -1,45 +1,30 @@
-from qt_compat import QMessageBox, QPixmap
+import logging
 
-from ui_theme import apply_status_visual
+from ..qt_compat import QMessageBox, QPixmap
+
+from ..ui_theme import apply_status_visual
+
+_logger = logging.getLogger(__name__)
 
 try:
     import pyrealsense2 as rs
 except ImportError:
     rs = None
 
-_missing_deps = []
 try:
-    import cv2
+    from ..vision_system import VisionSystem as _VisionSystem
+    VISION_AVAILABLE = True
+    VisionSystem = _VisionSystem
 except ImportError:
-    cv2 = None
-    _missing_deps.append(("opencv-python", "pip install opencv-python"))
-
-try:
-    import onnxruntime as ort
-except ImportError:
-    ort = None
-    _missing_deps.append(("onnxruntime", "pip install onnxruntime"))
-
-if _missing_deps:
+    _logger.warning("VisionSystem 不可用，视觉依赖未安装")
     VISION_AVAILABLE = False
-    rs = None
-    cv2 = None
+
     class VisionSystem:
-        def __init__(self):
-            raise Exception("视觉系统不可用，缺少依赖: " + ", ".join(d[0] for d in _missing_deps))
+        """VisionSystem stub when vision dependencies are not available."""
+        def __init__(self, *args, **kwargs):
+            raise Exception("视觉系统不可用，缺少依赖")
         def close(self):
             pass
-else:
-    try:
-        from vision_system import VisionSystem
-        VISION_AVAILABLE = True
-    except Exception:
-        VISION_AVAILABLE = False
-        class VisionSystem:
-            def __init__(self):
-                raise Exception("视觉系统不可用")
-            def close(self):
-                pass
 
 
 class VisionMixin:
@@ -56,8 +41,6 @@ class VisionMixin:
             and getattr(self.cam_test_worker, "cam_type", None) == camera_type
         ):
             self._stop_camera_test()
-        if camera_type == "D435i" and hasattr(self, '_low_fps_worker') and self._low_fps_worker is not None:
-            self.stop_d435i_low_fps()
 
     def _detect_camera_serials(self):
         try:
@@ -67,7 +50,7 @@ class VisionMixin:
             for dev in devices:
                 name = dev.get_info(rs.camera_info.name)
                 serial = dev.get_info(rs.camera_info.serial_number)
-                print(f"📷 发现设备: {name}, 序列号: {serial}")
+                _logger.info("发现设备: %s, 序列号: %s", name, serial)
                 if "D405" in name:
                     serials["D405"] = serial
                 elif "D435" in name:
@@ -76,7 +59,7 @@ class VisionMixin:
                     serials.setdefault("D435i", serial)
             return serials
         except Exception as e:
-            print(f"⚠️ 探测设备失败: {e}")
+            _logger.warning("探测设备失败: %s", e)
             return {}
 
     def connect_d435i(self):
@@ -92,8 +75,10 @@ class VisionMixin:
             self.d435i_disconnect_btn.setEnabled(True)
             if hasattr(self, "_refresh_action_states"):
                 self._refresh_action_states()
-            QMessageBox.information(self, "成功", f"D435i 相机连接成功" + (f" (SN: {serial})" if serial else ""))
+            self.update_gpu_status(self.vision_d435i.inference_provider)
+            QMessageBox.information(self, "成功", f"D435i 相机连接成功" + (f" (SN: {serial})" if serial else "") + f" [{self.vision_d435i.inference_provider}]")
         except Exception as e:
+            self.vision_d435i = None
             self._set_camera_status("D435i", "连接失败")
             QMessageBox.critical(self, "错误", f"D435i 相机连接失败: {e}")
 
@@ -104,6 +89,7 @@ class VisionMixin:
                 self.vision_d435i.close()
                 self.vision_d435i = None
                 self._set_camera_status("D435i", "未连接")
+                self.update_gpu_status(None)
                 self.d435i_connect_btn.setEnabled(True)
                 self.d435i_disconnect_btn.setEnabled(False)
                 if hasattr(self, "_refresh_action_states"):
@@ -124,8 +110,10 @@ class VisionMixin:
             self.d405_disconnect_btn.setEnabled(True)
             if hasattr(self, "_refresh_action_states"):
                 self._refresh_action_states()
-            QMessageBox.information(self, "成功", f"D405 相机连接成功" + (f" (SN: {serial})" if serial else ""))
+            self.update_gpu_status(self.vision_d405.inference_provider)
+            QMessageBox.information(self, "成功", f"D405 相机连接成功" + (f" (SN: {serial})" if serial else "") + f" [{self.vision_d405.inference_provider}]")
         except Exception as e:
+            self.vision_d405 = None
             self._set_camera_status("D405", "连接失败")
             QMessageBox.critical(self, "错误", f"D405 相机连接失败: {e}")
 
@@ -136,6 +124,7 @@ class VisionMixin:
                 self.vision_d405.close()
                 self.vision_d405 = None
                 self._set_camera_status("D405", "未连接")
+                self.update_gpu_status(None)
                 self.d405_connect_btn.setEnabled(True)
                 self.d405_disconnect_btn.setEnabled(False)
                 if hasattr(self, "_refresh_action_states"):
@@ -145,7 +134,7 @@ class VisionMixin:
 
     def open_realtime_feedback(self):
         try:
-            from realtime_feedback_dialog import RealTimeFeedbackDialog
+            from ..realtime_feedback_dialog import RealTimeFeedbackDialog
             dialog = RealTimeFeedbackDialog(ip=self.robot_ip)
             dialog.exec()
         except Exception as e:
@@ -166,7 +155,7 @@ class VisionMixin:
         self.cam_test_start_btn.setEnabled(False)
         self.cam_test_stop_btn.setEnabled(True)
         vision = self.vision_d405 if cam_type == "D405" else self.vision_d435i
-        from workers import CameraTestWorker
+        from ..workers import CameraTestWorker
         self.cam_test_worker = CameraTestWorker(vision, cam_type, self.controller)
         self.cam_test_worker.result_ready.connect(self._on_camera_test_result)
         self.cam_test_worker.finished.connect(self.cam_test_worker.deleteLater)
@@ -230,63 +219,4 @@ class VisionMixin:
             self.cam_test_base_coords.setText("X: ---  Y: ---  Z: ---")
             self.cam_test_confidence.setText("---")
 
-    def start_d435i_low_fps(self):
-        if self.vision_d435i is None:
-            QMessageBox.warning(self, "警告", "D435i 相机未连接")
-            return
-        if hasattr(self, '_low_fps_worker') and self._low_fps_worker is not None:
-            QMessageBox.warning(self, "警告", "低帧率识别已在运行")
-            return
-        from workers import D435iLowFpsWorker
-        self._low_fps_worker = D435iLowFpsWorker(self.vision_d435i, self.controller)
-        self._low_fps_worker.low_fps_result.connect(self._on_low_fps_result)
-        self._low_fps_worker.finished.connect(self._low_fps_worker.deleteLater)
-        self._low_fps_worker.start()
-        self.d435i_low_fps_start_btn.setEnabled(False)
-        self.d435i_low_fps_stop_btn.setEnabled(True)
-        self.d435i_low_fps_status.setText("状态: 运行中")
-        apply_status_visual(self.d435i_low_fps_status, "运行中")
 
-    def stop_d435i_low_fps(self):
-        if hasattr(self, '_low_fps_worker') and self._low_fps_worker is not None:
-            self._low_fps_worker.stop()
-            self._low_fps_worker.wait(3000)
-            self._low_fps_worker = None
-        self.d435i_low_fps_start_btn.setEnabled(True)
-        self.d435i_low_fps_stop_btn.setEnabled(False)
-        self.d435i_low_fps_status.setText("状态: 已停止")
-        apply_status_visual(self.d435i_low_fps_status, "已停止")
-
-    def _on_low_fps_result(self, result):
-        status = result.get('status', 'unknown')
-        if status == 'no_frame':
-            return
-        if status == 'error':
-            self.d435i_low_fps_status.setText(f"状态: 错误 - {result.get('error_msg', '')}")
-            apply_status_visual(self.d435i_low_fps_status, "错误")
-            return
-
-        object_position = result.get('object_position')
-        if object_position:
-            cam_coords = result.get('cam_coords', [])
-            conf = result.get('confidence', 0.0)
-            self.d435i_low_fps_status.setText(f"状态: 检测到物体 (置信度={conf:.2f})")
-            apply_status_visual(self.d435i_low_fps_status, "运行")
-            if len(cam_coords) >= 3:
-                self.d435i_low_fps_cam_coords.setText(f"X: {cam_coords[0]:.1f}  Y: {cam_coords[1]:.1f}  Z: {cam_coords[2]:.1f}")
-            end_coords = result.get('end_coords')
-            if end_coords is not None:
-                self.d435i_low_fps_end_coords.setText(f"X: {end_coords[0]:.1f}  Y: {end_coords[1]:.1f}  Z: {end_coords[2]:.1f}")
-            else:
-                self.d435i_low_fps_end_coords.setText("X: ---  Y: ---  Z: ---")
-            base_coords = result.get('base_coords')
-            if base_coords is not None:
-                self.d435i_low_fps_base_coords.setText(f"X: {base_coords[0]:.1f}  Y: {base_coords[1]:.1f}  Z: {base_coords[2]:.1f}")
-            else:
-                self.d435i_low_fps_base_coords.setText("X: ---  Y: ---  Z: ---")
-        else:
-            self.d435i_low_fps_status.setText("状态: 未检测到物体")
-            apply_status_visual(self.d435i_low_fps_status, "未检测到物体")
-            self.d435i_low_fps_cam_coords.setText("X: ---  Y: ---  Z: ---")
-            self.d435i_low_fps_end_coords.setText("X: ---  Y: ---  Z: ---")
-            self.d435i_low_fps_base_coords.setText("X: ---  Y: ---  Z: ---")

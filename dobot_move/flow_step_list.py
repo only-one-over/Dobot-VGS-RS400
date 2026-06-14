@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Flow step list widget with drag-and-drop reordering and status icons."""
 
-from qt_compat import (
+from .qt_compat import (
     QByteArray,
     QColor,
     QDrag,
@@ -18,7 +18,7 @@ from qt_compat import (
     pyqtSignal,
 )
 
-from ui_theme import FLOW_STEP_STYLE, FLOW_STEP_SELECTED_STYLE, FLOW_STEP_EMPTY_STYLE
+from .ui_theme import FLOW_STEP_STYLE, FLOW_STEP_SELECTED_STYLE, FLOW_STEP_EMPTY_STYLE
 
 
 # Status constants

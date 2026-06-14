@@ -7,9 +7,6 @@ import threading
 import time
 from time import sleep
 import requests
-import logging
-
-logger = logging.getLogger(__name__)
 
 alarmControllerFile = "files/alarmController.json"
 alarmServoFile = "files/alarmServo.json"
@@ -135,57 +132,48 @@ class DobotApi:
                 self.socket_dobot = socket.socket()
                 self.socket_dobot.connect((self.ip, self.port))
                 self.socket_dobot.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 144000)
-            except socket.error as e:
-                logger.error(f"Socket连接失败 ({self.ip}:{self.port}): {e}")
-                self.socket_dobot = 0
+            except socket.error:
+                print(socket.error)
 
         else:
-            logger.error(f"Connect to dashboard server need use port {self.port} !")
+            print(f"Connect to dashboard server need use port {self.port} !")
 
     def log(self, text):
         if self.text_log:
-            logger.info(text)
+            print(text)
 
     def send_data(self, string):
        # self.log(f"Send to {self.ip}:{self.port}: {string}")
         try:
             self.socket_dobot.send(str.encode(string, 'utf-8'))
         except Exception as e:
-            logger.error(e)
-            for i in range(10):
+            print(e)
+            while True:
                 try:
                     self.socket_dobot = self.reConnect(self.ip, self.port)
                     self.socket_dobot.send(str.encode(string, 'utf-8'))
-                    return
+                    break
                 except Exception:
                     sleep(1)
-            raise ConnectionError(f"send_data: 10 retries exhausted, failed to send to {self.ip}:{self.port}")
 
     def wait_reply(self):
-        data = b""
-        while True:
-            try:
-                chunk = self.socket_dobot.recv(1024)
-                if not chunk:
-                    break
-                data += chunk
-                if b"\n" in data:
-                    break
-            except socket.timeout:
-                break
-            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
-                logger.error(f"接收数据异常: {e}")
-                self.socket_dobot = self.reConnect(self.ip, self.port)
-                break
-            except OSError as e:
-                logger.error(f"接收数据异常: {e}")
-                self.socket_dobot = self.reConnect(self.ip, self.port)
-                break
-            except Exception as e:
-                logger.error(f"接收数据异常: {e}")
-                self.socket_dobot = self.reConnect(self.ip, self.port)
-                break
-        return data.decode().strip()
+        """
+        Read the return value
+        """
+        data = ""
+        try:
+            data = self.socket_dobot.recv(1024)
+        except Exception as e:
+            print(e)
+            self.socket_dobot = self.reConnect(self.ip, self.port)
+
+        finally:
+            if len(data) == 0:
+                data_str = data
+            else:
+                data_str = str(data, encoding="utf-8")
+            # self.log(f'Receive from {self.ip}:{self.port}: {data_str}')
+            return data_str
 
     def close(self):
         """
@@ -195,8 +183,8 @@ class DobotApi:
             try:
                 self.socket_dobot.shutdown(socket.SHUT_RDWR)
                 self.socket_dobot.close()
-            except Exception:
-                pass
+            except socket.error as e:
+                print(f"Error while closing socket: {e}")
 
     def sendRecvMsg(self, string):
         """
@@ -204,37 +192,21 @@ class DobotApi:
         """
         with self.__globalLock:
             self.send_data(string)
-            if self.socket_dobot and self.socket_dobot != 0:
-                current_timeout = self.socket_dobot.gettimeout()
-                if current_timeout is None:
-                    self.socket_dobot.settimeout(5)
-                    try:
-                        recvData = self.wait_reply()
-                    finally:
-                        self.socket_dobot.settimeout(None)
-                else:
-                    recvData = self.wait_reply()
-            else:
-                recvData = ""
+            recvData = self.wait_reply()
             return recvData
 
     def __del__(self):
         self.close()
 
     def reConnect(self, ip, port):
-        try:
-            if self.socket_dobot and self.socket_dobot != 0:
-                self.socket_dobot.close()
-        except Exception:
-            pass
-        for _ in range(10):
+        while True:
             try:
                 socket_dobot = socket.socket()
                 socket_dobot.connect((ip, port))
-                return socket_dobot
+                break
             except Exception:
                 sleep(1)
-        raise ConnectionError(f"reConnect: 10 retries exhausted, cannot connect to {ip}:{port}")
+        return socket_dobot
 
 # 控制及运动指令接口类
 # Control and motion command interface
@@ -1902,7 +1874,7 @@ class DobotApiDashboard(DobotApi):
             string = "MovJ(joint={{{:f},{:f},{:f},{:f},{:f},{:f}}}".format(
                 a1, b1, c1, d1, e1, f1)
         else:
-            logger.warning("coordinateMode param is wrong")
+            print("coordinateMode param is wrong")
             return ""
         params = []
         if user != -1:
@@ -1962,77 +1934,7 @@ class DobotApiDashboard(DobotApi):
             string = "MovL(joint={{{:f},{:f},{:f},{:f},{:f},{:f}}}".format(
                 a1, b1, c1, d1, e1, f1)
         else:
-            logger.warning("coordinateMode  param  is wrong")
-            return ""
-        params = []
-        if user != -1:
-            params.append('user={:d}'.format(user))
-        if tool != -1:
-            params.append('tool={:d}'.format(tool))
-        if a != -1:
-            params.append('a={:d}'.format(a))
-        if v != -1 and speed != -1:
-            params.append('speed={:d}'.format(speed))
-        elif speed != -1:
-            params.append('speed={:d}'.format(speed))
-        elif v != -1:
-            params.append('v={:d}'.format(v))
-        if cp != -1 and r != -1:
-            params.append('r={:d}'.format(r))
-        elif r != -1:
-            params.append('r={:d}'.format(r))
-        elif cp != -1:
-            params.append('cp={:d}'.format(cp))
-        for ii in params:
-            string = string + ',' + ii
-        string = string + ')'
-        return self.sendRecvMsg(string)
-
-    def MovC(self, a1, b1, c1, d1, e1, f1, a2, b2, c2, d2, e2, f2, coordinateMode, user=-1, tool=-1, a=-1, v=-1, speed=-1, cp=-1, r=-1):
-        """
-        描述
-        从当前位置以圆弧运动⽅式运动⾄⽬标点，经过中间点。
-        必选参数
-        参数名 类型 说明
-        P string ⽬标点，⽀持关节变量或位姿变量
-        P2 string 中间点，⽀持关节变量或位姿变量
-        coordinateMode int  目标点的坐标值模式    0为pose方式  1为joint
-        可选参数
-        参数名 类型  说明
-        user int ⽤⼾坐标系
-        tool int ⼯具坐标系
-        a    int 执⾏该条指令时的机械臂运动加速度⽐例。取值范围：(0,100]
-        v    int 执⾏该条指令时的机械臂运动速度⽐例，与speed互斥。取值范围：(0,100]
-        speed int 执⾏该条指令时的机械臂运动⽬标速度，与v互斥，若同时存在以speed为
-        准。取值范围：[1, 最⼤运动速度]，单位：mm/s
-        cp  int 平滑过渡⽐例，与r互斥。取值范围：[0,100]
-        r   int 平滑过渡半径，与cp互斥，若同时存在以r为准。单位：mm
-        Description
-        Move from the current position to the target position in an arc mode through a middle point.
-        Required parameter:
-        Parameter name     Type     Description
-        P     string     Target point (joint variables or posture variables)
-        P2    string     Middle point (joint variables or posture variables)
-        coordinateMode     int      Coordinate mode of the target point, 0: pose, 1: joint
-        Optional parameter:
-        Parameter name     Type     Description
-        user     int     user coordinate system
-        tool     int     tool coordinate system
-        a     int     acceleration rate of the robot arm when executing this command. Range: (0,100].
-        v     int     velocity rate of the robot arm when executing this command, incompatible with "speed". Range: (0,100].
-        speed     int     target speed of the robot arm when executing this command, incompatible with "v". If both "speed" and "v" exist, speed takes precedence. Range: [0, maximum motion speed], unit: mm/s.
-        cp     int     continuous path rate, incompatible with "r". Range: [0,100].
-        r     int     continuous path radius, incompatible with "cp". If both "r" and "cp" exist, r takes precedence. Unit: mm.
-        """
-        string = ""
-        if coordinateMode == 0:
-            string = "MovC(pose={{{:f},{:f},{:f},{:f},{:f},{:f}}},pose2={{{:f},{:f},{:f},{:f},{:f},{:f}}}".format(
-                a1, b1, c1, d1, e1, f1, a2, b2, c2, d2, e2, f2)
-        elif coordinateMode == 1:
-            string = "MovC(joint={{{:f},{:f},{:f},{:f},{:f},{:f}}},joint2={{{:f},{:f},{:f},{:f},{:f},{:f}}}".format(
-                a1, b1, c1, d1, e1, f1, a2, b2, c2, d2, e2, f2)
-        else:
-            logger.warning("coordinateMode  param  is wrong")
+            print("coordinateMode  param  is wrong")
             return ""
         params = []
         if user != -1:
@@ -2183,7 +2085,7 @@ class DobotApiDashboard(DobotApi):
             string = "MovLIO(joint={{{:f},{:f},{:f},{:f},{:f},{:f}}},{{{:d},{:d},{:d},{:d}}}".format(
                 a1, b1, c1, d1, e1, f1, Mode, Distance, Index, Status)
         else:
-            logger.warning("coordinateMode  param  is wrong")
+            print("coordinateMode  param  is wrong")
             return ""
         params = []
         if user != -1:
@@ -2269,7 +2171,7 @@ class DobotApiDashboard(DobotApi):
             string = "MovJIO(joint={{{:f},{:f},{:f},{:f},{:f},{:f}}},{{{:d},{:d},{:d},{:d}}}".format(
                 a1, b1, c1, d1, e1, f1, Mode, Distance, Index, Status)
         else:
-            logger.warning("coordinateMode  param  is wrong")
+            print("coordinateMode  param  is wrong")
             return ""
         params = []
         if user != -1:
@@ -2334,7 +2236,7 @@ class DobotApiDashboard(DobotApi):
             string = "Arc(joint={{{:f},{:f},{:f},{:f},{:f},{:f}}},joint={{{:f},{:f},{:f},{:f},{:f},{:f}}}".format(
                 a1, b1, c1, d1, e1, f1,  a2, b2, c2, d2, e2, f2)
         else:
-            logger.warning("coordinateMode  param  is wrong")
+            print("coordinateMode  param  is wrong")
             return ""
         params = []
         if user != -1:
@@ -2409,7 +2311,7 @@ class DobotApiDashboard(DobotApi):
             string = "Circle(joint={{{:f},{:f},{:f},{:f},{:f},{:f}}},joint={{{:f},{:f},{:f},{:f},{:f},{:f}}},{:d}".format(
                 a1, b1, c1, d1, e1, f1,  a2, b2, c2, d2, e2, f2, count)
         else:
-            logger.warning("coordinateMode  param  is wrong")
+            print("coordinateMode  param  is wrong")
             return ""
         params = []
         if user != -1:
@@ -3155,7 +3057,7 @@ class DobotApiDashboard(DobotApi):
             # 发送POST请求设置语言
             response = requests.post(language_url, json=language_data, timeout=5)
             if response.status_code != 200:
-                logger.error(f"设置语言失败: HTTP {response.status_code}")
+                print(f"设置语言失败: HTTP {response.status_code}")
             
             # 获取报警信息
             alarm_url = f"http://{self.ip}:22000/protocol/getAlarm"
@@ -3164,17 +3066,17 @@ class DobotApiDashboard(DobotApi):
             if response.status_code == 200:
                 return response.json()
             else:
-                logger.error(f"获取报警信息失败: HTTP {response.status_code}")
+                print(f"获取报警信息失败: HTTP {response.status_code}")
                 return {"errMsg": []}
                 
         except requests.exceptions.RequestException as e:
-            logger.error(f"HTTP请求异常: {e}")
+            print(f"HTTP请求异常: {e}")
             return {"errMsg": []}
         except json.JSONDecodeError as e:
-            logger.error(f"JSON解析异常: {e}")
+            print(f"JSON解析异常: {e}")
             return {"errMsg": []}
         except Exception as e:
-            logger.error(f"获取报警信息时发生未知错误: {e}")
+            print(f"获取报警信息时发生未知错误: {e}")
             return {"errMsg": []}
 
     def ArcIO(self, a1, b1, c1, d1, e1, f1, a2, b2, c2, d2, e2, f2, coordinateMode, *io_params, user=-1, tool=-1, a=-1, v=-1, speed=-1, cp=-1, r=-1, mode=-1):
@@ -3189,14 +3091,14 @@ class DobotApiDashboard(DobotApi):
             string = "ArcIO(joint={{{:f},{:f},{:f},{:f},{:f},{:f}}},joint={{{:f},{:f},{:f},{:f},{:f},{:f}}}".format(
                 a1, b1, c1, d1, e1, f1, a2, b2, c2, d2, e2, f2)
         else:
-            logger.warning("coordinateMode  param  is wrong")
+            print("coordinateMode  param  is wrong")
             return ""
         
         for io_param in io_params:
             if isinstance(io_param, (list, tuple)) and len(io_param) == 4:
                 string += ",{{{:d},{:d},{:d},{:d}}}".format(*io_param)
             else:
-                 logger.warning("io_param format is wrong")
+                 print("io_param format is wrong")
 
         params = []
         if user != -1:
@@ -3441,7 +3343,7 @@ class DobotApiDashboard(DobotApi):
                      pts_str.append("joint={{{:f},{:f},{:f},{:f},{:f},{:f}}}".format(*pt))
              string += ",".join(pts_str)
         else:
-             logger.warning("MovS param is wrong")
+             print("MovS param is wrong")
              return ""
         
         params = []
@@ -3499,7 +3401,7 @@ class DobotApiDashboard(DobotApi):
             string = "RunTo(joint={{{:f},{:f},{:f},{:f},{:f},{:f}}},moveType=1".format(
                 a1, b1, c1, d1, e1, f1)
         else:
-             logger.warning("moveType param is wrong")
+             print("moveType param is wrong")
              return ""
         
         params = []

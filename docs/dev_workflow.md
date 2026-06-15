@@ -2,14 +2,7 @@
 
 ## 安装依赖
 
-项目依赖分为三层：
-
-| 文件 | 内容 | 用途 |
-|------|------|------|
-| `requirements.txt` | 聚合入口（引用 base + gpu） | 默认安装 |
-| `requirements-base.txt` | PySide6、OpenCV、RealSense、Modbus 等 | 无 GPU 推理的基础环境 |
-| `requirements-gpu-cu12.txt` | onnxruntime-gpu[cuda,cudnn] | CUDA 12.x GPU 推理 |
-| `requirements-cpp.txt` | pybind11、cmake | 可选 C++ 加速模块构建 |
+所有依赖统一在 `requirements.txt` 中，用注释分区标注（基础 / GPU可选 / C++可选）。
 
 从仓库根目录：
 
@@ -29,7 +22,7 @@ RealSense 工作还需要在 Python 之外安装 Intel RealSense SDK 2.0。原�
 
 ```powershell
 .\.venv\Scripts\activate
-python dobot_move\gui_app.py
+python -m dobot_move
 ```
 
 应用期望运行时配置位于 `dobot_move/config.json`。相机启动期望已连接 RealSense 硬件且 ONNX 模型位于 `dobot_move/best.onnx`。

@@ -1,4 +1,0 @@
-# GPU 推理依赖 — CUDA 12.x runtime + cuDNN 随虚拟环境安装
-# 前置：NVIDIA 驱动 >= 525.60.13 (Windows) / >= 525.60.11 (Linux)
-# 详细部署指南见 docs/gpu_environment.md
-onnxruntime-gpu[cuda,cudnn]

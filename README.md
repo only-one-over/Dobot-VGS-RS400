@@ -22,7 +22,6 @@
 ## 功能特性
 
 - 🎯 **双相机协作** — D435i 粗定位 + D405 精细识别（掩码几何中心）
-- 🔄 **实时跟踪** — D435i 低帧率（5fps）连续识别，实时更新目标位置
 - 🧠 **YOLO 实例分割** — YOLO11s-seg / YOLO26 端到端 + ByteTrack 多目标跟踪 + 3D Kalman 滤波
 - 📐 **手眼标定** — D435i/D405 双相机独立标定
 - 🎮 **视觉伺服** — 自适应增益迭代逼近，2mm 收敛阈值
@@ -69,11 +68,10 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # 3. （可选）构建 C++ 加速模块
-pip install -r requirements-cpp.txt
 python build_cpp.py
 ```
 
-> 依赖文件说明：`requirements.txt` 为聚合入口（基础 + GPU），分层文件见 `requirements-base.txt`、`requirements-gpu-cu12.txt`、`requirements-cpp.txt`。GPU 环境详细部署指南见 [docs/gpu_environment.md](docs/gpu_environment.md)。
+> GPU 和 C++ 依赖为可选，已包含在 requirements.txt 中（用注释标注）。无 NVIDIA GPU 时自动回退 CPU 推理。GPU 环境详细部署指南见 [docs/gpu_environment.md](docs/gpu_environment.md)。
 
 ### 验证安装
 
@@ -149,8 +147,7 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 ### 启动应用
 
 ```bash
-cd dobot_move
-python gui_app.py
+python -m dobot_move
 ```
 
 ### 首次设置
@@ -164,16 +161,6 @@ python gui_app.py
 4. **连接相机** — 点击"连接相机"，选择 D435i 或 D405
 5. **测试视觉** — 点击"相机测试"验证检测效果
 6. **运行抓取流程** — 在"抓取流程"选项卡中启动自动抓取
-
-### D435i 低帧率实时识别
-
-在视觉选项卡中，可使用 D435i 低帧率（5fps）连续识别：
-
-1. 连接 D435i 相机
-2. 在"D435i 低帧率识别"区域点击"启动"
-3. 系统以 5fps 持续检测，实时更新 `d435i` 点位坐标
-4. 界面显示当前相机坐标、末端坐标、基座坐标
-5. 点击"停止"关闭识别
 
 ### 抓取流程
 
@@ -364,16 +351,13 @@ pip install opencv-python
 - Windows 需要安装 Visual Studio Build Tools
 - 不构建 C++ 模块不影响使用——程序会回退到 Python
 
-### YOLO 推理（CUDA 必需）
+### YOLO 推理（优先 GPU，自动回退 CPU）
 
-本项目 YOLO 推理需要 NVIDIA GPU + CUDA。GPU 依赖通过 `requirements-gpu-cu12.txt` 安装，CUDA runtime 和 cuDNN 随 pip 包自动安装到虚拟环境中。
+本项目 YOLO 推理优先使用 NVIDIA GPU + CUDA，无 GPU 时自动回退 CPU 推理。CUDA runtime 和 cuDNN 随 pip 包自动安装到虚拟环境中。
 
 ```bash
 # 确认 GPU 可用
 nvidia-smi
-
-# 安装 GPU 推理依赖
-pip install -r requirements-gpu-cu12.txt
 
 # 验证 GPU 真实启用
 python -c "import onnxruntime as ort; s = ort.InferenceSession('dobot_move/best.onnx', providers=['CUDAExecutionProvider']); print('Active providers:', s.get_providers())"
@@ -381,10 +365,10 @@ python -c "import onnxruntime as ort; s = ort.InferenceSession('dobot_move/best.
 
 | 模式 | YOLO 推理耗时 | 视觉伺服闭环频率 | 安装要求 | 支持状态 |
 |------|--------------|-----------------|----------|----------|
-| GPU (CUDA) | ~20-50ms | ~10-15 Hz | NVIDIA GPU + 驱动 + onnxruntime-gpu[cuda,cudnn] | ✅ 必需 |
-| CPU | — | — | — | ❌ 不支持 |
+| GPU (CUDA) | ~20-50ms | ~10-15 Hz | NVIDIA GPU + 驱动 + onnxruntime-gpu[cuda,cudnn] | ✅ 推荐 |
+| CPU | ~100-300ms | ~3-5 Hz | 无额外要求 | ✅ 支持（自动回退） |
 
-> 完整 GPU 环境部署指南见 [docs/gpu_environment.md](docs/gpu_environment.md)。注意 `onnxruntime` 和 `onnxruntime-gpu` 不能同时安装，装了 GPU 版后 CPU 版需先卸载。
+> 完整 GPU 环境部署指南见 [docs/gpu_environment.md](docs/gpu_environment.md)。注意 `onnxruntime` 和 `onnxruntime-gpu` 不能同时安装，装了 GPU 版后 CPU 版需先卸载。连接相机后界面"推理"卡片会显示当前模式（GPU/CPU）。
 
 ### YOLO 模型检测效果差
 - 确认 `dobot_move/` 目录下存在 `best.onnx` 模型文件

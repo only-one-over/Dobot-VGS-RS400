@@ -50,16 +50,11 @@ python -m pip install --upgrade pip
 ### 3. 安装依赖
 
 ```powershell
-# 方式 A：默认安装（基础 + GPU 推理）
+# 一键安装（基础 + GPU 推理 + C++ 可选依赖）
 pip install -r requirements.txt
-
-# 方式 B：分层安装
-pip install -r requirements-base.txt    # 基础依赖（UI、相机、Modbus 等）
-pip install -r requirements-gpu-cu12.txt # GPU 推理依赖（CUDA 12.x + cuDNN）
-
-# 方式 C：仅基础依赖（无 GPU 推理）
-pip install -r requirements-base.txt
 ```
+
+> GPU 和 C++ 依赖为可选，已包含在 requirements.txt 中。无 NVIDIA GPU 时 onnxruntime-gpu 安装可能失败，不影响 CPU 推理使用。
 
 ### 4. 可选：安装 C++ 加速模块
 
@@ -150,7 +145,4 @@ pip install -r requirements-gpu-cu12.txt
 
 | 文件 | 内容 | 用途 |
 |------|------|------|
-| `requirements.txt` | 聚合入口（引用 base + gpu） | 默认安装 |
-| `requirements-base.txt` | PySide6、OpenCV、RealSense、Modbus 等 | 无 GPU 推理的基础环境 |
-| `requirements-gpu-cu12.txt` | onnxruntime-gpu[cuda,cudnn] | CUDA 12.x GPU 推理 |
-| `requirements-cpp.txt` | pybind11、cmake | 可选 C++ 加速模块构建 |
+| `requirements.txt` | 基础依赖 + GPU 推理（可选）+ C++ 构建（可选） | 一键安装 |

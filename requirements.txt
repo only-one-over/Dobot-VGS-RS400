@@ -1,8 +1,22 @@
-# 默认聚合入口 — 安装基础依赖 + GPU 推理依赖
-# 用法：pip install -r requirements.txt
--r requirements-base.txt
--r requirements-gpu-cu12.txt
+# === 基础依赖 ===
+PySide6>=6.0
+numpy
+requests
+pymodbus>=3.0
+opencv-python
+scipy
+pyrealsense2
+minimalmodbus
+pyserial
+python-can
+lapx
 
-# === 可选：C++ 加速模块 ===
-# pip install -r requirements-cpp.txt
-# python build_cpp.py
+# === GPU 推理依赖（可选，需要 NVIDIA GPU + 驱动） ===
+# 前置：NVIDIA 驱动 >= 525.60.13 (Windows) / >= 525.60.11 (Linux)
+# 详细部署指南见 docs/gpu_environment.md
+onnxruntime-gpu[cuda,cudnn]
+
+# === C++ 加速模块构建依赖（可选） ===
+# 用法：pip install pybind11 cmake && python build_cpp.py
+pybind11
+cmake

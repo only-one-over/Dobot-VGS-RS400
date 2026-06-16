@@ -28,6 +28,7 @@ CMD_STOP = 0
 CMD_RESET = 1
 CMD_HOOK = 3
 
+STATUS_IDLE = 0
 STATUS_STANDBY = 2
 STATUS_RUNNING = 4
 STATUS_HOOK_OK = 5
@@ -38,7 +39,7 @@ STATUS_CAMERA_ERR = 112
 MODE_AUTO = 0
 MODE_MANUAL = 1
 
-_CMD_DISPLAY = {0: "中停", 1: "复位", 2: "待机", 3: "提钩", 4: "运行中", 5: "提钩OK", 110: "提钩ERR", 111: "机器人报错", 112: "相机报错"}
+_CMD_DISPLAY = {0: "空闲/中停", 1: "复位回原点", 2: "复位完成", 3: "执行流程", 4: "运行中", 5: "流程完成", 110: "流程ERR", 111: "机器人报错", 112: "相机报错"}
 _MODE_DISPLAY = {0: "自动模式", 1: "手动模式"}
 
 # 寄存器名称映射
@@ -50,13 +51,13 @@ REGISTER_NAME = {
 
 # 寄存器值描述映射
 REGISTER_VALUE_DESC = {
-    (40001, 0): "中停",
-    (40001, 1): "复位命令",
-    (40001, 2): "复位完成，待机位准备好",
-    (40001, 3): "提钩运行",
+    (40001, 0): "空闲/中停",
+    (40001, 1): "复位回原点命令",
+    (40001, 2): "复位完成",
+    (40001, 3): "执行运动编辑流程",
     (40001, 4): "运行中",
-    (40001, 5): "提钩OK",
-    (40001, 110): "提钩ERR",
+    (40001, 5): "流程完成",
+    (40001, 110): "流程ERR",
     (40001, 111): "机器人报错",
     (40001, 112): "相机报错",
     (40002, 0): "自动模式",
@@ -79,6 +80,8 @@ class DobotModbusServer:
         self._loop = None
         self._port = 0
         self._host = "0.0.0.0"
+        self._internal_write_lock = threading.Lock()
+        self._internal_write_signatures = []
 
         self.last_error = None
         self._started_event = threading.Event()
@@ -95,7 +98,7 @@ class DobotModbusServer:
         self._last_cycle_time = 0.0
 
         self._register_info = {
-            REG_CMD_STATUS: ("命令/状态(0=中停/1=复位/3=提钩/2=待机/4=运行中/5=提钩OK/110=提钩ERR/111=机器人报错/112=相机报错)", "U16", "双向"),
+            REG_CMD_STATUS: ("命令/状态(0=空闲/中停/1=复位回原点/2=复位完成/3=执行流程/4=运行中/5=流程完成/110=流程ERR/111=机器人报错/112=相机报错)", "U16", "双向"),
             REG_MODE: ("模式(0=自动模式/1=手动模式)", "U16", "双向"),
             REG_HEARTBEAT: ("心跳(1/0交替)", "U16", "从站写"),
         }
@@ -109,6 +112,48 @@ class DobotModbusServer:
         ]
         return devices
 
+    @staticmethod
+    def _display_address(raw_address):
+        if raw_address >= REG_CMD_STATUS:
+            return raw_address
+        return REG_CMD_STATUS + (raw_address - _WIRE_ADDR)
+
+    @staticmethod
+    def _read_current_register(current_registers, start_address, display_address, default=0, prefer_display=False):
+        wire_address = _WIRE_ADDR + (display_address - REG_CMD_STATUS)
+        candidates = [display_address, wire_address] if prefer_display else [wire_address, display_address]
+        for candidate in candidates:
+            offset = candidate - start_address
+            if 0 <= offset < len(current_registers):
+                return current_registers[offset]
+        return default
+
+    @staticmethod
+    def _write_signature(address, values):
+        return int(address), tuple(int(v) for v in values)
+
+    def _mark_internal_status_write(self, address, values):
+        signature = self._write_signature(address, values)
+        with self._internal_write_lock:
+            self._internal_write_signatures.append(signature)
+        return signature
+
+    def _discard_internal_status_write(self, signature):
+        with self._internal_write_lock:
+            try:
+                self._internal_write_signatures.remove(signature)
+            except ValueError:
+                pass
+
+    def _consume_internal_status_write(self, address, values):
+        signature = self._write_signature(address, values)
+        with self._internal_write_lock:
+            try:
+                self._internal_write_signatures.remove(signature)
+                return True
+            except ValueError:
+                return False
+
     async def _action_callback(self, function_code, start_address, address, count, current_registers, set_values):
         """SimDevice action 回调：实时监测主站写操作"""
         if set_values is None:
@@ -116,14 +161,18 @@ class DobotModbusServer:
         if function_code not in HR_FC:
             return None
 
+        internal_status_write = self._consume_internal_status_write(address, set_values)
         offset = address - start_address
         old_values = list(current_registers[offset:offset + len(set_values)])
 
         cmd_triggered = False
         cmd_value = 0
+        cmd_prefers_display_address = False
 
         for i, value in enumerate(set_values):
-            reg_addr = address + i
+            raw_addr = address + i
+            reg_addr = self._display_address(raw_addr)
+            prefers_display_address = raw_addr >= REG_CMD_STATUS
             old_val = old_values[i] if i < len(old_values) else None
             reg_name = REGISTER_NAME.get(reg_addr, "")
             value_desc = REGISTER_VALUE_DESC.get((reg_addr, value), "")
@@ -138,7 +187,7 @@ class DobotModbusServer:
             )
 
             # 心跳变化追踪
-            if reg_addr == 40003 and old_val != value:
+            if reg_addr == REG_HEARTBEAT and old_val != value:
                 now = time.time()
                 if self._last_cycle_time > 0:
                     self._cycle_count += 1
@@ -147,9 +196,9 @@ class DobotModbusServer:
                 self._heartbeat_last_change = now
 
             # 命令/状态变化
-            if reg_addr == 40001 and old_val != value:
-                old_desc = REGISTER_VALUE_DESC.get((40001, old_val), str(old_val))
-                new_desc = REGISTER_VALUE_DESC.get((40001, value), str(value))
+            if reg_addr == REG_CMD_STATUS and old_val != value:
+                old_desc = REGISTER_VALUE_DESC.get((REG_CMD_STATUS, old_val), str(old_val))
+                new_desc = REGISTER_VALUE_DESC.get((REG_CMD_STATUS, value), str(value))
                 logger.info("[Modbus监测] 命令/状态变化: %s → %s", old_desc, new_desc)
                 if value in (110, 111, 112):
                     if _HAS_WINSOUND:
@@ -159,20 +208,30 @@ class DobotModbusServer:
                             pass
 
             # 模式变化
-            if reg_addr == 40002 and old_val != value:
-                old_desc = REGISTER_VALUE_DESC.get((40002, old_val), str(old_val))
-                new_desc = REGISTER_VALUE_DESC.get((40002, value), str(value))
+            if reg_addr == REG_MODE and old_val != value:
+                old_desc = REGISTER_VALUE_DESC.get((REG_MODE, old_val), str(old_val))
+                new_desc = REGISTER_VALUE_DESC.get((REG_MODE, value), str(value))
                 logger.info("[Modbus监测] 模式变化: %s → %s", old_desc, new_desc)
 
             # 命令检测
-            if reg_addr == 40001 and value in (0, 1, 3):
+            if (
+                not internal_status_write
+                and reg_addr == REG_CMD_STATUS
+                and value in (CMD_STOP, CMD_RESET, CMD_HOOK)
+            ):
                 cmd_triggered = True
                 cmd_value = value
+                cmd_prefers_display_address = prefers_display_address
 
         if cmd_triggered and self._on_command:
             # 读取当前模式
-            mode_offset = 40002 - start_address
-            current_mode = current_registers[mode_offset] if 0 <= mode_offset < len(current_registers) else 0
+            current_mode = self._read_current_register(
+                current_registers,
+                start_address,
+                REG_MODE,
+                default=MODE_AUTO,
+                prefer_display=cmd_prefers_display_address,
+            )
             self._on_command(cmd_value, mode=current_mode)
 
         return None
@@ -300,18 +359,22 @@ class DobotModbusServer:
             "last_duration_ms": self._last_duration_ms,
         }
 
-    def update_status_registers(self, status=2, mode=0):
+    def update_status_registers(self, status=0, mode=0):
         """更新状态寄存器（40001 和 40002）"""
         if not self._loop or not self._loop.is_running() or not self._server:
             return
+        values = [int(status), int(mode)]
+        signature = self._mark_internal_status_write(_WIRE_ADDR, values)
         try:
             future = asyncio.run_coroutine_threadsafe(
-                self._server.context.async_setValues(self._slave_id, 3, _WIRE_ADDR, [int(status), int(mode)]),
+                self._server.context.async_setValues(self._slave_id, 3, _WIRE_ADDR, values),
                 self._loop,
             )
             future.result(timeout=2.0)
         except Exception as e:
             logger.error("update_status_registers failed: %s", e)
+        finally:
+            self._discard_internal_status_write(signature)
 
     def get_register_values(self):
         """获取寄存器当前值"""

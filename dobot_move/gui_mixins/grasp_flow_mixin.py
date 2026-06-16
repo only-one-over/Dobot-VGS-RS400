@@ -389,10 +389,10 @@ class GraspFlowMixin:
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载抓取流程时出错: {e}")
 
-    def run_grasp_flow(self):
+    def run_grasp_flow(self, modbus_triggered=False):
         if self._flow_running:
             self.statusBar().showMessage("流程已在运行中")
-            return
+            return False
         self._flow_running = True
         self.is_paused = False
         if hasattr(self, "_refresh_action_states"):
@@ -406,13 +406,18 @@ class GraspFlowMixin:
         if errors:
             self._flow_running = False
             error_text = "\n".join(errors)
-            QMessageBox.warning(self, "流程校验失败", f"以下问题需要修正：\n\n{error_text}")
+            if modbus_triggered:
+                self.statusBar().showMessage(f"Modbus流程校验失败: {error_text}")
+                self.controller.record_alarm("Modbus执行流程", "VALIDATION_FAILED", "故障", error_text)
+            else:
+                QMessageBox.warning(self, "流程校验失败", f"以下问题需要修正：\n\n{error_text}")
             if hasattr(self, "_refresh_action_states"):
                 self._refresh_action_states()
-            return
+            return False
 
         from ..workers import FlowThread
 
+        self._flow_started_by_modbus = bool(modbus_triggered)
         self._flow_thread = FlowThread(
             self.controller,
             self.vision_d435i,
@@ -426,6 +431,7 @@ class GraspFlowMixin:
         self._flow_thread.flow_module_progress.connect(self._on_flow_module_progress)
         self._flow_thread.finished.connect(self._flow_thread.deleteLater)
         self._flow_thread.start()
+        return True
 
     def _on_flow_log(self, msg):
         self.statusBar().showMessage(msg)
@@ -443,6 +449,8 @@ class GraspFlowMixin:
             self.flow_step_list.set_step_status(idx, STATUS_RUNNING)
 
     def _on_flow_finished(self, success):
+        modbus_triggered = bool(getattr(self, "_flow_started_by_modbus", False))
+        self._flow_started_by_modbus = False
         self._flow_running = False
         self._flow_thread = None
         self.is_paused = False
@@ -451,12 +459,20 @@ class GraspFlowMixin:
         for i in range(len(self.grasp_flow_modules)):
             self.flow_step_list.set_step_status(i, STATUS_COMPLETED if success else STATUS_FAILED)
         if success:
-            QMessageBox.information(self, "成功", "抓取流程执行完成")
+            if modbus_triggered:
+                self.controller.mark_modbus_program_finished(True)
+                self.statusBar().showMessage("Modbus触发的运动编辑流程执行完成")
+            else:
+                QMessageBox.information(self, "成功", "抓取流程执行完成")
         else:
             self.controller.record_alarm("流程执行", "", "故障", "抓取流程执行失败", "查看状态栏和流程步骤，确认失败模块")
             if hasattr(self, "_refresh_alarm_table"):
                 self._refresh_alarm_table()
-            QMessageBox.warning(self, "失败", "抓取流程执行失败，请检查状态栏信息")
+            if modbus_triggered:
+                self.controller.mark_modbus_program_finished(False)
+                self.statusBar().showMessage("Modbus触发的运动编辑流程执行失败")
+            else:
+                QMessageBox.warning(self, "失败", "抓取流程执行失败，请检查状态栏信息")
 
     def _on_steps_reordered(self, modules):
         self.grasp_flow_modules = modules

@@ -455,7 +455,7 @@ class FlowThread(QThread):
                                     r=seg_r,
                                     wait=False,
                                 )
-                                if resp_code == 0:
+                                if resp_code is not False and resp_code == 0:
                                     queued_count += 1
                                     logger.info("relative_path queued seg %d: offsets=%s coord=%s speed=%d cp=%d r=%d cmd_id=%s", queued_count, offsets, seg_coord, seg_speed, seg_cp, seg_r, seg_cmd_id)
                                 else:
@@ -890,5 +890,4 @@ class CameraTestWorker(QThread):
         if self._capture_thread:
             self._capture_thread.stop()
             self._capture_thread.join(timeout=3.0)
-
 

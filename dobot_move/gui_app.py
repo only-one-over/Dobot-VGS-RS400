@@ -16,7 +16,7 @@ from .qt_compat import (
     QMessageBox, QLineEdit, QDoubleSpinBox, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QFrame, QScrollArea, QStackedWidget,
     QCheckBox, QSizePolicy,
-    Qt, QTimer,
+    Qt, QTimer, pyqtSignal,
 )
 
 from .robot_controller import DobotController
@@ -120,6 +120,7 @@ _DEFAULT_GRASP_FLOW_MODULES = [
 
 class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManagementMixin, GraspFlowMixin, JogMixin, QMainWindow):
     """机器人控制GUI"""
+    _modbus_program_requested = pyqtSignal()
     
     def __init__(self):
         super().__init__()
@@ -131,6 +132,8 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         
         self.robot_ip = get_robot_ip()
         self.controller = DobotController(self.robot_ip)
+        self._modbus_program_requested.connect(self._run_modbus_program_from_signal)
+        self.controller.set_modbus_program_runner(self._request_modbus_program_from_modbus)
         self.vision_d435i = None
         self.vision_d405 = None
         
@@ -138,6 +141,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         
         self.is_paused = False
         self._flow_running = False
+        self._flow_started_by_modbus = False
         self._software_emergency_active = False
         self._emergency_cmd_running = False
         self._last_emergency_click_ts = 0.0
@@ -163,6 +167,17 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
                 self.grasp_flow_modules = list(_DEFAULT_GRASP_FLOW_MODULES)
         else:
             self.grasp_flow_modules = list(_DEFAULT_GRASP_FLOW_MODULES)
+
+    def _request_modbus_program_from_modbus(self):
+        if getattr(self, "_flow_running", False):
+            return False
+        self._modbus_program_requested.emit()
+        return True
+
+    def _run_modbus_program_from_signal(self):
+        started = self.run_grasp_flow(modbus_triggered=True)
+        if not started:
+            self.controller.mark_modbus_program_finished(False)
 
     @staticmethod
     def _wrap_in_scroll(widget):

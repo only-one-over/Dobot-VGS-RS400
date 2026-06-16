@@ -150,6 +150,14 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 python -m dobot_move
 ```
 
+生产现场 7x24 后台运行使用根目录脚本：
+
+```powershell
+python runtime_agent.py --startup-delay 20
+```
+
+开机自启动和状态排查见 [docs/runtime_agent.md](docs/runtime_agent.md)。
+
 ### 首次设置
 
 1. **连接机器人** — 在界面中输入机器人 IP，点击"连接"

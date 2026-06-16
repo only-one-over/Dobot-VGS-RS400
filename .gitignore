@@ -27,3 +27,5 @@ dobot_move/alarm_history.json
 figma_thumbnail.png
 vendor/
 docs/code_wiki.md
+logs/
+runtime_health.json

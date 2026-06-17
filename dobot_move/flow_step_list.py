@@ -201,26 +201,33 @@ class FlowStepList(QWidget):
     def _build_step_text(self, i: int, module: dict) -> str:
         """Build display text for a step."""
         text = f"{i+1}. {module['name']}"
+        params = module.get('params', {})
+        force_guard = params.get("force_guard") or {}
+        force_text = ""
+        if force_guard.get("enabled"):
+            force_text = f", TCP力停: {float(force_guard.get('threshold_n', 0)):.1f}N"
         if module['type'] == "move":
-            if module['params'].get('motion_type') == "MovL":
-                point_name = module['params'].get('point_name', '')
-                text += f" (直线运动, 点位: {point_name}, 速度: {module['params']['speed']}%)"
+            if params.get('motion_type') == "MovL":
+                point_name = params.get('point_name', '')
+                text += f" (直线运动, 点位: {point_name}, 速度: {params['speed']}%{force_text})"
         elif module['type'] in ("arc_motion", "force_arc"):
-            p = module['params']
+            p = params
             offset = p.get('center_offset_z', p.get('radius', 50))
             sweep = p.get('sweep_angle', abs(float(p.get('end_angle', 90)) - float(p.get('start_angle', 0))))
             direction = "顺时针" if p.get('arc_direction') == 'cw' else "逆时针"
-            text += f" (圆弧运动, 上方距离: {offset}mm, 角度: {sweep}°, 方向: {direction})"
+            text += f" (圆弧运动, 上方距离: {offset}mm, 角度: {sweep}°, 方向: {direction}{force_text})"
         elif module['type'] == "relative_move":
-            p = module['params']
+            p = params
             coord = {"user": "用户", "tool": "工具", "joint": "关节"}.get(p.get("coord_system", "user"), "用户")
             motion = {"linear": "直线", "joint": "关节"}.get(p.get("motion_type", "linear"), "直线")
-            text += f" (相对移动, 坐标系: {coord}, 方式: {motion}, 偏移: {p.get('offsets', [0]*6)}, 速度: {p.get('speed', 30)}%)"
+            text += f" (相对移动, 坐标系: {coord}, 方式: {motion}, 偏移: {p.get('offsets', [0]*6)}, 速度: {p.get('speed', 30)}%{force_text})"
+        elif module['type'] == "relative_path":
+            text += f" (连续相对路径{force_text})"
         elif module['type'] == "joint_move":
-            offsets = module['params'].get('offsets', [0]*6)
-            text += f" (关节旋转, 偏移: {offsets}, 速度: {module['params']['speed']}%)"
+            offsets = params.get('offsets', [0]*6)
+            text += f" (关节旋转, 偏移: {offsets}, 速度: {params['speed']}%)"
         elif module['type'] == "visual_servo":
-            p = module['params']
+            p = params
             text += f" (视觉伺服, 目标: {p.get('target_type', 'grasp_point')}, 阈值: {p.get('converge_threshold', 2.0)}mm)"
         return text
 

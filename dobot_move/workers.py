@@ -70,6 +70,31 @@ def normalize_module_type(module: dict) -> dict:
     return module
 
 
+def build_force_guard(params: dict):
+    """Build normalized force guard config from a flow module params dict."""
+    guard = params.get("force_guard") or {}
+    if not guard or not guard.get("enabled"):
+        return None
+    try:
+        threshold_n = float(guard.get("threshold_n", 0))
+        baseline_samples = int(guard.get("baseline_samples", 3))
+        baseline_interval = float(guard.get("baseline_interval", 0.02))
+        debounce_samples = int(guard.get("debounce_samples", 2))
+    except (TypeError, ValueError):
+        threshold_n = 0.0
+        baseline_samples = 3
+        baseline_interval = 0.02
+        debounce_samples = 2
+    return {
+        "enabled": True,
+        "mode": "resultant_delta",
+        "threshold_n": threshold_n,
+        "baseline_samples": baseline_samples,
+        "baseline_interval": baseline_interval,
+        "debounce_samples": debounce_samples,
+    }
+
+
 def validate_grasp_flow_modules(modules: list) -> list:
     """Validate grasp flow module configuration before execution.
 
@@ -84,6 +109,11 @@ def validate_grasp_flow_modules(modules: list) -> list:
         name = module.get("name", f"模块{step}")
         mtype = module.get("type", "")
         params = module.get("params", {})
+
+        if mtype in ("move", "arc_motion", "relative_move", "relative_path"):
+            guard = build_force_guard(params)
+            if guard is not None and float(guard.get("threshold_n", 0)) <= 0:
+                errors.append(f"第{step}步「{name}」：TCP力阈值必须大于0N")
 
         if mtype == "move":
             target = params.get("target", "")
@@ -158,6 +188,22 @@ class FlowThread(QThread):
         self.controller.record_alarm("流程执行", f"模块{module_index + 1}", "故障", reason)
         self.flow_finished.emit(False)
 
+    def _log_force_guard_if_triggered(self, module_index, module_name):
+        if getattr(self.controller, "_last_motion_completion_reason", None) != "force_triggered":
+            return False
+        event = getattr(self.controller, "_last_force_guard_event", None) or {}
+        delta_n = float(event.get("delta_n", 0.0))
+        threshold_n = float(event.get("threshold_n", 0.0))
+        pose = event.get("pose")
+        pose_text = ""
+        if pose:
+            pose_text = f", 当前点=[{pose[0]:.1f},{pose[1]:.1f},{pose[2]:.1f}]"
+        self.flow_log.emit(
+            f"✅ 模块{module_index + 1}「{module_name}」TCP力触发停止: "
+            f"{delta_n:.2f}N >= {threshold_n:.2f}N，继续下一步{pose_text}"
+        )
+        return True
+
     def stop(self):
         if self._ctx is not None:
             self._ctx.stop_event.set()
@@ -207,6 +253,7 @@ class FlowThread(QThread):
 
                     module = normalize_module_type(module)
                     name = module.get("name", f"模块{i+1}")
+                    force_guard = build_force_guard(module.get("params", {}))
                     self.flow_module_progress.emit(i + 1, total, name)
 
                     # --- Feedback health check before motion modules ---
@@ -227,9 +274,15 @@ class FlowThread(QThread):
 
                     if module['type'] == "move":
                         if module['params']['target'] == "initial_position":
-                            if not self.controller.move_to_initial_position(verify_start_pose=False, verify_end_pose=False, wait_poll_interval=wait_poll_interval):
+                            if not self.controller.move_to_initial_position(
+                                verify_start_pose=False,
+                                verify_end_pose=False,
+                                wait_poll_interval=wait_poll_interval,
+                                force_guard=force_guard,
+                            ):
                                 self._fail_module(ctx, i, name, "移动到初始位置失败")
                                 return
+                            self._log_force_guard_if_triggered(i, name)
                             move_timing = getattr(self.controller, '_last_move_timing', {})
                         elif module['params']['target'] == "camera_detected":
                             if base_coords is None:
@@ -251,10 +304,12 @@ class FlowThread(QThread):
                                     verify_start_pose=False,
                                     verify_end_pose=False,
                                     wait_poll_interval=wait_poll_interval,
+                                    force_guard=force_guard,
                                 )
                                 if not success:
                                     self._fail_module(ctx, i, name, "直线运动失败")
                                     return
+                                self._log_force_guard_if_triggered(i, name)
                             move_timing = getattr(self.controller, '_last_move_timing', {})
                         elif module['params']['target'] == "saved_point":
                             point_name = module['params'].get('point_name', '')
@@ -272,10 +327,12 @@ class FlowThread(QThread):
                                 verify_start_pose=False,
                                 verify_end_pose=False,
                                 wait_poll_interval=wait_poll_interval,
+                                force_guard=force_guard,
                             )
                             if not success:
                                 self._fail_module(ctx, i, name, f"移动到点位 '{point_name}' 失败")
                                 return
+                            self._log_force_guard_if_triggered(i, name)
                             move_timing = getattr(self.controller, '_last_move_timing', {})
                         else:
                             move_timing = {}
@@ -340,17 +397,29 @@ class FlowThread(QThread):
                                 orientation=orientation,
                                 speed_factor=p.get('speed', 20)
                             )
+                            try:
+                                prepared_force_guard = self.controller.prepare_force_guard(force_guard)
+                            except RuntimeError as e:
+                                self._fail_module(ctx, i, name, f"力到位保护准备失败: {e}")
+                                return
                             cmd_start = time.perf_counter()
                             arc_command_id = fa_ctrl.execute(set_speed=False)
                             cmd_elapsed = time.perf_counter() - cmd_start
                             arc_length = abs(center_offset_z * np.deg2rad(sweep_angle))
                             timeout = min(max(arc_length / 20.0 + 5.0, 5.0), 60.0)
                             wait_start = time.perf_counter()
-                            if not self.controller.wait_for_motion_completion(timeout=timeout, poll_interval=wait_poll_interval, stop_checker=stop_checker, command_id=arc_command_id):
+                            if not self.controller.wait_for_motion_completion(
+                                timeout=timeout,
+                                poll_interval=wait_poll_interval,
+                                stop_checker=stop_checker,
+                                command_id=arc_command_id,
+                                force_guard=prepared_force_guard,
+                            ):
                                 self._fail_module(ctx, i, name, "圆弧运动等待完成失败")
                                 return
                             wait_elapsed = time.perf_counter() - wait_start
-                            self.flow_log.emit(f"✅ 模块{i+1}圆弧运动完成")
+                            if not self._log_force_guard_if_triggered(i, name):
+                                self.flow_log.emit(f"✅ 模块{i+1}圆弧运动完成")
                         except Exception as e:
                             self._fail_module(ctx, i, name, f"圆弧运动失败: {e}")
                             return
@@ -383,13 +452,15 @@ class FlowThread(QThread):
                             acceleration=acceleration,
                             cp=cp,
                             wait_poll_interval=wait_poll_interval,
+                            force_guard=force_guard,
                         )
                         cmd_elapsed = time.perf_counter() - cmd_start
                         wait_elapsed = 0.0
                         if not success:
                             self._fail_module(ctx, i, name, "相对移动失败")
                             return
-                        self.flow_log.emit(f"✅ 模块{i+1}相对移动完成")
+                        if not self._log_force_guard_if_triggered(i, name):
+                            self.flow_log.emit(f"✅ 模块{i+1}相对移动完成")
                         ctx.increment_motion_generation()
 
                     elif module['type'] == "relative_path":
@@ -407,6 +478,9 @@ class FlowThread(QThread):
                         g_accel = int(p.get('acceleration', 30))
                         g_cp = int(p.get('cp', 0))
                         execution_mode = str(p.get('execution_mode', 'stop_each')).lower()
+                        if force_guard is not None and execution_mode == "queued":
+                            self.flow_log.emit("  已启用TCP力到位保护，连续相对路径自动改为逐段等待模式")
+                            execution_mode = "stop_each"
                         segments = p.get('segments', [])
 
                         if not segments:
@@ -503,6 +577,8 @@ class FlowThread(QThread):
                                     acceleration=seg_accel,
                                     cp=seg_cp,
                                     r=seg_r,
+                                    wait_poll_interval=wait_poll_interval,
+                                    force_guard=force_guard,
                                 )
                                 seg_elapsed = time.perf_counter() - seg_start
 
@@ -511,6 +587,8 @@ class FlowThread(QThread):
                                     return
 
                                 seg_name = seg.get('name', f'段{seg_idx+1}')
+                                if self._log_force_guard_if_triggered(i, f"{name}/段{seg_idx+1}"):
+                                    break
                                 logger.info("relative_path seg %d/%d: name=%s offsets=%s coord=%s speed=%d cp=%d r=%d elapsed=%.3fs", seg_idx + 1, len(segments), seg_name, offsets, seg_coord, seg_speed, seg_cp, seg_r, seg_elapsed)
                                 self.flow_log.emit(f"  段{seg_idx+1}/{len(segments)}「{seg_name}」: [{offsets[0]:.1f},{offsets[1]:.1f},{offsets[2]:.1f}] coord={seg_coord} speed={seg_speed}% cp={seg_cp} r={seg_r} %.3fs" % seg_elapsed)
 
@@ -890,4 +968,3 @@ class CameraTestWorker(QThread):
         if self._capture_thread:
             self._capture_thread.stop()
             self._capture_thread.join(timeout=3.0)
-

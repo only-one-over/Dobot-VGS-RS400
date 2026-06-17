@@ -4,6 +4,7 @@ import time
 import types
 
 import numpy as np
+import pytest
 
 
 def _install_modbus_stub():
@@ -41,6 +42,7 @@ def _make_feedback_packet():
     packet["TestValue"][0] = 0x123456789ABCDEF
     packet["ToolVectorActual"][0] = [100.0, 200.0, 300.0, 1.0, 2.0, 3.0]
     packet["TCPSpeedActual"][0] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    packet["ActualTCPForce"][0] = [1.0, 2.0, 3.0, 0.1, 0.2, 0.3]
     packet["ToolVectorTarget"][0] = [101.0, 201.0, 301.0, 1.1, 2.1, 3.1]
     packet["QActual"][0] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
     packet["QTarget"][0] = [11.0, 21.0, 31.0, 41.0, 51.0, 61.0]
@@ -57,6 +59,34 @@ def _make_controller():
     return controller
 
 
+class _FakeStopDashboard:
+    def __init__(self):
+        self.calls = []
+
+    def Stop(self):
+        self.calls.append("Stop")
+        return "0,{0},0;"
+
+
+def _force_snapshot(force, command_id=1, robot_mode=7):
+    return {
+        "pose": [300.0, 0.0, 200.0, 0.0, 0.0, -90.0],
+        "tcp_speed": [5.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "running_status": 1,
+        "run_queued_cmd": 1,
+        "current_command_id": command_id,
+        "tool_vector_target": None,
+        "robot_mode": robot_mode,
+        "q_actual": None,
+        "q_target": None,
+        "actual_tcp_force": list(force),
+        "timestamp": time.time(),
+        "health": "ok",
+        "feedback_age": 0.0,
+        "pose_timestamp": time.time(),
+    }
+
+
 def _cache_packet(controller, packet):
     now = time.time()
     with controller.feed_lock:
@@ -67,6 +97,8 @@ def _cache_packet(controller, packet):
         controller.latest_pose_time = now
         controller.latest_tcp_speed = controller._extract_tcp_speed_from_feed_data(packet)
         controller.latest_tcp_speed_time = now
+        controller.latest_actual_tcp_force = controller._extract_actual_tcp_force_from_feed_data(packet)
+        controller.latest_actual_tcp_force_time = now
         controller.latest_robot_mode = controller._extract_robot_mode_from_feed_data(packet)
         controller.latest_robot_mode_time = now
         controller.latest_running_status = controller._extract_running_status_from_feed_data(packet)
@@ -93,8 +125,88 @@ def test_structured_feedback_fields_are_extracted():
     assert controller._extract_tcp_speed_from_feed_data(packet).tolist() == [
         0.1, 0.2, 0.3, 0.4, 0.5, 0.6
     ]
+    assert controller._extract_actual_tcp_force_from_feed_data(packet).tolist() == [
+        1.0, 2.0, 3.0, 0.1, 0.2, 0.3
+    ]
     assert controller._extract_robot_mode_from_feed_data(packet) == 5
     assert controller._extract_current_command_id_from_feed_data(packet) == 1234
+
+
+def test_force_delta_norm_uses_xyz_resultant():
+    assert DobotController._force_delta_norm([4, 6, 3, 0, 0, 0], [1, 2, 3, 0, 0, 0]) == 5.0
+
+
+def test_prepare_force_guard_averages_pre_motion_baseline(monkeypatch):
+    controller = _make_controller()
+    snapshots = [
+        _force_snapshot([1, 2, 3, 0, 0, 0]),
+        _force_snapshot([3, 4, 5, 0, 0, 0]),
+    ]
+
+    def fake_snapshot(max_age=0.3):
+        return snapshots.pop(0)
+
+    monkeypatch.setattr(controller, "get_motion_feedback_snapshot", fake_snapshot)
+
+    guard = controller.prepare_force_guard({
+        "enabled": True,
+        "threshold_n": 5,
+        "baseline_samples": 2,
+        "baseline_interval": 0,
+    })
+
+    assert guard["baseline_force"][:3] == [2.0, 3.0, 4.0]
+    assert guard["threshold_n"] == 5.0
+
+
+def test_prepare_force_guard_rejects_missing_force_feedback(monkeypatch):
+    controller = _make_controller()
+    monkeypatch.setattr(
+        controller,
+        "get_motion_feedback_snapshot",
+        lambda max_age=0.3: {"health": "disconnected", "actual_tcp_force": None},
+    )
+
+    with pytest.raises(RuntimeError, match="TCP力反馈不可用"):
+        controller.prepare_force_guard({
+            "enabled": True,
+            "threshold_n": 5,
+            "baseline_samples": 1,
+            "baseline_interval": 0,
+            "sample_timeout": 0.01,
+        })
+
+
+def test_wait_force_guard_stops_and_succeeds_before_command_id(monkeypatch):
+    controller = _make_controller()
+    controller.dashboard = _FakeStopDashboard()
+    snapshots = [
+        _force_snapshot([4, 6, 3, 0, 0, 0], command_id=999, robot_mode=5),
+        _force_snapshot([4, 6, 3, 0, 0, 0], command_id=999, robot_mode=5),
+    ]
+
+    def fake_snapshot(max_age=0.3):
+        return snapshots.pop(0) if snapshots else _force_snapshot([4, 6, 3, 0, 0, 0], command_id=999, robot_mode=5)
+
+    monkeypatch.setattr(controller, "get_motion_feedback_snapshot", fake_snapshot)
+
+    ok = controller.wait_for_motion_completion(
+        timeout=0.5,
+        poll_interval=0,
+        settle_time=0,
+        command_id=999,
+        force_guard={
+            "enabled": True,
+            "threshold_n": 4.9,
+            "baseline_force": [1, 2, 3, 0, 0, 0],
+            "debounce_samples": 2,
+        },
+    )
+
+    assert ok is True
+    assert controller.dashboard.calls == ["Stop"]
+    assert controller._last_motion_completion_reason == "force_triggered"
+    assert controller._last_force_guard_event["delta_n"] == 5.0
 
 
 def test_feedback_health_uses_feed_timestamp():
@@ -121,6 +233,7 @@ def test_motion_snapshot_uses_feed_timestamp_even_without_pose_timestamp():
     assert snapshot["timestamp"] == controller.latest_feed_time
     assert snapshot["pose_timestamp"] == 0.0
     assert snapshot["current_command_id"] == 1234
+    assert snapshot["actual_tcp_force"] == [1.0, 2.0, 3.0, 0.1, 0.2, 0.3]
 
 
 def test_stop_feedback_clears_cached_packet(monkeypatch):
@@ -137,3 +250,4 @@ def test_stop_feedback_clears_cached_packet(monkeypatch):
     assert controller.feed_data is None
     assert controller.latest_feed_time == 0.0
     assert controller.latest_pose is None
+    assert controller.latest_actual_tcp_force is None

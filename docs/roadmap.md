@@ -15,7 +15,7 @@
 - ✅ 执行流程优化：预执行验证、默认模板修复、耗时拆分（speed_set/cmd_send/motion_wait）
 - ✅ 运动完成判定提速：30004 反馈状态机、角速度判定、Dashboard fallback 降频
 - ✅ 连续相对路径模块：多段相对运动、stop_each/queued 执行模式
-- ✅ 连续相对运动高自由度编辑器：15列段表、模板按钮、段级参数覆盖
+- ✅ 连续相对运动高自由度编辑器：15列段表、段级参数覆盖
 - ✅ 官方 command_id 模式：parse_response_ids、CurrentCommandId 精确判定
 - ✅ 稳定性修复：command_id 保守判定、stop_feedback 不卡死、急停独立连接优先
 - ✅ Modbus 异步执行：运动命令投递独立线程、cmd=9 急停快速路径

@@ -8,6 +8,25 @@ from ..flow_step_list import STATUS_COMPLETED, STATUS_FAILED, STATUS_RUNNING
 
 
 class GraspFlowMixin:
+    @staticmethod
+    def _default_force_guard(enabled=False, threshold_n=5.0):
+        return {
+            "enabled": bool(enabled),
+            "threshold_n": float(threshold_n),
+            "mode": "resultant_delta",
+        }
+
+    def _force_guard_from_controls(self, enabled_widget, threshold_widget):
+        return self._default_force_guard(
+            enabled=enabled_widget.isChecked(),
+            threshold_n=threshold_widget.value(),
+        )
+
+    def _apply_force_guard_to_controls(self, params, enabled_widget, threshold_widget):
+        guard = params.get("force_guard") or {}
+        enabled_widget.setChecked(bool(guard.get("enabled", False)))
+        threshold_widget.setValue(float(guard.get("threshold_n", 5.0)))
+
     def _normalize_flow_modules(self):
         for module in self.grasp_flow_modules:
             if module.get("type") == "force_arc":
@@ -56,6 +75,7 @@ class GraspFlowMixin:
                     "motion_type": "MovL",
                     "speed": 30,
                     "point_name": "d435i",
+                    "force_guard": self._default_force_guard(),
                 },
             }
         elif module_type == "圆弧运动":
@@ -67,6 +87,7 @@ class GraspFlowMixin:
                     "sweep_angle": 90,
                     "arc_direction": "ccw",
                     "speed": 20,
+                    "force_guard": self._default_force_guard(),
                 },
             }
         elif module_type == "相对移动":
@@ -80,6 +101,7 @@ class GraspFlowMixin:
                     "speed": 30,
                     "acceleration": 20,
                     "cp": 100,
+                    "force_guard": self._default_force_guard(),
                 },
             }
         elif module_type == "连续相对路径":
@@ -93,6 +115,7 @@ class GraspFlowMixin:
                     "acceleration": 30,
                     "cp": 0,
                     "execution_mode": "stop_each",
+                    "force_guard": self._default_force_guard(),
                     "segments": [
                         {"enabled": True, "name": "X+200", "x": 200, "y": 0, "z": 0, "rx": 0, "ry": 0, "rz": 0}
                     ],
@@ -195,12 +218,20 @@ class GraspFlowMixin:
             current_module["params"]["target"] = target_text_map.get(self.linear_target_combo.currentText(), "saved_point")
             current_module["params"]["point_name"] = self.linear_point_combo.currentText()
             current_module["params"]["speed"] = int(self.linear_speed.value())
+            current_module["params"]["force_guard"] = self._force_guard_from_controls(
+                self.linear_force_guard_enabled,
+                self.linear_force_threshold,
+            )
             QMessageBox.information(self, "成功", "直线运动参数已更新")
         elif module_type == "圆弧运动" and current_module["type"] == "arc_motion":
             current_module["params"]["center_offset_z"] = self.fa_center_offset_z.value()
             current_module["params"]["sweep_angle"] = self.fa_sweep_angle.value()
             current_module["params"]["arc_direction"] = "cw" if self.fa_arc_direction.currentText() == "顺时针" else "ccw"
             current_module["params"]["speed"] = int(self.fa_speed.value())
+            current_module["params"]["force_guard"] = self._force_guard_from_controls(
+                self.fa_force_guard_enabled,
+                self.fa_force_threshold,
+            )
             QMessageBox.information(self, "成功", "圆弧运动参数已更新")
         elif module_type == "相对移动" and current_module["type"] == "relative_move":
             coord_map = {"用户": "user", "工具": "tool", "关节": "joint"}
@@ -211,6 +242,10 @@ class GraspFlowMixin:
             current_module["params"]["speed"] = int(self.rel_speed.value())
             current_module["params"]["acceleration"] = int(self.rel_accel.value())
             current_module["params"]["cp"] = int(self.rel_cp.value())
+            current_module["params"]["force_guard"] = self._force_guard_from_controls(
+                self.rel_force_guard_enabled,
+                self.rel_force_threshold,
+            )
             QMessageBox.information(self, "成功", "相对移动参数已更新")
         elif module_type == "连续相对路径" and current_module["type"] == "relative_path":
             coord_map = {"用户": "user", "工具": "tool", "关节": "joint"}
@@ -221,6 +256,10 @@ class GraspFlowMixin:
             current_module["params"]["acceleration"] = int(self.rpath_accel.value())
             current_module["params"]["cp"] = int(self.rpath_cp.value())
             current_module["params"]["execution_mode"] = self.rpath_exec_mode.currentText()
+            current_module["params"]["force_guard"] = self._force_guard_from_controls(
+                self.rpath_force_guard_enabled,
+                self.rpath_force_threshold,
+            )
             self._save_path_segments(self.rpath_seg_table, current_module["params"])
             QMessageBox.information(self, "成功", "连续相对路径参数已更新")
         elif module_type == "关节旋转" and current_module["type"] == "joint_move":
@@ -287,6 +326,11 @@ class GraspFlowMixin:
             if idx >= 0:
                 self.linear_point_combo.setCurrentIndex(idx)
             self.linear_speed.setValue(module["params"].get("speed", 30))
+            self._apply_force_guard_to_controls(
+                module["params"],
+                self.linear_force_guard_enabled,
+                self.linear_force_threshold,
+            )
         elif module["type"] == "arc_motion":
             p = module.get("params", {})
             self.fa_center_offset_z.setValue(float(p.get("center_offset_z", p.get("radius", 50))))
@@ -298,6 +342,11 @@ class GraspFlowMixin:
             if idx >= 0:
                 self.fa_arc_direction.setCurrentIndex(idx)
             self.fa_speed.setValue(float(p.get("speed", 20)))
+            self._apply_force_guard_to_controls(
+                p,
+                self.fa_force_guard_enabled,
+                self.fa_force_threshold,
+            )
         elif module["type"] == "relative_move":
             p = module.get("params", {})
             coord_text = {"user": "用户", "tool": "工具", "joint": "关节"}.get(p.get("coord_system", "user"), "用户")
@@ -314,6 +363,11 @@ class GraspFlowMixin:
             self.rel_speed.setValue(float(p.get("speed", 30)))
             self.rel_accel.setValue(float(p.get("acceleration", 20)))
             self.rel_cp.setValue(float(p.get("cp", 100)))
+            self._apply_force_guard_to_controls(
+                p,
+                self.rel_force_guard_enabled,
+                self.rel_force_threshold,
+            )
         elif module["type"] == "relative_path":
             p = module.get("params", {})
             coord_text = {"user": "用户", "tool": "工具", "joint": "关节"}.get(p.get("coord_system", "user"), "用户")
@@ -327,6 +381,11 @@ class GraspFlowMixin:
             self.rpath_speed.setValue(float(p.get("speed", 30)))
             self.rpath_accel.setValue(float(p.get("acceleration", 30)))
             self.rpath_cp.setValue(float(p.get("cp", 0)))
+            self._apply_force_guard_to_controls(
+                p,
+                self.rpath_force_guard_enabled,
+                self.rpath_force_threshold,
+            )
             # Load execution_mode
             exec_mode = p.get("execution_mode", "stop_each")
             idx = self.rpath_exec_mode.findText(exec_mode)

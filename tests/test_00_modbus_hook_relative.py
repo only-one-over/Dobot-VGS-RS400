@@ -567,6 +567,15 @@ def test_queued_relative_path_does_not_treat_false_as_success():
     assert "if resp_code is not False and resp_code == 0:" in source
 
 
+def test_force_guard_relative_path_forces_stop_each_mode():
+    with open("dobot_move/workers.py", encoding="utf-8") as f:
+        source = f.read()
+
+    assert 'if force_guard is not None and execution_mode == "queued":' in source
+    assert 'execution_mode = "stop_each"' in source
+    assert "force_guard=force_guard" in source
+
+
 def test_gui_modbus_program_uses_signal_and_resets_after_success():
     with open("dobot_move/gui_app.py", encoding="utf-8") as f:
         gui_source = f.read()

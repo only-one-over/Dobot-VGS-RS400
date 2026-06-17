@@ -51,6 +51,8 @@ class DobotController:
         self.latest_feed_time = 0.0
         self.latest_tcp_speed = None
         self.latest_tcp_speed_time = 0.0
+        self.latest_actual_tcp_force = None
+        self.latest_actual_tcp_force_time = 0.0
         self.latest_running_status = None
         self.latest_running_status_time = 0.0
         self.latest_run_queued_cmd = None
@@ -96,6 +98,8 @@ class DobotController:
         self._motion_lock = threading.Lock()
         self._last_move_timing = {}  # {"speed_set": 0.0, "command_send": 0.0, "motion_wait": 0.0}
         self._last_command_id = None
+        self._last_motion_completion_reason = None
+        self._last_force_guard_event = None
         self._feed_packet_drops = 0
 
         _cfg = get_config()
@@ -853,6 +857,9 @@ class DobotController:
     def _extract_tcp_speed_from_feed_data(self, data):
         return self._extract_vector6_from_feed_data(data, "TCPSpeedActual")
 
+    def _extract_actual_tcp_force_from_feed_data(self, data):
+        return self._extract_vector6_from_feed_data(data, "ActualTCPForce")
+
     def _extract_robot_mode_from_feed_data(self, data):
         return self._extract_int_from_feed_data(data, "RobotMode")
 
@@ -876,6 +883,74 @@ class DobotController:
 
     def _extract_q_target_from_feed_data(self, data):
         return self._extract_vector6_from_feed_data(data, "QTarget")
+
+    @staticmethod
+    def _force_delta_norm(current_force, baseline_force):
+        """Return resultant delta force for Fx/Fy/Fz in Newtons."""
+        current = [float(v) for v in list(current_force)[:3]]
+        baseline = [float(v) for v in list(baseline_force)[:3]]
+        if len(current) < 3 or len(baseline) < 3:
+            raise ValueError("TCP force vector must contain at least Fx/Fy/Fz")
+        return math.sqrt(sum((current[i] - baseline[i]) ** 2 for i in range(3)))
+
+    @staticmethod
+    def _force_guard_enabled(force_guard):
+        return bool(force_guard and force_guard.get("enabled"))
+
+    def prepare_force_guard(self, force_guard, max_age=None):
+        """Validate force guard config and sample a pre-motion software baseline."""
+        if not self._force_guard_enabled(force_guard):
+            return None
+
+        guard = dict(force_guard)
+        try:
+            threshold = float(guard.get("threshold_n", 0))
+        except (TypeError, ValueError):
+            threshold = 0.0
+        if threshold <= 0:
+            raise RuntimeError("TCP力阈值必须大于0N")
+
+        perf = get_performance_config()
+        max_age = float(max_age if max_age is not None else perf.get("pose_cache_max_age", 0.3))
+        try:
+            sample_count = max(1, int(guard.get("baseline_samples", 3)))
+            sample_interval = max(0.0, float(guard.get("baseline_interval", 0.02)))
+            sample_timeout = max(0.01, float(guard.get("sample_timeout", 1.0)))
+        except (TypeError, ValueError):
+            sample_count = 3
+            sample_interval = 0.02
+            sample_timeout = 1.0
+        deadline = time.time() + sample_timeout
+        samples = []
+
+        while len(samples) < sample_count and time.time() <= deadline:
+            snapshot = self.get_motion_feedback_snapshot(max_age=max_age)
+            force = snapshot.get("actual_tcp_force")
+            if snapshot.get("health") == "ok" and force is not None and len(force) >= 3:
+                sample = [float(v) for v in list(force)[:6]]
+                if len(sample) < 6:
+                    sample.extend([0.0] * (6 - len(sample)))
+                samples.append(sample)
+            if len(samples) < sample_count:
+                time.sleep(sample_interval)
+
+        if len(samples) < sample_count:
+            raise RuntimeError("TCP力反馈不可用，无法启用力到位保护")
+
+        baseline = [
+            sum(sample[i] for sample in samples) / len(samples)
+            for i in range(6)
+        ]
+        guard["enabled"] = True
+        guard["mode"] = "resultant_delta"
+        guard["threshold_n"] = threshold
+        guard["baseline_force"] = baseline
+        try:
+            guard["debounce_samples"] = max(1, int(guard.get("debounce_samples", 2)))
+        except (TypeError, ValueError):
+            guard["debounce_samples"] = 2
+        guard["max_age"] = max_age
+        return guard
 
     def get_cached_pose(self, max_age=0.3):
         """Read parsed TCP pose from the 30004 feedback cache."""
@@ -959,6 +1034,7 @@ class DobotController:
             running_status = self.latest_running_status
             run_queued_cmd = self.latest_run_queued_cmd
             tcp_speed = list(self.latest_tcp_speed) if self.latest_tcp_speed is not None else None
+            actual_tcp_force = list(self.latest_actual_tcp_force) if self.latest_actual_tcp_force is not None else None
             timestamp = self.latest_feed_time
             pose_timestamp = self.latest_pose_time
 
@@ -967,6 +1043,7 @@ class DobotController:
                 "pose": None, "robot_mode": None, "timestamp": 0.0,
                 "health": "disconnected",
                 "running_status": None, "run_queued_cmd": None, "tcp_speed": None,
+                "actual_tcp_force": None,
                 "pose_timestamp": 0.0,
             }
 
@@ -987,6 +1064,7 @@ class DobotController:
             "running_status": running_status,
             "run_queued_cmd": run_queued_cmd,
             "tcp_speed": tcp_speed,
+            "actual_tcp_force": actual_tcp_force,
             "pose_timestamp": pose_timestamp,
         }
 
@@ -1008,6 +1086,7 @@ class DobotController:
             run_queued_cmd = self.latest_run_queued_cmd
             current_command_id = self.latest_current_command_id
             tool_vector_target = list(self.latest_tool_vector_target) if self.latest_tool_vector_target is not None else None
+            actual_tcp_force = list(self.latest_actual_tcp_force) if self.latest_actual_tcp_force is not None else None
             robot_mode = self.latest_robot_mode
             q_actual = list(self.latest_q_actual) if self.latest_q_actual is not None else None
             q_target = list(self.latest_q_target) if self.latest_q_target is not None else None
@@ -1019,6 +1098,7 @@ class DobotController:
                 "pose": None, "tcp_speed": None, "running_status": None,
                 "run_queued_cmd": None, "current_command_id": None,
                 "tool_vector_target": None, "robot_mode": None,
+                "actual_tcp_force": None,
                 "q_actual": None, "q_target": None,
                 "timestamp": 0.0, "health": "disconnected",
                 "feedback_age": 999.0,
@@ -1037,6 +1117,7 @@ class DobotController:
             "pose": pose, "tcp_speed": tcp_speed, "running_status": running_status,
             "run_queued_cmd": run_queued_cmd, "current_command_id": current_command_id,
             "tool_vector_target": tool_vector_target, "robot_mode": robot_mode,
+            "actual_tcp_force": actual_tcp_force,
             "q_actual": q_actual, "q_target": q_target,
             "timestamp": timestamp, "health": health,
             "feedback_age": age,
@@ -1053,6 +1134,7 @@ class DobotController:
         stop_checker=None,
         target_pose=None,
         command_id=None,
+        force_guard=None,
     ):
         """Wait until motion is complete, preferring 30004 feedback state machine."""
         perf = get_performance_config()
@@ -1071,6 +1153,14 @@ class DobotController:
         use_feedback = perf.get("motion_done_use_feedback", True)
         pose_cache_max_age = float(perf.get("pose_cache_max_age", 0.3))
         feedback_stale_fail_age = float(perf.get("feedback_stale_fail_age", 2.0))
+        force_guard = dict(force_guard) if self._force_guard_enabled(force_guard) else None
+        force_guard_counter = 0
+        self._last_motion_completion_reason = None
+        self._last_force_guard_event = None
+
+        if force_guard is not None and not force_guard.get("baseline_force"):
+            logger.error("力到位保护缺少运动前TCP力基线")
+            return False
 
         logger.info("等待运动完成: timeout=%.1fs poll=%.2fs settle=%.2fs target=%s",
                     timeout, poll_interval, settle_time,
@@ -1103,6 +1193,55 @@ class DobotController:
             snapshot_health = snapshot["health"]
             snapshot_timestamp = snapshot["timestamp"]
 
+            # --- Force guard check: must run before command_id completion ---
+            if force_guard is not None:
+                actual_force = snapshot.get("actual_tcp_force")
+                if snapshot_health != "ok" or actual_force is None:
+                    logger.error("力到位保护失效: 30004 TCP力反馈不可用，停止当前运动")
+                    try:
+                        self.dashboard.Stop()
+                    except Exception as e:
+                        logger.warning("力到位保护停止失败: %s", e)
+                    return False
+
+                try:
+                    delta_n = self._force_delta_norm(actual_force, force_guard["baseline_force"])
+                except (ValueError, TypeError) as e:
+                    logger.error("力到位保护TCP力数据异常: %s", e)
+                    try:
+                        self.dashboard.Stop()
+                    except Exception as stop_error:
+                        logger.warning("力到位保护停止失败: %s", stop_error)
+                    return False
+
+                threshold_n = float(force_guard["threshold_n"])
+                if delta_n >= threshold_n:
+                    force_guard_counter += 1
+                else:
+                    force_guard_counter = 0
+
+                if force_guard_counter >= int(force_guard.get("debounce_samples", 2)):
+                    event = {
+                        "threshold_n": threshold_n,
+                        "delta_n": delta_n,
+                        "current_force": list(actual_force)[:6],
+                        "baseline_force": list(force_guard["baseline_force"])[:6],
+                        "pose": cur_pose,
+                        "timestamp": snapshot_timestamp,
+                    }
+                    logger.warning(
+                        "TCP力到位触发: delta=%.3fN threshold=%.3fN force=%s baseline=%s",
+                        delta_n, threshold_n, event["current_force"], event["baseline_force"]
+                    )
+                    try:
+                        self.dashboard.Stop()
+                    except Exception as e:
+                        logger.warning("TCP力到位Stop()失败: %s", e)
+                    self._last_motion_completion_reason = "force_triggered"
+                    self._last_force_guard_event = event
+                    self._motion_done_stable_count = 0
+                    return True
+
             # --- Command ID completion check (official pattern) ---
             # Official DobotDemo: RobotMode == 5 && CurrentCommandId == command_id
             if command_id is not None and snapshot_health == "ok":
@@ -1114,6 +1253,7 @@ class DobotController:
                         if self._motion_done_stable_count >= stable_samples:
                             logger.info("官方模式判定完成: CurrentCommandId=%d匹配+RobotMode=5, 连续%d次", command_id, stable_samples)
                             self._motion_done_stable_count = 0
+                            self._last_motion_completion_reason = "motion_done"
                             return True
                     else:
                         self._motion_done_stable_count = 0
@@ -1163,6 +1303,7 @@ class DobotController:
                             if self._motion_done_stable_count >= stable_samples:
                                 logger.info("30004反馈辅助判定完成: 速度归零+位姿到位, 连续%d次", stable_samples)
                                 self._motion_done_stable_count = 0
+                                self._last_motion_completion_reason = "motion_done"
                                 return True
                         else:
                             self._motion_done_stable_count = 0
@@ -1180,6 +1321,7 @@ class DobotController:
                             if self._motion_done_stable_count >= stable_samples:
                                 logger.info("30004反馈辅助判定完成: 速度归零+运行状态完成, 连续%d次", stable_samples)
                                 self._motion_done_stable_count = 0
+                                self._last_motion_completion_reason = "motion_done"
                                 return True
                         else:
                             self._motion_done_stable_count = 0
@@ -1209,6 +1351,7 @@ class DobotController:
                     if robot_mode == 5:
                         logger.info("运动完成 (Dashboard RobotMode=5)")
                         self.clear_error_retry_count = 0
+                        self._last_motion_completion_reason = "motion_done"
                         return True
                     elif robot_mode in (7, 8):
                         elapsed = time.time() - start_time
@@ -1282,6 +1425,7 @@ class DobotController:
         verify_start_pose=True,
         verify_end_pose=True,
         wait_poll_interval=0.05,
+        force_guard=None,
     ):
         """移动到目标点"""
         _cmd_speed = speed_percentage if speed_percentage is not None else self.current_speed
@@ -1329,6 +1473,11 @@ class DobotController:
         logger.info("=" * 60)
 
         _cmd_speed = speed_percentage if speed_percentage is not None else self.current_speed
+        try:
+            prepared_force_guard = self.prepare_force_guard(force_guard)
+        except RuntimeError as e:
+            logger.error("力到位保护准备失败: %s", e)
+            return False
 
         logger.info(f" 发送{move_type}指令...")
         _cmd_start = time.perf_counter()
@@ -1396,7 +1545,13 @@ class DobotController:
         self._has_seen_motion_state = False
 
         _wait_start = time.perf_counter()
-        success = self.wait_for_motion_completion(timeout=estimated_time + 10, poll_interval=wait_poll_interval, target_pose=target_pose, command_id=self._last_command_id)
+        success = self.wait_for_motion_completion(
+            timeout=estimated_time + 10,
+            poll_interval=wait_poll_interval,
+            target_pose=target_pose,
+            command_id=self._last_command_id,
+            force_guard=prepared_force_guard,
+        )
         _wait_elapsed = time.perf_counter() - _wait_start
 
         self._last_move_timing = {
@@ -1409,6 +1564,10 @@ class DobotController:
             logger.error("  运动可能未完成，强制停止...")
             self.dashboard.Stop()
             return False
+
+        if self._last_motion_completion_reason == "force_triggered":
+            logger.info("TCP力触发停止，跳过结束点校验")
+            return True
 
         if not verify_end_pose:
             logger.info(" 跳过结束位置校验")
@@ -1472,7 +1631,7 @@ class DobotController:
             logger.error(f" ServoP异常: {e}")
             return False
 
-    def move_joint_relative(self, offsets, a=20, v=50, cp=100, verify_end_pose=True, wait_poll_interval=0.05):
+    def move_joint_relative(self, offsets, a=20, v=50, cp=100, verify_end_pose=True, wait_poll_interval=0.05, force_guard=None):
         """关节相对运动"""
         if not self.is_connected:
             logger.error("机器人未连接，无法执行关节相对运动")
@@ -1487,6 +1646,12 @@ class DobotController:
         logger.info(f" 关节偏移: {offsets}")
         logger.info(f" 加速度: {a}, 速度: {v}, CP: {cp}")
         logger.info("=" * 60)
+
+        try:
+            prepared_force_guard = self.prepare_force_guard(force_guard)
+        except RuntimeError as e:
+            logger.error("力到位保护准备失败: %s", e)
+            return False
 
         logger.info(f" 发送RelJointMovJ指令...")
         response = self.dashboard.RelJointMovJ(offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5], a, v, cp)
@@ -1525,12 +1690,21 @@ class DobotController:
         self._has_seen_motion_state = False
 
         estimated_time = 10
-        success = self.wait_for_motion_completion(timeout=estimated_time + 10, poll_interval=wait_poll_interval, command_id=self._last_command_id)
+        success = self.wait_for_motion_completion(
+            timeout=estimated_time + 10,
+            poll_interval=wait_poll_interval,
+            command_id=self._last_command_id,
+            force_guard=prepared_force_guard,
+        )
 
         if not success:
             logger.error("  运动可能未完成，强制停止...")
             self.dashboard.Stop()
             return False
+
+        if self._last_motion_completion_reason == "force_triggered":
+            logger.info("TCP力触发停止，跳过关节相对运动结束点校验")
+            return True
 
         if not verify_end_pose:
             logger.info(" 跳过结束位置校验")
@@ -1590,6 +1764,7 @@ class DobotController:
         cp=100,
         r=-1,
         wait_poll_interval=0.05,
+        force_guard=None,
     ):
         """Relative motion without force control."""
         result = validate_relative_delta(self, offsets, coord_system=coord_system, motion_type=motion_type, speed=speed)
@@ -1615,12 +1790,19 @@ class DobotController:
                 cp=cp,
                 verify_end_pose=False,
                 wait_poll_interval=wait_poll_interval,
+                force_guard=force_guard,
             )
 
         logger.info(
             "相对移动: coord=%s motion=%s offsets=%s speed=%s acceleration=%s cp=%s r=%s",
             coord_system, motion_type, offsets, speed, acceleration, cp, r
         )
+
+        try:
+            prepared_force_guard = self.prepare_force_guard(force_guard)
+        except RuntimeError as e:
+            logger.error("力到位保护准备失败: %s", e)
+            return False
 
         build_motion_type = 'movl' if motion_type != 'joint' else 'movj'
         response, command_name = self._build_relative_command(offsets, coord_system, build_motion_type, speed, acceleration, cp, r)
@@ -1642,7 +1824,12 @@ class DobotController:
         linear_distance = math.sqrt(offsets[0] ** 2 + offsets[1] ** 2 + offsets[2] ** 2)
         angular_distance = max(abs(offsets[3]), abs(offsets[4]), abs(offsets[5]))
         timeout = min(max(max(linear_distance / 20.0, angular_distance / 20.0) + 5.0, 5.0), 60.0)
-        if not self.wait_for_motion_completion(timeout=timeout, poll_interval=wait_poll_interval, command_id=self._last_command_id):
+        if not self.wait_for_motion_completion(
+            timeout=timeout,
+            poll_interval=wait_poll_interval,
+            command_id=self._last_command_id,
+            force_guard=prepared_force_guard,
+        ):
             logger.error("相对移动等待完成失败")
             self.dashboard.Stop()
             return False
@@ -1650,7 +1837,7 @@ class DobotController:
 
     def send_relative_command(self, offsets, coord_system="user", motion_type="linear",
                               speed=30, acceleration=20, cp=100, r=-1, wait=True,
-                              wait_poll_interval=0.05):
+                              wait_poll_interval=0.05, force_guard=None):
         """Send a relative motion command with unified logging, response parsing, and command_id tracking.
 
         Args:
@@ -1675,6 +1862,11 @@ class DobotController:
         acceleration = int(acceleration)
         cp = int(cp)
         r = int(r)
+        try:
+            prepared_force_guard = self.prepare_force_guard(force_guard) if wait else None
+        except RuntimeError as e:
+            logger.error("力到位保护准备失败: %s", e)
+            return False
 
         if coord_system == "joint":
             response = self.dashboard.RelJointMovJ(
@@ -1711,13 +1903,18 @@ class DobotController:
         linear_distance = math.sqrt(offsets[0] ** 2 + offsets[1] ** 2 + offsets[2] ** 2)
         angular_distance = max(abs(offsets[3]), abs(offsets[4]), abs(offsets[5]))
         timeout = min(max(max(linear_distance / 20.0, angular_distance / 20.0) + 5.0, 5.0), 60.0)
-        if not self.wait_for_motion_completion(timeout=timeout, poll_interval=wait_poll_interval, command_id=command_id):
+        if not self.wait_for_motion_completion(
+            timeout=timeout,
+            poll_interval=wait_poll_interval,
+            command_id=command_id,
+            force_guard=prepared_force_guard,
+        ):
             logger.error("相对移动等待完成失败")
             self.dashboard.Stop()
             return False
         return True
 
-    def move_to_initial_position(self, verify_start_pose=True, verify_end_pose=True, wait_poll_interval=0.05):
+    def move_to_initial_position(self, verify_start_pose=True, verify_end_pose=True, wait_poll_interval=0.05, force_guard=None):
         """移动到初始位置"""
         self.initial_pose = get_initial_point()
         logger.info("\n" + "=" * 60)
@@ -1734,6 +1931,7 @@ class DobotController:
             verify_start_pose=verify_start_pose,
             verify_end_pose=verify_end_pose,
             wait_poll_interval=wait_poll_interval,
+            force_guard=force_guard,
         )
 
         if success:
@@ -1753,6 +1951,8 @@ class DobotController:
         self.latest_feed_time = 0.0
         self.latest_tcp_speed = None
         self.latest_tcp_speed_time = 0.0
+        self.latest_actual_tcp_force = None
+        self.latest_actual_tcp_force_time = 0.0
         self.latest_running_status = None
         self.latest_running_status_time = 0.0
         self.latest_run_queued_cmd = None
@@ -1814,6 +2014,7 @@ class DobotController:
                         pose = self._extract_pose_from_feed_data(result)
                         robot_mode = self._extract_robot_mode_from_feed_data(result)
                         tcp_speed = self._extract_tcp_speed_from_feed_data(result)
+                        actual_tcp_force = self._extract_actual_tcp_force_from_feed_data(result)
                         running_status = self._extract_running_status_from_feed_data(result)
                         run_queued_cmd = self._extract_run_queued_cmd_from_feed_data(result)
                         current_command_id = self._extract_current_command_id_from_feed_data(result)
@@ -1833,6 +2034,9 @@ class DobotController:
                             if tcp_speed is not None:
                                 self.latest_tcp_speed = tcp_speed
                                 self.latest_tcp_speed_time = now
+                            if actual_tcp_force is not None:
+                                self.latest_actual_tcp_force = actual_tcp_force
+                                self.latest_actual_tcp_force_time = now
                             if running_status is not None:
                                 self.latest_running_status = running_status
                                 self.latest_running_status_time = now

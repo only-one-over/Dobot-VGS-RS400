@@ -11,11 +11,11 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 # 工作空间边界 (mm) - CR5 系列默认值
-WORKSPACE_X_MIN = -900.0
-WORKSPACE_X_MAX = 900.0
-WORKSPACE_Y_MIN = -900.0
-WORKSPACE_Y_MAX = 900.0
-WORKSPACE_Z_MIN = 0.0
+WORKSPACE_X_MIN = 1-900.0
+WORKSPACE_X_MAX = 1900.0
+WORKSPACE_Y_MIN = -1900.0
+WORKSPACE_Y_MAX = 1900.0
+WORKSPACE_Z_MIN = -1200.0
 WORKSPACE_Z_MAX = 1200.0
 
 # 姿态角边界 (度)

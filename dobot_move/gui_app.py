@@ -499,6 +499,19 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         speed_layout.addStretch()
         linear_layout.addLayout(speed_layout)
 
+        linear_force_layout = QHBoxLayout()
+        self.linear_force_guard_enabled = QCheckBox("启用TCP力停止")
+        linear_force_layout.addWidget(self.linear_force_guard_enabled)
+        linear_force_layout.addWidget(QLabel("阈值(N):"))
+        self.linear_force_threshold = QDoubleSpinBox()
+        self.linear_force_threshold.setRange(0.1, 200.0)
+        self.linear_force_threshold.setValue(5.0)
+        self.linear_force_threshold.setDecimals(1)
+        self.linear_force_threshold.setToolTip("当前TCP力相对运动前基线的合力超过该值时停止当前运动并进入下一步")
+        linear_force_layout.addWidget(self.linear_force_threshold)
+        linear_force_layout.addStretch()
+        linear_layout.addLayout(linear_force_layout)
+
         read_current_btn = QPushButton("读取当前位置")
         read_current_btn.setMinimumWidth(120)
         read_current_btn.clicked.connect(self._on_read_current_for_linear)
@@ -578,6 +591,16 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.rel_cp.setValue(100)
         self.rel_cp.setDecimals(0)
         rel_layout.addWidget(self.rel_cp, 3, 5)
+
+        self.rel_force_guard_enabled = QCheckBox("启用TCP力停止")
+        rel_layout.addWidget(self.rel_force_guard_enabled, 4, 0, 1, 2)
+        rel_layout.addWidget(QLabel("阈值(N):"), 4, 2)
+        self.rel_force_threshold = QDoubleSpinBox()
+        self.rel_force_threshold.setRange(0.1, 200.0)
+        self.rel_force_threshold.setValue(5.0)
+        self.rel_force_threshold.setDecimals(1)
+        self.rel_force_threshold.setToolTip("当前TCP力相对运动前基线的合力超过该值时停止当前运动并进入下一步")
+        rel_layout.addWidget(self.rel_force_threshold, 4, 3)
         
         self.arc_motion_params = QWidget()
         fa_layout = QVBoxLayout(self.arc_motion_params)
@@ -621,6 +644,16 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.fa_speed.setRange(1, 100)
         self.fa_speed.setValue(20)
         fa_params_layout.addWidget(self.fa_speed, 1, 3)
+
+        self.fa_force_guard_enabled = QCheckBox("启用TCP力停止")
+        fa_params_layout.addWidget(self.fa_force_guard_enabled, 2, 0, 1, 2)
+        fa_params_layout.addWidget(QLabel("阈值(N):"), 2, 2)
+        self.fa_force_threshold = QDoubleSpinBox()
+        self.fa_force_threshold.setRange(0.1, 200.0)
+        self.fa_force_threshold.setValue(5.0)
+        self.fa_force_threshold.setDecimals(1)
+        self.fa_force_threshold.setToolTip("当前TCP力相对运动前基线的合力超过该值时停止当前运动并进入下一步")
+        fa_params_layout.addWidget(self.fa_force_threshold, 2, 3)
 
         fa_layout.addWidget(fa_params_widget)
         self.camera_params = QWidget()
@@ -674,22 +707,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         btn_down_seg.clicked.connect(lambda: self._move_path_segment(self.rpath_seg_table, 1))
         seg_btn_layout.addWidget(btn_down_seg)
 
-        btn_x200 = QPushButton("X +200")
-        btn_x200.clicked.connect(lambda: self._add_path_template(self.rpath_seg_table, "x200"))
-        seg_btn_layout.addWidget(btn_x200)
-
-        btn_zy200 = QPushButton("ZY 平面 200")
-        btn_zy200.clicked.connect(lambda: self._add_path_template(self.rpath_seg_table, "zy200"))
-        seg_btn_layout.addWidget(btn_zy200)
-
-        btn_y200 = QPushButton("Y +200")
-        btn_y200.clicked.connect(lambda: self._add_path_template(self.rpath_seg_table, "y200"))
-        seg_btn_layout.addWidget(btn_y200)
-
-        btn_z200 = QPushButton("Z +200")
-        btn_z200.clicked.connect(lambda: self._add_path_template(self.rpath_seg_table, "z200"))
-        seg_btn_layout.addWidget(btn_z200)
-
         btn_copy_seg = QPushButton("复制段")
         btn_copy_seg.clicked.connect(lambda: self._copy_path_segment(self.rpath_seg_table))
         seg_btn_layout.addWidget(btn_copy_seg)
@@ -739,6 +756,16 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.rpath_cp.setValue(0)
         self.rpath_cp.setDecimals(0)
         common_layout.addWidget(self.rpath_cp, 1, 3)
+
+        self.rpath_force_guard_enabled = QCheckBox("启用TCP力停止")
+        common_layout.addWidget(self.rpath_force_guard_enabled, 2, 0, 1, 2)
+        common_layout.addWidget(QLabel("阈值(N):"), 2, 2)
+        self.rpath_force_threshold = QDoubleSpinBox()
+        self.rpath_force_threshold.setRange(0.1, 200.0)
+        self.rpath_force_threshold.setValue(5.0)
+        self.rpath_force_threshold.setDecimals(1)
+        self.rpath_force_threshold.setToolTip("当前TCP力相对运动前基线的合力超过该值时停止当前运动并进入下一步")
+        common_layout.addWidget(self.rpath_force_threshold, 2, 3)
 
         rpath_layout.addLayout(common_layout)
 

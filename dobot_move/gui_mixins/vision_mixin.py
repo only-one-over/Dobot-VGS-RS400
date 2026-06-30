@@ -1,6 +1,8 @@
 import logging
+import os
 
-from ..qt_compat import QMessageBox, QPixmap
+from ..config_manager import get_camera_model_path, set_camera_model_path
+from ..qt_compat import QFileDialog, QMessageBox, QPixmap
 
 from ..ui_theme import apply_status_visual
 
@@ -28,6 +30,41 @@ except ImportError:
 
 
 class VisionMixin:
+
+    def _refresh_camera_model_controls(self):
+        for camera_type in ("D435i", "D405"):
+            try:
+                model_path = get_camera_model_path(camera_type)
+                self.main_control.set_camera_model_path(camera_type, model_path)
+            except Exception as exc:
+                _logger.error("读取 %s 模型配置失败: %s", camera_type, exc)
+
+    def _select_camera_model(self, camera_type):
+        vision = self.vision_d435i if camera_type == "D435i" else self.vision_d405
+        if vision is not None:
+            QMessageBox.warning(self, "相机已连接", "请先断开相机，再更换模型")
+            return
+
+        current_path = get_camera_model_path(camera_type)
+        selected_path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"选择 {camera_type} ONNX 模型",
+            os.path.dirname(current_path),
+            "ONNX 模型 (*.onnx)",
+        )
+        if not selected_path:
+            return
+        try:
+            normalized = set_camera_model_path(camera_type, selected_path)
+            self.main_control.set_camera_model_path(camera_type, normalized)
+            QMessageBox.information(
+                self,
+                "模型已保存",
+                f"{camera_type} 将在下次连接时使用模型:\n{normalized}",
+            )
+        except Exception as exc:
+            _logger.exception("保存 %s 模型失败", camera_type)
+            QMessageBox.critical(self, "模型配置失败", str(exc))
 
     def _set_camera_status(self, camera_type, status):
         label = self.d435i_status_label if camera_type == "D435i" else self.d405_status_label
@@ -73,6 +110,7 @@ class VisionMixin:
             self._set_camera_status("D435i", "已连接")
             self.d435i_connect_btn.setEnabled(False)
             self.d435i_disconnect_btn.setEnabled(True)
+            self.main_control.set_camera_model_selection_enabled("D435i", False)
             if hasattr(self, "_refresh_action_states"):
                 self._refresh_action_states()
             self.update_gpu_status(self.vision_d435i.inference_provider)
@@ -92,6 +130,7 @@ class VisionMixin:
                 self.update_gpu_status(None)
                 self.d435i_connect_btn.setEnabled(True)
                 self.d435i_disconnect_btn.setEnabled(False)
+                self.main_control.set_camera_model_selection_enabled("D435i", True)
                 if hasattr(self, "_refresh_action_states"):
                     self._refresh_action_states()
         except Exception as e:
@@ -108,6 +147,7 @@ class VisionMixin:
             self._set_camera_status("D405", "已连接")
             self.d405_connect_btn.setEnabled(False)
             self.d405_disconnect_btn.setEnabled(True)
+            self.main_control.set_camera_model_selection_enabled("D405", False)
             if hasattr(self, "_refresh_action_states"):
                 self._refresh_action_states()
             self.update_gpu_status(self.vision_d405.inference_provider)
@@ -127,6 +167,7 @@ class VisionMixin:
                 self.update_gpu_status(None)
                 self.d405_connect_btn.setEnabled(True)
                 self.d405_disconnect_btn.setEnabled(False)
+                self.main_control.set_camera_model_selection_enabled("D405", True)
                 if hasattr(self, "_refresh_action_states"):
                     self._refresh_action_states()
         except Exception as e:
@@ -218,5 +259,4 @@ class VisionMixin:
             self.cam_test_end_coords.setText("X: ---  Y: ---  Z: ---")
             self.cam_test_base_coords.setText("X: ---  Y: ---  Z: ---")
             self.cam_test_confidence.setText("---")
-
 

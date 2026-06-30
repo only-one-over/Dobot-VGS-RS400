@@ -10,13 +10,17 @@ try:
     import cv2
 except ImportError:
     raise ImportError("缺少依赖 opencv-python，请执行: pip install opencv-python")
-import os
 import logging
 import time
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
-from .config_manager import load_config, get_calibration, get_camera_handeye_matrix
+from .config_manager import (
+    get_calibration,
+    get_camera_handeye_matrix,
+    load_config,
+    resolve_camera_model_path,
+)
 
 
 
@@ -54,7 +58,8 @@ class VisionSystem:
     """视觉系统 - 用于识别物体并计算坐标"""
 
     def __init__(self, camera_type="D435i", serial_number=None,
-                 enable_tracking=True, enable_kalman=True, enable_depth_filter=True):
+                 enable_tracking=True, enable_kalman=True, enable_depth_filter=True,
+                 model_path=None):
         self.camera_type = camera_type
         self.serial_number = serial_number
         self.enable_tracking = enable_tracking
@@ -101,6 +106,9 @@ class VisionSystem:
         self.T_cam2gripper = get_camera_handeye_matrix(camera_type)
         logger.info(f"✅ 加载 {camera_type} 手眼标定矩阵 T_hand_eye:")
         logger.debug(np.round(self.T_cam2gripper, 4))
+
+        self.model_path = resolve_camera_model_path(camera_type, model_path)
+        self._initialize_onnx_model()
         
         logger.info("正在启动相机...")
         try:
@@ -145,75 +153,6 @@ class VisionSystem:
             self.profile = None
             raise RuntimeError(f"相机初始化失败: {e}")
         
-        # 实例分割模型初始化
-        logger.info("正在加载实例分割模型...")
-        self.model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.onnx")
-        logger.debug(f"模型路径: {self.model_path}, 文件存在: {os.path.exists(self.model_path)}")
-
-        # 创建ONNX Runtime session（优先GPU，回退CPU）
-        import onnxruntime as ort
-        # 预加载 CUDA/cuDNN DLL（onnxruntime-gpu[cuda,cudnn] 安装到 nvidia/ site-packages 子目录）
-        if hasattr(ort, 'preload_dlls'):
-            ort.preload_dlls(directory="")
-        available_providers = ort.get_available_providers()
-        self.inference_provider = "CPU"
-
-        if 'CUDAExecutionProvider' in available_providers:
-            self.session = ort.InferenceSession(self.model_path, providers=['CUDAExecutionProvider'])
-            active_providers = self.session.get_providers()
-            if 'CUDAExecutionProvider' in active_providers:
-                self.inference_provider = "GPU (CUDA)"
-                logger.info("实例分割模型加载成功（GPU CUDA 模式）")
-            else:
-                self.inference_provider = "CPU (CUDA回退)"
-                logger.warning(
-                    f"CUDAExecutionProvider 注册但未激活，已回退 CPU。活跃 providers: {active_providers}\n"
-                    "请检查 CUDA 安装和 onnxruntime-gpu 版本兼容性"
-                )
-        else:
-            self.session = ort.InferenceSession(self.model_path, providers=['CPUExecutionProvider'])
-            self.inference_provider = "CPU"
-            logger.warning(
-                f"CUDA 不可用，使用 CPU 推理。当前可用 providers: {available_providers}\n"
-                "如需 GPU 加速，请安装: pip uninstall onnxruntime && pip install onnxruntime-gpu"
-            )
-
-        # 获取模型输入输出信息
-        self.input_name = self.session.get_inputs()[0].name
-        self.input_shape = self.session.get_inputs()[0].shape
-        logger.debug(f"模型输入: {self.input_name}, 形状: {self.input_shape}")
-
-        self.warmup_onnx()
-
-        output_infos = self.session.get_outputs()
-        self.model_format = "yolov8"  # 默认格式
-        if len(output_infos) >= 2:
-            self.is_seg_model = True
-            output_shape = output_infos[0].shape
-            if len(output_shape) == 3:
-                # YOLO26: [1, N, C] where N < C (e.g. [1, 300, 38])
-                # YOLO11: [1, C, N] where C < N (e.g. [1, 37, 8400])
-                dim1, dim2 = output_shape[1], output_shape[2]
-                if dim1 < dim2:
-                    # YOLO11 format: [1, C, N]
-                    self.num_classes = dim1 - 4 - 32
-                else:
-                    # YOLO26 format: [1, N, C]
-                    self.model_format = "yolo26"
-                    self.num_classes = 1  # will be inferred from detections
-            logger.debug(f"模型输出: seg模式, num_classes={self.num_classes}, model_format={self.model_format}")
-        else:
-            self.is_seg_model = False
-            output_shape = output_infos[0].shape
-            if len(output_shape) == 3:
-                dim1, dim2 = output_shape[1], output_shape[2]
-                if dim1 < dim2:
-                    self.num_classes = dim1 - 4
-                else:
-                    self.model_format = "yolo26"
-                    self.num_classes = 1
-            logger.debug(f"模型输出: detect模式, num_classes={self.num_classes}, model_format={self.model_format}")
-
         if self.enable_tracking:
             self.tracker = BYTETracker(track_thresh=0.5, match_thresh=0.8, track_buffer=30)
             self.tracked_target_id = None
@@ -242,6 +181,104 @@ class VisionSystem:
             self.depth_processor = None
 
         self.last_valid_position = None
+
+    def _initialize_onnx_model(self):
+        logger.info("正在为 %s 加载模型: %s", self.camera_type, self.model_path)
+        try:
+            import onnxruntime as ort
+
+            if hasattr(ort, 'preload_dlls'):
+                ort.preload_dlls(directory="")
+            available_providers = ort.get_available_providers()
+            self.inference_provider = "CPU"
+
+            if 'CUDAExecutionProvider' in available_providers:
+                self.session = ort.InferenceSession(
+                    self.model_path,
+                    providers=['CUDAExecutionProvider'],
+                )
+                active_providers = self.session.get_providers()
+                if 'CUDAExecutionProvider' in active_providers:
+                    self.inference_provider = "GPU (CUDA)"
+                    logger.info("实例分割模型加载成功（GPU CUDA 模式）")
+                else:
+                    self.inference_provider = "CPU (CUDA回退)"
+                    logger.warning(
+                        "CUDAExecutionProvider 注册但未激活，已回退 CPU。活跃 providers: %s",
+                        active_providers,
+                    )
+            else:
+                self.session = ort.InferenceSession(
+                    self.model_path,
+                    providers=['CPUExecutionProvider'],
+                )
+                self.inference_provider = "CPU"
+                logger.warning(
+                    "CUDA 不可用，使用 CPU 推理。当前可用 providers: %s",
+                    available_providers,
+                )
+
+            input_infos = self.session.get_inputs()
+            output_infos = self.session.get_outputs()
+            if not input_infos or len(input_infos[0].shape) != 4:
+                raise ValueError("模型必须具有一个四维 NCHW 输入")
+            if not output_infos or len(output_infos[0].shape) != 3:
+                raise ValueError("模型主输出必须是三维 YOLO 检测张量")
+
+            self.input_name = input_infos[0].name
+            self.input_shape = input_infos[0].shape
+            height, width = self.input_shape[2], self.input_shape[3]
+            if not isinstance(height, int) or height <= 0 or not isinstance(width, int) or width <= 0:
+                raise ValueError("模型输入高度和宽度必须是固定正整数")
+            logger.debug(f"模型输入: {self.input_name}, 形状: {self.input_shape}")
+
+            self.warmup_onnx()
+            self.model_format = "yolov8"
+            output_shape = output_infos[0].shape
+            dim1, dim2 = output_shape[1], output_shape[2]
+            if not isinstance(dim1, int) or not isinstance(dim2, int):
+                raise ValueError("模型输出维度必须是固定整数")
+
+            if len(output_infos) >= 2:
+                self.is_seg_model = True
+                mask_shape = output_infos[1].shape
+                if (
+                    len(mask_shape) != 4
+                    or not isinstance(mask_shape[1], int)
+                    or mask_shape[1] != 32
+                ):
+                    raise ValueError("实例分割模型掩码输出必须是 [N, 32, H, W]")
+                if dim1 < dim2:
+                    self.num_classes = dim1 - 4 - 32
+                else:
+                    self.model_format = "yolo26"
+                    self.num_classes = 1
+                if self.num_classes <= 0:
+                    raise ValueError("分割模型输出中未检测到有效类别")
+                logger.debug(
+                    "模型输出: seg模式, num_classes=%s, model_format=%s",
+                    self.num_classes,
+                    self.model_format,
+                )
+            else:
+                self.is_seg_model = False
+                if dim1 < dim2:
+                    self.num_classes = dim1 - 4
+                else:
+                    self.model_format = "yolo26"
+                    self.num_classes = 1
+                if self.num_classes <= 0:
+                    raise ValueError("检测模型输出中未检测到有效类别")
+                logger.debug(
+                    "模型输出: detect模式, num_classes=%s, model_format=%s",
+                    self.num_classes,
+                    self.model_format,
+                )
+        except Exception as exc:
+            self.session = None
+            raise RuntimeError(
+                f"{self.camera_type} 模型加载失败 ({self.model_path}): {exc}"
+            ) from exc
 
     def warmup_onnx(self):
         """ONNX session warmup：运行一次 dummy inference 消除 CUDA JIT 延迟"""

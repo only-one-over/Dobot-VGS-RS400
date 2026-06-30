@@ -1,6 +1,12 @@
 {
   "photo_position": [0, 0, 0, 0, 0, 0],
   "target_offset": [0, 0, 0],
+  "camera": {
+    "models": {
+      "D435i": "",
+      "D405": ""
+    }
+  },
   "calibration": {
     "D435i": {
       "tool_base_calib_pose": [0, 0, 0, 0, 0, 0],

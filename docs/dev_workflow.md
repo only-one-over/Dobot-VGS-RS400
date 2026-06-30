@@ -25,7 +25,7 @@ RealSense 工作还需要在 Python 之外安装 Intel RealSense SDK 2.0。原�
 python -m dobot_move
 ```
 
-应用期望运行时配置位于 `dobot_move/config.json`。相机启动期望已连接 RealSense 硬件且 ONNX 模型位于 `dobot_move/best.onnx`。
+应用期望运行时配置位于 `dobot_move/config.json`。D435i、D405 可在主控制页分别选择 ONNX 模型，路径保存到 `camera.models`；缺少该配置时使用 `dobot_move/best.onnx`。模型文件不提交到 Git，部署时需单独复制到工控机。
 
 ## 运行测试和检查
 

@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -42,4 +43,3 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-

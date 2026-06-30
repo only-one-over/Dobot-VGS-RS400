@@ -1,15 +1,22 @@
 """Tests for config_manager: atomic write, backup recovery, visual servo config."""
 import json
 import os
-import tempfile
 import shutil
+import uuid
 import pytest
 
 # We test config_manager functions by importing them
 from dobot_move.config_manager import (
     load_config, save_config, get_visual_servo_config,
-    DEFAULT_VISUAL_SERVO_CONFIG,
+    DEFAULT_VISUAL_SERVO_CONFIG, DEFAULT_CAMERA_MODEL_PATH,
+    get_camera_model_path, resolve_camera_model_path, set_camera_model_path,
 )
+
+
+def _make_test_directory(prefix):
+    path = os.path.join(os.getcwd(), f".{prefix}_{uuid.uuid4().hex}")
+    os.mkdir(path)
+    return path
 
 
 class TestAtomicWrite:
@@ -17,7 +24,7 @@ class TestAtomicWrite:
 
     def setup_method(self):
         """Create a temp dir for config files."""
-        self.tmpdir = tempfile.mkdtemp()
+        self.tmpdir = _make_test_directory("config_test")
         self.config_file = os.path.join(self.tmpdir, "test_config.json")
         self.bak_file = self.config_file + ".bak"
 
@@ -110,3 +117,77 @@ class TestVisualServoConfig:
         config = get_visual_servo_config()
         for key, value in DEFAULT_VISUAL_SERVO_CONFIG.items():
             assert config[key] == value, f"Mismatch for {key}: {config[key]} != {value}"
+
+
+class TestCameraModelConfig:
+    def setup_method(self):
+        import dobot_move.config_manager as cm
+
+        self.tmpdir = _make_test_directory("camera_model_test")
+        self.original_config_file = cm.CONFIG_FILE
+        cm.CONFIG_FILE = os.path.join(self.tmpdir, "config.json")
+        cm._cache_valid = False
+        cm._config_cache = None
+
+    def teardown_method(self):
+        import dobot_move.config_manager as cm
+
+        cm.CONFIG_FILE = self.original_config_file
+        cm._cache_valid = False
+        cm._config_cache = None
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_legacy_config_uses_bundled_model_for_both_cameras(self):
+        save_config({})
+
+        assert get_camera_model_path("D435i") == DEFAULT_CAMERA_MODEL_PATH
+        assert get_camera_model_path("D405") == DEFAULT_CAMERA_MODEL_PATH
+
+    def test_camera_model_paths_are_persisted_independently(self):
+        d435i_model = os.path.join(self.tmpdir, "d435i.onnx")
+        d405_model = os.path.join(self.tmpdir, "d405.onnx")
+        with open(d435i_model, "wb") as model_file:
+            model_file.write(b"d435i")
+        with open(d405_model, "wb") as model_file:
+            model_file.write(b"d405")
+
+        set_camera_model_path("D435i", d435i_model)
+        set_camera_model_path("D405", d405_model)
+
+        assert get_camera_model_path("D435i") == os.path.abspath(d435i_model)
+        assert get_camera_model_path("D405") == os.path.abspath(d405_model)
+        config = load_config()
+        assert config["camera"]["models"] == {
+            "D435i": os.path.abspath(d435i_model),
+            "D405": os.path.abspath(d405_model),
+        }
+
+    @pytest.mark.parametrize("camera_type", ["D455", "", None])
+    def test_invalid_camera_type_is_rejected(self, camera_type):
+        with pytest.raises(ValueError, match="不支持的相机类型"):
+            get_camera_model_path(camera_type)
+
+    def test_non_onnx_model_is_rejected(self):
+        model = os.path.join(self.tmpdir, "model.pt")
+        with open(model, "wb") as model_file:
+            model_file.write(b"model")
+
+        with pytest.raises(ValueError, match=r"\.onnx"):
+            set_camera_model_path("D435i", model)
+
+    def test_missing_model_is_rejected_without_fallback(self):
+        missing_model = os.path.join(self.tmpdir, "missing.onnx")
+
+        with pytest.raises(FileNotFoundError, match="模型文件不存在"):
+            resolve_camera_model_path("D405", missing_model)
+
+    def test_explicit_model_path_takes_precedence(self):
+        configured_model = os.path.join(self.tmpdir, "configured.onnx")
+        explicit_model = os.path.join(self.tmpdir, "explicit.onnx")
+        with open(configured_model, "wb") as model_file:
+            model_file.write(b"configured")
+        with open(explicit_model, "wb") as model_file:
+            model_file.write(b"explicit")
+        set_camera_model_path("D435i", configured_model)
+
+        assert resolve_camera_model_path("D435i", explicit_model) == os.path.abspath(explicit_model)

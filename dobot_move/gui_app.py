@@ -328,6 +328,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.main_control.disconnect_d435i.connect(self.disconnect_d435i)
         self.main_control.connect_d405.connect(self.connect_d405)
         self.main_control.disconnect_d405.connect(self.disconnect_d405)
+        self.main_control.select_camera_model.connect(self._select_camera_model)
         self.main_control.run_grasp.connect(self.run_grasping_task)
         self.main_control.move_initial.connect(self.move_to_initial_position)
         self.main_control.get_pose.connect(self.get_current_position)
@@ -351,6 +352,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.d405_status_label = self.main_control.d405_status_label
         self.d405_connect_btn = self.main_control.d405_connect_btn
         self.d405_disconnect_btn = self.main_control.d405_disconnect_btn
+        self._refresh_camera_model_controls()
         self.get_pos_btn = self.main_control.get_pos_btn
         self.move_initial_btn = self.main_control.move_initial_btn
         self.collision_combo = self.main_control.collision_combo

@@ -5,6 +5,8 @@
 卡片式分组布局，深色工业仪表盘风格
 """
 
+import os
+
 from .qt_compat import (
     QWidget, QVBoxLayout, QGridLayout, QPushButton, QLabel, QComboBox,
     QLineEdit, QHBoxLayout, QFrame, pyqtSignal,
@@ -23,6 +25,7 @@ class MainControlPanel(QWidget):
     disconnect_d435i = pyqtSignal()
     connect_d405 = pyqtSignal()
     disconnect_d405 = pyqtSignal()
+    select_camera_model = pyqtSignal(str)
     run_grasp = pyqtSignal()
     move_initial = pyqtSignal()
     get_pose = pyqtSignal()
@@ -174,6 +177,18 @@ class MainControlPanel(QWidget):
         apply_status_visual(self.d435i_status_label, "未连接")
         cam_layout.addWidget(self.d435i_status_label)
 
+        d435i_model_row = QHBoxLayout()
+        d435i_model_row.setSpacing(8)
+        self.d435i_model_path = QLineEdit()
+        self.d435i_model_path.setReadOnly(True)
+        self.d435i_model_path.setPlaceholderText("未选择模型")
+        d435i_model_row.addWidget(self.d435i_model_path, 1)
+        self.d435i_model_select_btn = QPushButton("选择模型")
+        set_button_role(self.d435i_model_select_btn, "secondary")
+        self.d435i_model_select_btn.setMinimumHeight(self.BTN_HEIGHT)
+        d435i_model_row.addWidget(self.d435i_model_select_btn)
+        cam_layout.addLayout(d435i_model_row)
+
         d435i_row = QHBoxLayout()
         d435i_row.setSpacing(8)
         self.d435i_connect_btn = QPushButton("D435i 连接")
@@ -192,6 +207,18 @@ class MainControlPanel(QWidget):
         self.d405_status_label = QLabel("D405: 未连接")
         apply_status_visual(self.d405_status_label, "未连接")
         cam_layout.addWidget(self.d405_status_label)
+
+        d405_model_row = QHBoxLayout()
+        d405_model_row.setSpacing(8)
+        self.d405_model_path = QLineEdit()
+        self.d405_model_path.setReadOnly(True)
+        self.d405_model_path.setPlaceholderText("未选择模型")
+        d405_model_row.addWidget(self.d405_model_path, 1)
+        self.d405_model_select_btn = QPushButton("选择模型")
+        set_button_role(self.d405_model_select_btn, "secondary")
+        self.d405_model_select_btn.setMinimumHeight(self.BTN_HEIGHT)
+        d405_model_row.addWidget(self.d405_model_select_btn)
+        cam_layout.addLayout(d405_model_row)
 
         d405_row = QHBoxLayout()
         d405_row.setSpacing(8)
@@ -220,6 +247,12 @@ class MainControlPanel(QWidget):
         self.d435i_disconnect_btn.clicked.connect(self.disconnect_d435i.emit)
         self.d405_connect_btn.clicked.connect(self.connect_d405.emit)
         self.d405_disconnect_btn.clicked.connect(self.disconnect_d405.emit)
+        self.d435i_model_select_btn.clicked.connect(
+            lambda: self.select_camera_model.emit("D435i")
+        )
+        self.d405_model_select_btn.clicked.connect(
+            lambda: self.select_camera_model.emit("D405")
+        )
         self.run_task_btn.clicked.connect(self.run_grasp.emit)
         self.move_initial_btn.clicked.connect(self.move_initial.emit)
         self.get_pos_btn.clicked.connect(self.get_pose.emit)
@@ -231,3 +264,16 @@ class MainControlPanel(QWidget):
         self.ip_input.editingFinished.connect(
             lambda: self.ip_changed.emit(self.ip_input.text().strip())
         )
+
+    def set_camera_model_path(self, camera_type, model_path):
+        field = self.d435i_model_path if camera_type == "D435i" else self.d405_model_path
+        field.setText(os.path.basename(model_path))
+        field.setToolTip(model_path)
+
+    def set_camera_model_selection_enabled(self, camera_type, enabled):
+        button = (
+            self.d435i_model_select_btn
+            if camera_type == "D435i"
+            else self.d405_model_select_btn
+        )
+        button.setEnabled(enabled)

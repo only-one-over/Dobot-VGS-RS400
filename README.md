@@ -172,7 +172,7 @@ python runtime_agent.py --startup-delay 20
    - 切换到"手眼标定"选项卡
    - 输入标定板上的工具点位姿和相机原点位姿
    - 点击"计算"生成标定矩阵
-4. **连接相机** — 点击"连接相机"，选择 D435i 或 D405
+4. **选择并连接相机模型** — 在主控制页分别为 D435i、D405 选择兼容的 ONNX 模型，然后连接相机
 5. **测试视觉** — 点击"相机测试"验证检测效果
 6. **运行抓取流程** — 在"抓取流程"选项卡中启动自动抓取
 
@@ -232,6 +232,8 @@ python runtime_agent.py --startup-delay 20
 | `target_offset` | float[3] | 目标偏移 (dx,dy,dz) mm | `[0, 0, 0]` |
 | `calibration.D435i` | object | D435i 手眼标定参数 | 见下方 |
 | `calibration.D405` | object | D405 手眼标定参数 | 见下方 |
+| `camera.models.D435i` | string | D435i 使用的 ONNX 模型绝对路径 | `"D:\\models\\d435i.onnx"` |
+| `camera.models.D405` | string | D405 使用的 ONNX 模型绝对路径 | `"D:\\models\\d405.onnx"` |
 | `points` | object | 点位表 | 见下方 | 小车 IP 地址 | `"192.168.5.2"` | 小车 Modbus 端口 | `502` |
 | `modbus_port` | int | 本地 Modbus 服务器端口 | `502` |
 | `user_index` | int | 用户坐标系索引 | `0` |
@@ -385,10 +387,12 @@ python -c "import onnxruntime as ort; s = ort.InferenceSession('dobot_move/best.
 > 完整 GPU 环境部署指南见 [docs/gpu_environment.md](docs/gpu_environment.md)。注意 `onnxruntime` 和 `onnxruntime-gpu` 不能同时安装，装了 GPU 版后 CPU 版需先卸载。连接相机后界面"推理"卡片会显示当前模式（GPU/CPU）。
 
 ### YOLO 模型检测效果差
-- 确认 `dobot_move/` 目录下存在 `best.onnx` 模型文件
+- 在主控制页确认 D435i、D405 各自选择了正确的 `.onnx` 模型；相机连接期间需先断开才能更换
+- 未配置相机模型时，程序兼容使用 `dobot_move/best.onnx`
 - 检查光照条件，避免强烈反光
-- 如更换检测目标，需重新训练模型并替换 `best.onnx`
-- 注意：新模型的类别数和掩码系数维度必须与硬编码值匹配（1 类，32 mask_coeff）
+- 新模型必须使用固定 NCHW 输入尺寸，并输出当前后处理支持的 YOLO 检测或实例分割张量
+- GUI、抓取流程和后台运行统一按相机类型读取模型配置；模型文件丢失或不兼容时会拒绝连接，不会静默使用其他模型
+- `*.onnx` 已被 Git 忽略，现场模型文件需单独部署
 
 ### 手眼标定精度不足
 - 确认标定板上工具点位姿记录准确

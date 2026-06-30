@@ -48,8 +48,8 @@
 1. 用户在 `DobotMainWindow` 中操作 PyQt6 UI。
 2. UI 事件调用功能 mixin 或 `MainControlPanel` 信号。
 3. 机器人操作通过 `DobotController` 流转，然后进入 `DobotApiDashboard` 和 `DobotApiFeedBack`。
-4. 相机操作为 D435i 和/或 D405 创建 `VisionSystem` 实例。
-5. `VisionSystem` 捕获 RealSense 帧，运行 ONNX 推理，跟踪目标，估算深度，并通过手眼标定转换相机坐标。
+4. 相机操作为 D435i 和/或 D405 创建 `VisionSystem` 实例，并从 `camera.models` 读取该相机的模型路径。
+5. `VisionSystem` 先校验并加载对应 ONNX 模型，再打开 RealSense 管线、捕获帧、运行推理、跟踪目标、估算深度，并通过手眼标定转换相机坐标。
 6. 检测到的基座坐标通过 `config_manager.py` 更新默认点位，如 `d435i` 和 `d405`。
 7. `FlowThread` 执行 `grasp_flow_modules.json` 中配置的模块，解析点位并协调机器人运动、视觉检测、视觉伺服、相对移动和原生圆弧操作。
 8. UI 更新通过 Qt 信号返回，保持主线程响应。
@@ -171,7 +171,9 @@ GUI 和后台通过 `robot_control.lock` 竞争控制租约，后台自身另用
 
 - 运行时 Python 依赖列在 `requirements.txt` 中。
 - RealSense 操作需要 Intel RealSense SDK 和兼容的 D435i/D405 设备。
-- ONNX 推理期望模型文件位于 `dobot_move/best.onnx`，具体见 `vision_system.py`。
+- D435i 和 D405 可通过 `camera.models.D435i`、`camera.models.D405` 配置独立 ONNX 模型；未配置时回退到 `dobot_move/best.onnx`。
+- 模型必须具有固定正整数尺寸的 NCHW 输入，并输出当前后处理支持的三维 YOLO 检测张量；实例分割模型还需提供掩码输出。
+- GUI、流程线程和后台代理都通过 `VisionSystem(camera_type=...)` 使用同一份相机级配置。配置模型缺失或不兼容时初始化失败，不切换到其他相机模型。
 - 机器人控制期望可达的 Dobot Dashboard 和 Feedback 端口；文档中的默认值提及 Dashboard `29999` 和 Feedback `30004`。
 - Modbus 默认值存储在 `config.json` 中，典型 TCP 端口为 `502`。
 - C++ 加速依赖 CMake、C++17 编译器、pybind11 和 Python ABI 兼容性。

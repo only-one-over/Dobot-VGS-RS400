@@ -9,7 +9,7 @@ import logging
 import os
 import re
 import shutil
-import tempfile
+import uuid
 
 import numpy as np
 
@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(_MODULE_DIR, "config.json")
 GRASP_FLOW_FILE = os.path.join(_MODULE_DIR, "gui_mixins", "grasp_flow_modules.json")
+DEFAULT_CAMERA_MODEL_PATH = os.path.join(_MODULE_DIR, "best.onnx")
+SUPPORTED_CAMERA_TYPES = ("D435i", "D405")
 _config_cache = None
 _cache_valid = False
 
@@ -111,17 +113,30 @@ def save_config(config):
             except Exception as e:
                 logger.warning("备份配置文件失败: %s", e)
         
-        # 写入临时文件
+        # tempfile.mkstemp may spin for a very long time on Windows when the
+        # directory reports writable but rejects files created with mode 0o600.
         dir_name = os.path.dirname(CONFIG_FILE)
-        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+        tmp_path = None
         try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
-            # 原子替换
+            for _ in range(10):
+                candidate = os.path.join(
+                    dir_name,
+                    f".{os.path.basename(CONFIG_FILE)}.{uuid.uuid4().hex}.tmp",
+                )
+                try:
+                    with open(candidate, 'x', encoding='utf-8') as f:
+                        tmp_path = candidate
+                        json.dump(config, f, indent=2, ensure_ascii=False)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    break
+                except FileExistsError:
+                    continue
+            if tmp_path is None:
+                raise FileExistsError("无法创建唯一的配置临时文件")
             os.replace(tmp_path, CONFIG_FILE)
-            tmp_path = None  # 标记已成功替换
+            tmp_path = None
         finally:
-            # 清理临时文件（如果替换未成功）
             if tmp_path and os.path.exists(tmp_path):
                 try:
                     os.unlink(tmp_path)
@@ -233,6 +248,64 @@ def get_performance_config():
     if isinstance(config.get("performance"), dict):
         performance.update(config["performance"])
     return performance
+
+
+def _validate_camera_type(camera_type):
+    if camera_type not in SUPPORTED_CAMERA_TYPES:
+        raise ValueError(f"不支持的相机类型: {camera_type}")
+
+
+def normalize_camera_model_path(model_path):
+    if not isinstance(model_path, str) or not model_path.strip():
+        raise ValueError("模型路径不能为空")
+    return os.path.abspath(os.path.expanduser(model_path.strip()))
+
+
+def validate_camera_model_path(model_path):
+    normalized = normalize_camera_model_path(model_path)
+    if os.path.splitext(normalized)[1].lower() != ".onnx":
+        raise ValueError("模型文件必须是 .onnx 格式")
+    if not os.path.isfile(normalized):
+        raise FileNotFoundError(f"模型文件不存在: {normalized}")
+    return normalized
+
+
+def get_camera_model_path(camera_type):
+    """Return the configured model path, or the bundled model for legacy configs."""
+    _validate_camera_type(camera_type)
+    config = load_config()
+    camera_config = config.get("camera", {})
+    models = camera_config.get("models", {}) if isinstance(camera_config, dict) else {}
+    configured_path = models.get(camera_type) if isinstance(models, dict) else None
+    if not configured_path:
+        return DEFAULT_CAMERA_MODEL_PATH
+    return normalize_camera_model_path(configured_path)
+
+
+def resolve_camera_model_path(camera_type, model_path=None):
+    """Resolve and validate an explicit or camera-specific ONNX model path."""
+    _validate_camera_type(camera_type)
+    selected_path = model_path if model_path is not None else get_camera_model_path(camera_type)
+    return validate_camera_model_path(selected_path)
+
+
+def set_camera_model_path(camera_type, model_path):
+    """Persist one camera's model without changing the other camera settings."""
+    _validate_camera_type(camera_type)
+    normalized = validate_camera_model_path(model_path)
+    config = load_config()
+    camera_config = config.get("camera")
+    if not isinstance(camera_config, dict):
+        camera_config = {}
+    models = camera_config.get("models")
+    if not isinstance(models, dict):
+        models = {}
+    models[camera_type] = normalized
+    camera_config["models"] = models
+    config["camera"] = camera_config
+    if not save_config(config):
+        raise OSError("保存相机模型配置失败")
+    return normalized
 
 
 def update_config(key, value):

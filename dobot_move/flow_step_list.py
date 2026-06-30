@@ -229,6 +229,12 @@ class FlowStepList(QWidget):
         elif module['type'] == "visual_servo":
             p = params
             text += f" (视觉伺服, 目标: {p.get('target_type', 'grasp_point')}, 阈值: {p.get('converge_threshold', 2.0)}mm)"
+        elif module['type'] == "delay":
+            duration_s = float(params.get('duration_s', 1.0))
+            if params.get("wait_mode", "time") == "modbus_or_timeout":
+                text += f" (最长等待: {duration_s:.1f}秒, 40001=1提前通过)"
+            else:
+                text += f" (延时: {duration_s:.1f}秒)"
         return text
 
     def _make_click_handler(self, idx: int, item: FlowStepItem):

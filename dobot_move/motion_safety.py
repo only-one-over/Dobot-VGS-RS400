@@ -11,7 +11,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 # 工作空间边界 (mm) - CR5 系列默认值
-WORKSPACE_X_MIN = 1-900.0
+WORKSPACE_X_MIN = -1900.0
 WORKSPACE_X_MAX = 1900.0
 WORKSPACE_Y_MIN = -1900.0
 WORKSPACE_Y_MAX = 1900.0
@@ -19,8 +19,8 @@ WORKSPACE_Z_MIN = -1200.0
 WORKSPACE_Z_MAX = 1200.0
 
 # 姿态角边界 (度)
-ORIENTATION_MIN = -180.0
-ORIENTATION_MAX = 180.0
+ORIENTATION_MIN = -360.0
+ORIENTATION_MAX = 360.0
 
 # 速度/加速度范围
 SPEED_MIN = 1.0
@@ -49,14 +49,14 @@ CODE_UNPROJECTABLE_RELATIVE = 13
 @dataclass
 class MotionSafetyConfig:
     """运动安全配置"""
-    workspace_x_min: float = -900.0
-    workspace_x_max: float = 900.0
-    workspace_y_min: float = -900.0
-    workspace_y_max: float = 900.0
-    workspace_z_min: float = 0.0
+    workspace_x_min: float = -1900.0
+    workspace_x_max: float = 1900.0
+    workspace_y_min: float = -1900.0
+    workspace_y_max: float = 1900.0
+    workspace_z_min: float = -1200.0
     workspace_z_max: float = 1200.0
-    orientation_min: float = -180.0
-    orientation_max: float = 180.0
+    orientation_min: float = -360.0
+    orientation_max: float = 360.0
     max_delta_xyz: float = 300.0    # 单段 XYZ 偏移上限 (mm)
     max_delta_rot: float = 45.0     # 单段姿态偏移上限 (deg)
     feedback_max_age_normal: float = 0.5   # 普通运动反馈新鲜度 (s)

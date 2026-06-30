@@ -1,7 +1,10 @@
 import json
+import logging
 import os
 import threading
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 class AlarmHistory:
@@ -44,7 +47,21 @@ class AlarmHistory:
             with open(self.path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, list) else []
-        except Exception:
+        except Exception as e:
+            corrupt_path = (
+                self.path
+                + ".corrupt."
+                + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            )
+            try:
+                os.replace(self.path, corrupt_path)
+                logger.error(
+                    "报警历史损坏，已保留到 %s: %s",
+                    corrupt_path,
+                    e,
+                )
+            except OSError:
+                logger.exception("报警历史损坏且无法保留: %s", self.path)
             return []
 
     def _write_unlocked(self, records):
@@ -52,4 +69,6 @@ class AlarmHistory:
         tmp_path = self.path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(records, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, self.path)

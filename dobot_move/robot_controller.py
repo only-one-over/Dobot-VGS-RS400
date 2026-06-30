@@ -8,6 +8,7 @@ import time
 import re
 import socket
 import logging
+from pathlib import Path
 from contextlib import contextmanager
 from .modbus_server import DobotModbusServer, REG_CMD_STATUS, REG_MODE, STATUS_IDLE, STATUS_STANDBY, STATUS_RUNNING, STATUS_HOOK_OK, STATUS_HOOK_ERR, STATUS_ROBOT_ERR, STATUS_CAMERA_ERR, MODE_AUTO, MODE_MANUAL, CMD_STOP, CMD_RESET, CMD_HOOK
 import math
@@ -21,19 +22,28 @@ from .motion_safety import (
     MotionValidationResult, MotionSafetyState,
 )
 from .alarm_history import AlarmHistory
+from .runtime_resilience import SingleInstanceLock
 
 logger = logging.getLogger(__name__)
+STATUS_DELAY_WAIT = STATUS_HOOK_OK
 
 
 class DobotController:
     """机器人控制器"""
 
-    def __init__(self, robot_ip="192.168.5.1"):
+    def __init__(self, robot_ip="192.168.5.1", enforce_single_instance=False):
         self.robot_ip = robot_ip
         self.dashboard = None
         self.is_connected = False
         self.is_enabled = False
         self.last_error = ""
+        self._enforce_single_instance = bool(enforce_single_instance)
+        self._control_lease_path = (
+            Path(__file__).resolve().parent.parent / "robot_control.lock"
+        )
+        self._control_lease = None
+        self._control_lease_acquired = not self._enforce_single_instance
+        self._acquire_control_lease()
 
         self.pose_pattern = re.compile(r'{([^}]+)}')
 
@@ -92,6 +102,11 @@ class DobotController:
         self._robot_alarm_recorded = False
         self.software_emergency_active = False
         self._active_flow_thread = None
+        self._modbus_flow_state_lock = threading.Lock()
+        self._modbus_delay_waiting = False
+        self._modbus_delay_release_event = threading.Event()
+        self._runtime_recovery_required = False
+        self._runtime_recovery_cleared_callback = None
         self.alarm_history = AlarmHistory()
 
         self._motion_owner = None
@@ -181,12 +196,16 @@ class DobotController:
         if self.dashboard is None:
             yield
             return
-        old_timeout = self.dashboard.socket_dobot.gettimeout()
-        self.dashboard.socket_dobot.settimeout(seconds)
+        socket_dobot = getattr(self.dashboard, "socket_dobot", None)
+        if socket_dobot is None or not hasattr(socket_dobot, "gettimeout") or not hasattr(socket_dobot, "settimeout"):
+            yield
+            return
+        old_timeout = socket_dobot.gettimeout()
+        socket_dobot.settimeout(seconds)
         try:
             yield
         finally:
-            self.dashboard.socket_dobot.settimeout(old_timeout)
+            socket_dobot.settimeout(old_timeout)
 
     def _describe_error_code(self, code):
         error_map = {
@@ -368,6 +387,9 @@ class DobotController:
 
     def connect(self):
         """连接机器人"""
+        if not self._acquire_control_lease():
+            logger.error(self.last_error)
+            return False
         logger.info(f"\n===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 开始连接机器人 =====")
         logger.info(f" [连接] 目标IP: {self.robot_ip}")
         logger.info(f" [连接] 目标端口: 29999")
@@ -512,7 +534,27 @@ class DobotController:
         self.is_connected = False
         self.is_enabled = False
         self._last_speed_factor = None
+        self.release_control_lease()
         logger.info(" 已断开连接")
+
+    def release_control_lease(self):
+        if self._control_lease is not None:
+            self._control_lease.release()
+            self._control_lease = None
+        self._control_lease_acquired = not self._enforce_single_instance
+
+    def _acquire_control_lease(self):
+        if not self._enforce_single_instance:
+            self._control_lease_acquired = True
+            return True
+        if self._control_lease is not None and self._control_lease_acquired:
+            return True
+        self._control_lease = SingleInstanceLock(self._control_lease_path)
+        self._control_lease_acquired = self._control_lease.acquire()
+        if not self._control_lease_acquired:
+            self._control_lease = None
+            self.last_error = "另一个GUI或后台进程已持有机器人控制权"
+        return self._control_lease_acquired
 
     def enable_robot(self):
         """使能机器人"""
@@ -946,9 +988,9 @@ class DobotController:
         guard["threshold_n"] = threshold
         guard["baseline_force"] = baseline
         try:
-            guard["debounce_samples"] = max(1, int(guard.get("debounce_samples", 2)))
+            guard["debounce_samples"] = max(1, int(guard.get("debounce_samples", 1)))
         except (TypeError, ValueError):
-            guard["debounce_samples"] = 2
+            guard["debounce_samples"] = 1
         guard["max_age"] = max_age
         return guard
 
@@ -1124,6 +1166,85 @@ class DobotController:
             "pose_timestamp": pose_timestamp,
         }
 
+    def _wait_after_stop_settled(self, timeout=1.5, poll_interval=0.05):
+        """Wait after Stop() until the robot is idle enough for the next command."""
+        perf = get_performance_config()
+        speed_threshold = float(perf.get("motion_done_speed_threshold", 1.0))
+        rotation_speed_threshold = float(perf.get("motion_done_rotation_speed_threshold", 1.0))
+        pose_cache_max_age = float(perf.get("pose_cache_max_age", 0.3))
+        deadline = time.time() + max(0.1, float(timeout))
+        poll_interval = max(0.01, float(poll_interval))
+        last_event = {
+            "post_robot_mode": None,
+            "post_error_status": None,
+        }
+
+        while time.time() <= deadline:
+            snapshot = self.get_motion_feedback_snapshot(max_age=pose_cache_max_age)
+            state = self.get_motion_safety_state()
+            robot_mode = snapshot.get("robot_mode")
+            if robot_mode is None:
+                robot_mode = state.robot_mode
+            error_status = state.error_status
+            last_event = {
+                "post_robot_mode": robot_mode,
+                "post_error_status": error_status,
+            }
+
+            if error_status != 0 or robot_mode in (9, 11):
+                self.last_error = (
+                    f"力触发Stop后机器人报警: RobotMode={robot_mode}, "
+                    f"ErrorStatus={error_status}，可能阈值过高/速度过快/接触过硬"
+                )
+                self.record_alarm(
+                    "TCP力停止",
+                    "STOP_ALARM",
+                    "故障",
+                    self.last_error,
+                    "降低速度、降低TCP力阈值或减小接触行程，确认工件接触不是硬碰撞",
+                )
+                return False, last_event
+
+            tcp_speed = snapshot.get("tcp_speed")
+            if tcp_speed is None:
+                speed_ok = True
+            else:
+                linear_ok = all(abs(v) <= speed_threshold for v in list(tcp_speed)[:3])
+                angular_ok = all(abs(v) <= rotation_speed_threshold for v in list(tcp_speed)[3:6])
+                speed_ok = linear_ok and angular_ok
+
+            running_status = snapshot.get("running_status")
+            run_queued_cmd = snapshot.get("run_queued_cmd")
+            queue_ok = running_status in (None, 0) and run_queued_cmd in (None, 0)
+            mode_ok = robot_mode in (None, 5)
+
+            if snapshot.get("health") == "ok" and speed_ok and queue_ok and mode_ok:
+                self.last_error = ""
+                return True, last_event
+
+            time.sleep(poll_interval)
+
+        self.last_error = (
+            "Stop后机器人未在限定时间内稳定，可能仍处于暂停/运行/队列未清空状态"
+        )
+        self.record_alarm("TCP力停止", "STOP_SETTLE_TIMEOUT", "故障", self.last_error)
+        return False, last_event
+
+    def _recover_after_stop_rejected(self, reason=""):
+        """Recover once after Dashboard returns -7/script paused."""
+        logger.warning("运动指令被拒绝(-7)，执行Stop并等待稳定后重试: %s", reason)
+        try:
+            self.dashboard.Stop()
+        except Exception as e:
+            self.last_error = f"Stop恢复失败: {e}"
+            logger.warning(self.last_error)
+            return False
+        settled, event = self._wait_after_stop_settled(timeout=1.5, poll_interval=0.05)
+        if not settled:
+            logger.error("Stop恢复后机器人未稳定: %s event=%s", self.last_error, event)
+            return False
+        return True
+
     def wait_for_motion_completion(
         self,
         timeout=30,
@@ -1220,7 +1341,7 @@ class DobotController:
                 else:
                     force_guard_counter = 0
 
-                if force_guard_counter >= int(force_guard.get("debounce_samples", 2)):
+                if force_guard_counter >= int(force_guard.get("debounce_samples", 1)):
                     event = {
                         "threshold_n": threshold_n,
                         "delta_n": delta_n,
@@ -1234,12 +1355,18 @@ class DobotController:
                         delta_n, threshold_n, event["current_force"], event["baseline_force"]
                     )
                     try:
-                        self.dashboard.Stop()
+                        stop_response = self.dashboard.Stop()
+                        event["stop_response"] = stop_response
                     except Exception as e:
                         logger.warning("TCP力到位Stop()失败: %s", e)
-                    self._last_motion_completion_reason = "force_triggered"
-                    self._last_force_guard_event = event
                     self._motion_done_stable_count = 0
+                    settled, post_event = self._wait_after_stop_settled(timeout=1.5, poll_interval=max(poll_interval, 0.01))
+                    event.update(post_event)
+                    self._last_force_guard_event = event
+                    if not settled:
+                        logger.error("TCP力触发Stop后机器人未稳定: %s", self.last_error)
+                        return False
+                    self._last_motion_completion_reason = "force_triggered"
                     return True
 
             # --- Command ID completion check (official pattern) ---
@@ -1512,8 +1639,8 @@ class DobotController:
 
             if response_code == -7:
                 logger.warning("  机器人处于脚本暂停状态，尝试停止脚本后重试...")
-                self.dashboard.Stop()
-                time.sleep(1)
+                if not self._recover_after_stop_rejected(reason="absolute motion"):
+                    return False
 
                 logger.info(" 重试发送运动指令...")
                 if move_type == "MovJ":
@@ -1664,8 +1791,8 @@ class DobotController:
 
             if response_code == -7:
                 logger.warning("  机器人处于脚本暂停状态，尝试停止脚本后重试...")
-                self.dashboard.Stop()
-                time.sleep(1)
+                if not self._recover_after_stop_rejected(reason="joint relative motion"):
+                    return False
 
                 logger.info(" 重试发送运动指令...")
                 response = self.dashboard.RelJointMovJ(offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5], a, v, cp)
@@ -1813,7 +1940,17 @@ class DobotController:
         response_code = self.parse_response_code(response)
         if response_code != 0:
             logger.error(f"{command_name}指令被拒绝，响应码: {response_code}")
-            return False
+            if response_code == -7 and self._recover_after_stop_rejected(reason="relative motion"):
+                response, command_name = self._build_relative_command(
+                    offsets, coord_system, build_motion_type, speed, acceleration, cp, r
+                )
+                logger.debug(f"{command_name}重试响应: {response}")
+                response_code = self.parse_response_code(response)
+                if response_code != 0:
+                    logger.error(f"{command_name}重试后仍被拒绝，响应码: {response_code}")
+                    return False
+            else:
+                return False
 
         ids = self.parse_response_ids(response)
         self._last_command_id = ids[1] if len(ids) > 1 else None
@@ -1887,9 +2024,31 @@ class DobotController:
 
         if response_code != 0:
             logger.error(f"{command_name}指令被拒绝，响应码: {response_code}")
-            if not wait:
-                return (response_code, command_id)
-            return False
+            if response_code == -7 and self._recover_after_stop_rejected(reason=f"{command_name} relative command"):
+                if coord_system == "joint":
+                    response = self.dashboard.RelJointMovJ(
+                        offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5],
+                        a=acceleration, v=speed, cp=cp
+                    )
+                else:
+                    response, command_name = self._build_relative_command(
+                        offsets, coord_system, build_motion_type, speed, acceleration, cp, r
+                    )
+                    if response is None:
+                        return (1, None) if not wait else False
+                logger.debug(f"{command_name}重试响应: {response}")
+                response_code = self.parse_response_code(response)
+                ids = self.parse_response_ids(response)
+                command_id = ids[1] if len(ids) > 1 else None
+                if response_code != 0:
+                    logger.error(f"{command_name}重试后仍被拒绝，响应码: {response_code}")
+                    if not wait:
+                        return (response_code, command_id)
+                    return False
+            else:
+                if not wait:
+                    return (response_code, command_id)
+                return False
 
         if not wait:
             self._last_command_id = command_id
@@ -2076,6 +2235,9 @@ class DobotController:
 
     def start_modbus(self, port=502, slave_id=5):
         """启动Modbus TCP服务器"""
+        if not self._acquire_control_lease():
+            logger.error(self.last_error)
+            return False
         if self.modbus_server and self.modbus_server.is_running():
             logger.info(" Modbus服务已在运行")
             return True
@@ -2208,14 +2370,14 @@ class DobotController:
         self.last_error = ""
         return True
 
-    def mark_modbus_program_finished(self, success, mode=MODE_AUTO):
+    def mark_modbus_program_finished(self, success, mode=MODE_AUTO, failure_status=None):
         if success:
             self._modbus_hook_status = 2
             self._last_fault_code = 0
             self._write_modbus_status(STATUS_HOOK_OK, mode=mode)
         else:
             self._modbus_hook_status = 3
-            self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
+            self._write_modbus_status(failure_status or STATUS_HOOK_ERR, mode=mode)
 
     def reset_modbus_status_to_standby(self, mode=MODE_AUTO):
         self._modbus_hook_status = 0
@@ -2225,15 +2387,98 @@ class DobotController:
         self._modbus_hook_status = 0
         self._write_modbus_status(STATUS_IDLE, mode=mode)
 
+    def begin_modbus_delay_wait(self):
+        """Publish 40001=5 and arm 40001=1 as the current delay release signal."""
+        with self._modbus_flow_state_lock:
+            self._modbus_delay_release_event.clear()
+            self._modbus_delay_waiting = True
+        self._write_modbus_status(STATUS_DELAY_WAIT)
+
+    def is_modbus_delay_released(self):
+        return self._modbus_delay_release_event.is_set()
+
+    def end_modbus_delay_wait(self, restore_running=True):
+        """Disarm delay release and restore 40001=4 while the flow continues."""
+        with self._modbus_flow_state_lock:
+            self._modbus_delay_waiting = False
+            self._modbus_delay_release_event.clear()
+        if restore_running and self._active_flow_thread is not None:
+            self._write_modbus_status(STATUS_RUNNING)
+
+    def _release_modbus_delay_if_waiting(self):
+        with self._modbus_flow_state_lock:
+            if not self._modbus_delay_waiting:
+                return False
+            self._modbus_delay_release_event.set()
+            return True
+
+    def set_runtime_recovery_required(self, required=True, on_cleared=None):
+        self._runtime_recovery_required = bool(required)
+        if on_cleared is not None:
+            self._runtime_recovery_cleared_callback = on_cleared
+        if required:
+            self._write_modbus_status(STATUS_HOOK_ERR)
+
+    def _clear_runtime_recovery_required(self):
+        self._runtime_recovery_required = False
+        callback = self._runtime_recovery_cleared_callback
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                logger.exception("运行时恢复锁清除回调失败")
+
+    def _wait_robot_ready_for_modbus_program(self, timeout=5.0, poll_interval=0.1):
+        """Wait briefly for robot connection, fresh feedback, no alarm, and enable."""
+        deadline = time.time() + max(0.1, float(timeout))
+        last_error = ""
+        while time.time() <= deadline:
+            if self.ensure_robot_ready_for_motion(auto_enable=True):
+                return True
+            last_error = self.last_error
+            time.sleep(max(0.02, float(poll_interval)))
+        self.last_error = last_error or self.last_error or "机器人未就绪"
+        return False
+
     def _on_modbus_command(self, cmd, mode=0):
-        """Modbus命令回调（底盘工控机协议）"""
+        """Dispatch 40001 according to flow context.
+
+        During normal flow execution only 0 is accepted. During a delay wait,
+        0 stops and 1 releases the delay. Outside a flow, 1 resets and 3 starts.
+        """
         logger.info("收到Modbus命令: cmd=%d, mode=%d", cmd, mode)
         self._modbus_mode = mode
         self._last_modbus_command = int(cmd)
         self._last_modbus_command_time = time.time()
+        if self._runtime_recovery_required:
+            if cmd == CMD_STOP:
+                self._modbus_stop_immediate(mode=mode)
+                self._clear_runtime_recovery_required()
+                self._write_modbus_status(STATUS_IDLE, mode=mode)
+            else:
+                logger.warning("运行时恢复锁生效，忽略40001=%d；请先下发0", cmd)
+                self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
+            return
         if cmd == CMD_STOP:
             self._modbus_stop_immediate(mode=mode)
             return
+
+        flow_active = self._active_flow_thread is not None
+        if flow_active:
+            if cmd == CMD_RESET and self._release_modbus_delay_if_waiting():
+                logger.info("流程延时等待中收到40001=1，放行下一步")
+                self._write_modbus_status(STATUS_DELAY_WAIT, mode=mode)
+            else:
+                with self._modbus_flow_state_lock:
+                    delay_waiting = self._modbus_delay_waiting
+                allowed = "0或1" if delay_waiting else "0"
+                logger.info("流程运行中忽略40001=%d；当前阶段仅接受%s", cmd, allowed)
+                self._write_modbus_status(
+                    STATUS_DELAY_WAIT if delay_waiting else STATUS_RUNNING,
+                    mode=mode,
+                )
+            return
+
         if mode == MODE_MANUAL:
             logger.info("手动模式下忽略Modbus命令: cmd=%d", cmd)
             return
@@ -2271,6 +2516,9 @@ class DobotController:
 
         if self._active_flow_thread is not None and hasattr(self._active_flow_thread, '_ctx') and self._active_flow_thread._ctx is not None:
             self._active_flow_thread._ctx.stop_event.set()
+        with self._modbus_flow_state_lock:
+            self._modbus_delay_waiting = False
+            self._modbus_delay_release_event.set()
 
         self.release_motion("jog")
 
@@ -2287,8 +2535,84 @@ class DobotController:
                 except Exception as pause_error:
                     logger.error("Modbus Pause()兜底失败: %s", pause_error)
 
+        self._clear_faults_for_modbus_zero(auto_enable=True)
         self._modbus_hook_status = 0
         self._write_modbus_status(STATUS_IDLE, mode=mode)
+
+    def _clear_faults_for_modbus_zero(self, auto_enable=True):
+        """Best-effort cleanup for 40001=0 while keeping Modbus status at 0."""
+        had_software_estop = bool(self.software_emergency_active)
+        self.clear_error_retry_count = 0
+        self._last_fault_code = 0
+        self._robot_alarm_recorded = False
+        self._last_motion_completion_reason = None
+        self._last_force_guard_event = None
+        self.last_error = ""
+
+        if not self.is_connected or self.dashboard is None:
+            self.software_emergency_active = False
+            logger.warning("Modbus 0清故障跳过: 机器人未连接")
+            return False
+
+        cleanup_ok = True
+        if had_software_estop:
+            try:
+                response = self.dashboard.EmergencyStop(0)
+                code = self.parse_response_code(response)
+                if code not in (0, None):
+                    cleanup_ok = False
+                    logger.warning("Modbus 0解除软件急停响应码非0: %s, response=%s", code, response)
+            except Exception as e:
+                cleanup_ok = False
+                logger.warning("Modbus 0解除软件急停失败: %s", e)
+            self.software_emergency_active = False
+
+        clear_ok = False
+        for attempt in range(1, 4):
+            try:
+                response = self.dashboard.ClearError()
+                code = self.parse_response_code(response)
+                if code not in (0, None):
+                    cleanup_ok = False
+                    logger.warning("Modbus 0 ClearError响应码非0: attempt=%d code=%s response=%s", attempt, code, response)
+                    time.sleep(0.1)
+                    continue
+
+                time.sleep(0.1)
+                state = self.get_motion_safety_state()
+                if state.error_status == 0 and state.robot_mode not in (9, 11):
+                    clear_ok = True
+                    break
+                cleanup_ok = False
+                logger.warning(
+                    "Modbus 0 ClearError后机器人仍报警: attempt=%d error_status=%s robot_mode=%s",
+                    attempt, state.error_status, state.robot_mode,
+                )
+            except Exception as e:
+                cleanup_ok = False
+                logger.warning("Modbus 0 ClearError失败: attempt=%d error=%s", attempt, e)
+            time.sleep(0.1)
+
+        if not clear_ok:
+            self.last_error = "40001=0 已停止，但仍有不可清除或未解除的机器人故障"
+            self.record_alarm(
+                "Modbus停止",
+                "CLEAR_FAILED",
+                "故障",
+                self.last_error,
+                "检查物理急停、安全门、碰撞保护和机器人报警详情，处理后重新下发0或复位",
+            )
+            return False
+
+        if auto_enable:
+            if self.enable_robot():
+                self.last_error = ""
+            else:
+                cleanup_ok = False
+                self.last_error = self.last_error or "40001=0 清故障后自动使能失败"
+                self.record_alarm("Modbus停止", "ENABLE_FAILED", "故障", self.last_error)
+
+        return cleanup_ok
 
     def _modbus_run_edited_program(self, mode=MODE_AUTO):
         with self._modbus_exec_lock:
@@ -2306,7 +2630,7 @@ class DobotController:
             self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
             return
 
-        if not self.ensure_robot_ready_for_motion(auto_enable=True):
+        if not self._wait_robot_ready_for_modbus_program(timeout=5.0, poll_interval=0.1):
             logger.error("Modbus执行流程失败: 机器人未就绪: %s", self.last_error)
             self._write_modbus_status(STATUS_ROBOT_ERR, mode=mode)
             return
@@ -2710,3 +3034,4 @@ class DobotController:
         self.stop_feedback()
         if self.dashboard:
             self.dashboard.close()
+        self.release_control_lease()

@@ -38,6 +38,9 @@
 - `robot_controller.py`：协调 Dobot Dashboard/Feedback API、运动命令、安全状态、Modbus 从站集成、运动所有权、安全状态和位姿解析。
 - `vision_system.py`：拥有相机启动、RealSense 帧捕获、ONNX 模型加载、YOLO 后处理、跟踪、深度处理、平滑和坐标转换。
 - `config_manager.py`：集中管理 `dobot_move/config.json` 的读写，包括机器人 IP、Modbus 从站端口、标定、点位和手眼矩阵。
+- `runtime_agent.py`：生产环境无界面入口，负责设备监督、流程执行、健康状态和崩溃恢复锁。
+- `runtime_watchdog.py`：独立进程外看门狗，检测后台卡死，必要时先独立 Stop 再重启任务。
+- `runtime_resilience.py`：运行状态持久化、单实例锁、重启窗口、资源指标和动态超时预算。
 - `cpp_core/`：在原生代码中镜像部分 Python 视觉数学运算以提升性能。必须保留 `vision_system.py` 使用的输入/输出契约。
 
 ## 数据流
@@ -144,10 +147,25 @@ FlowThread 在 `run()` 开始时注册为 `controller._active_flow_thread`，在
 
 `_modbus_dispatch_motion(func, name)` 将 Modbus 运动命令投递到独立线程：
 
-- cmd=2（回安全位）和 cmd=3（目标运动）投递到独立线程执行
-- cmd=9（急停）直接调用 `emergency_stop()`，不排队
+- `40001=1` 在非流程运行时投递回初始点复位，完成后写 `2`
+- `40001=3` 在非流程运行时请求执行保存的运动流程
+- `40001=0` 始终直接停止当前流程/运动，不排队
+- 流程普通运行时忽略 `1/3`；信号延时阶段的 `1` 只用于放行下一步
 - `_modbus_exec_lock` 确保同一时间只有一个 Modbus 运动在执行
-- 200ms 周期状态刷新不被运动阻塞
+- Modbus 状态刷新不被长时间运动阻塞
+
+## 7×24 后台韧性
+
+后台采用两层监督：
+
+1. `DobotRuntimeAgent` 进程内监督机器人反馈、Modbus、相机和流程模块。
+2. `DobotRuntimeWatchdog` 进程外检查 `runtime_health.json`，处理主进程卡死。
+
+`runtime_state.json` 只保存诊断检查点。若上次退出不干净，后台进入 `RECOVERY_REQUIRED` 并保持 `40001=110`，不会恢复或重放运动；PLC 必须重新执行 `0→1→2→3`。
+
+GUI 和后台通过 `robot_control.lock` 竞争控制租约，后台自身另用 `runtime_agent.lock` 防止重复实例。反馈断流且流程正在运动时，顺序固定为：设置流程停止事件、发送 Dashboard `Stop()`、写机器人故障状态、关闭连接并退避重连。
+
+流程看门狗按模块类型计算截止时间。延时模块使用配置时长加余量，相机和视觉伺服按采集/迭代预算，运动模块使用保守上限；超时后停止流程并写 `40001=110`。
 
 ## 依赖
 

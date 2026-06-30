@@ -131,7 +131,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.set_dark_theme()
         
         self.robot_ip = get_robot_ip()
-        self.controller = DobotController(self.robot_ip)
+        self.controller = DobotController(self.robot_ip, enforce_single_instance=True)
         self._modbus_program_requested.connect(self._run_modbus_program_from_signal)
         self.controller.set_modbus_program_runner(self._request_modbus_program_from_modbus)
         self.vision_d435i = None
@@ -329,6 +329,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.main_control.connect_d405.connect(self.connect_d405)
         self.main_control.disconnect_d405.connect(self.disconnect_d405)
         self.main_control.run_grasp.connect(self.run_grasping_task)
+        self.main_control.move_initial.connect(self.move_to_initial_position)
         self.main_control.get_pose.connect(self.get_current_position)
         self.main_control.set_collision_level.connect(self.set_collision_level)
         self.main_control.clear_error.connect(self.on_clear_error)
@@ -351,6 +352,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.d405_connect_btn = self.main_control.d405_connect_btn
         self.d405_disconnect_btn = self.main_control.d405_disconnect_btn
         self.get_pos_btn = self.main_control.get_pos_btn
+        self.move_initial_btn = self.main_control.move_initial_btn
         self.collision_combo = self.main_control.collision_combo
         self.collision_set_btn = self.main_control.collision_set_btn
         self.clear_error_btn = self.main_control.clear_error_btn
@@ -450,7 +452,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         module_select_layout.setSpacing(10)
         module_select_layout.addWidget(QLabel("选择模块:"))
         self.module_combo = QComboBox()
-        self.module_combo.addItems(["相机识别", "直线运动", "圆弧运动", "相对移动", "连续相对路径", "关节旋转", "视觉伺服"])
+        self.module_combo.addItems(["相机识别", "直线运动", "圆弧运动", "相对移动", "连续相对路径", "关节旋转", "视觉伺服", "延时"])
         self.module_combo.currentIndexChanged.connect(self.on_module_combo_changed)
         module_select_layout.addWidget(self.module_combo)
         
@@ -665,6 +667,27 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.camera_module_combo.addItems(["D435i", "D405"])
         self.camera_module_combo.setCurrentIndex(0)
         camera_param_layout.addWidget(self.camera_module_combo, 0, 1)
+
+        self.delay_params = QWidget()
+        delay_layout = QGridLayout(self.delay_params)
+        delay_layout.addWidget(QLabel("等待方式:"), 0, 0)
+        self.delay_wait_mode = QComboBox()
+        self.delay_wait_mode.addItems(["固定延时", "40001放行或超时"])
+        self.delay_wait_mode.setToolTip(
+            "等待期间40001=5；上位机写1可提前进入下一步"
+        )
+        delay_layout.addWidget(self.delay_wait_mode, 0, 1)
+
+        delay_layout.addWidget(QLabel("最长等待(秒):"), 1, 0)
+        self.delay_seconds = QDoubleSpinBox()
+        self.delay_seconds.setRange(0.1, 3600.0)
+        self.delay_seconds.setDecimals(1)
+        self.delay_seconds.setSingleStep(0.5)
+        self.delay_seconds.setValue(1.0)
+        self.delay_seconds.setSuffix(" s")
+        delay_layout.addWidget(self.delay_seconds, 1, 1)
+
+        delay_layout.setColumnStretch(2, 1)
 
         # 连续相对路径参数
         self.relative_path_params = QWidget()
@@ -1222,7 +1245,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
 
         for attr in (
             "enable_robot_btn", "disable_robot_btn", "get_pos_btn",
-            "collision_set_btn", "clear_error_btn", "run_flow_btn",
+            "move_initial_btn", "collision_set_btn", "clear_error_btn", "run_flow_btn",
         ):
             if hasattr(self, attr):
                 getattr(self, attr).setEnabled(robot_ready and not flow_running and not cmd_running)
@@ -1523,6 +1546,8 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
                 if self.controller.is_connected:
                     self.controller.disconnect()
                     logger.info("机器人已断开连接")
+                else:
+                    self.controller.release_control_lease()
             except Exception as e:
                 logger.warning("断开机器人连接时出错: %s", e)
 

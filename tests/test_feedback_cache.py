@@ -35,6 +35,7 @@ _install_modbus_stub()
 
 from dobot_move.dobot_api import MyType  # noqa: E402
 from dobot_move.robot_controller import DobotController  # noqa: E402
+from dobot_move.motion_safety import MotionSafetyState  # noqa: E402
 
 
 def _make_feedback_packet():
@@ -68,12 +69,29 @@ class _FakeStopDashboard:
         return "0,{0},0;"
 
 
-def _force_snapshot(force, command_id=1, robot_mode=7):
+class _FakeRelativeRetryDashboard:
+    def __init__(self):
+        self.calls = []
+        self.relative_calls = 0
+
+    def Stop(self):
+        self.calls.append("Stop")
+        return "0,{0},0;"
+
+    def RelMovLUser(self, *args, **kwargs):
+        self.calls.append("RelMovLUser")
+        self.relative_calls += 1
+        if self.relative_calls == 1:
+            return "-7,{0},0;"
+        return "0,42;"
+
+
+def _force_snapshot(force, command_id=1, robot_mode=7, tcp_speed=None, running_status=1, run_queued_cmd=1):
     return {
         "pose": [300.0, 0.0, 200.0, 0.0, 0.0, -90.0],
-        "tcp_speed": [5.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        "running_status": 1,
-        "run_queued_cmd": 1,
+        "tcp_speed": list(tcp_speed if tcp_speed is not None else [5.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        "running_status": running_status,
+        "run_queued_cmd": run_queued_cmd,
         "current_command_id": command_id,
         "tool_vector_target": None,
         "robot_mode": robot_mode,
@@ -85,6 +103,17 @@ def _force_snapshot(force, command_id=1, robot_mode=7):
         "feedback_age": 0.0,
         "pose_timestamp": time.time(),
     }
+
+
+def _settled_force_snapshot(force=None, command_id=1, robot_mode=5):
+    return _force_snapshot(
+        force or [4, 6, 3, 0, 0, 0],
+        command_id=command_id,
+        robot_mode=robot_mode,
+        tcp_speed=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        running_status=0,
+        run_queued_cmd=0,
+    )
 
 
 def _cache_packet(controller, packet):
@@ -157,6 +186,7 @@ def test_prepare_force_guard_averages_pre_motion_baseline(monkeypatch):
 
     assert guard["baseline_force"][:3] == [2.0, 3.0, 4.0]
     assert guard["threshold_n"] == 5.0
+    assert guard["debounce_samples"] == 1
 
 
 def test_prepare_force_guard_rejects_missing_force_feedback(monkeypatch):
@@ -183,10 +213,12 @@ def test_wait_force_guard_stops_and_succeeds_before_command_id(monkeypatch):
     snapshots = [
         _force_snapshot([4, 6, 3, 0, 0, 0], command_id=999, robot_mode=5),
         _force_snapshot([4, 6, 3, 0, 0, 0], command_id=999, robot_mode=5),
+        _settled_force_snapshot(command_id=999, robot_mode=5),
+        _settled_force_snapshot(command_id=999, robot_mode=5),
     ]
 
     def fake_snapshot(max_age=0.3):
-        return snapshots.pop(0) if snapshots else _force_snapshot([4, 6, 3, 0, 0, 0], command_id=999, robot_mode=5)
+        return snapshots.pop(0) if snapshots else _settled_force_snapshot(command_id=999, robot_mode=5)
 
     monkeypatch.setattr(controller, "get_motion_feedback_snapshot", fake_snapshot)
 
@@ -207,6 +239,113 @@ def test_wait_force_guard_stops_and_succeeds_before_command_id(monkeypatch):
     assert controller.dashboard.calls == ["Stop"]
     assert controller._last_motion_completion_reason == "force_triggered"
     assert controller._last_force_guard_event["delta_n"] == 5.0
+    assert controller._last_force_guard_event["post_robot_mode"] == 5
+    assert controller._last_force_guard_event["post_error_status"] == 0
+
+
+def test_wait_force_guard_waits_for_stop_settle_then_succeeds(monkeypatch):
+    controller = _make_controller()
+    controller.dashboard = _FakeStopDashboard()
+    snapshots = [
+        _force_snapshot([4, 6, 3, 0, 0, 0], command_id=999, robot_mode=7),
+        _force_snapshot(
+            [4, 6, 3, 0, 0, 0],
+            command_id=999,
+            robot_mode=7,
+            tcp_speed=[2.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            running_status=1,
+            run_queued_cmd=1,
+        ),
+        _settled_force_snapshot(command_id=999, robot_mode=5),
+        _settled_force_snapshot(command_id=999, robot_mode=5),
+    ]
+
+    monkeypatch.setattr(controller, "get_motion_feedback_snapshot", lambda max_age=0.3: snapshots.pop(0))
+
+    ok = controller.wait_for_motion_completion(
+        timeout=0.5,
+        poll_interval=0,
+        settle_time=0,
+        command_id=999,
+        force_guard={
+            "enabled": True,
+            "threshold_n": 4.9,
+            "baseline_force": [1, 2, 3, 0, 0, 0],
+            "debounce_samples": 1,
+        },
+    )
+
+    assert ok is True
+    assert controller.dashboard.calls == ["Stop"]
+
+
+def test_wait_force_guard_fails_when_stop_settle_sees_alarm(monkeypatch):
+    controller = _make_controller()
+    controller.dashboard = _FakeStopDashboard()
+    snapshots = [
+        _force_snapshot([4, 6, 3, 0, 0, 0], command_id=999, robot_mode=7),
+        _settled_force_snapshot(command_id=999, robot_mode=9),
+    ]
+    def fake_safety_state():
+        return MotionSafetyState(is_connected=True, is_enabled=True, error_status=1, robot_mode=9, feedback_age=0.0)
+
+    monkeypatch.setattr(controller, "get_motion_feedback_snapshot", lambda max_age=0.3: snapshots.pop(0))
+    monkeypatch.setattr(controller, "get_motion_safety_state", fake_safety_state)
+
+    ok = controller.wait_for_motion_completion(
+        timeout=0.5,
+        poll_interval=0,
+        settle_time=0,
+        command_id=999,
+        force_guard={
+            "enabled": True,
+            "threshold_n": 4.9,
+            "baseline_force": [1, 2, 3, 0, 0, 0],
+            "debounce_samples": 1,
+        },
+    )
+
+    assert ok is False
+    assert "力触发Stop后机器人报警" in controller.last_error
+
+
+def test_relative_motion_retries_once_after_stop_rejected(monkeypatch):
+    controller = _make_controller()
+    controller.is_enabled = True
+    controller.dashboard = _FakeRelativeRetryDashboard()
+    controller.latest_pose = [0.0, 0.0, 200.0, 0.0, 0.0, 0.0]
+
+    monkeypatch.setattr(
+        controller,
+        "get_motion_safety_state",
+        lambda: MotionSafetyState(
+            is_connected=True,
+            is_enabled=True,
+            error_status=0,
+            robot_mode=5,
+            feedback_age=0.0,
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "get_motion_feedback_snapshot",
+        lambda max_age=0.3: _settled_force_snapshot(command_id=42, robot_mode=5),
+    )
+    monkeypatch.setattr(controller, "wait_for_motion_completion", lambda **kwargs: True)
+
+    ok = controller.move_relative(
+        [10, 0, 0, 0, 0, 0],
+        coord_system="user",
+        motion_type="linear",
+        speed=20,
+        acceleration=20,
+        cp=10,
+        wait_poll_interval=0,
+    )
+
+    assert ok is True
+    assert controller.dashboard.calls == ["RelMovLUser", "Stop", "RelMovLUser"]
+    assert controller._last_command_id == 42
 
 
 def test_feedback_health_uses_feed_timestamp():

@@ -24,6 +24,7 @@ class MainControlPanel(QWidget):
     connect_d405 = pyqtSignal()
     disconnect_d405 = pyqtSignal()
     run_grasp = pyqtSignal()
+    move_initial = pyqtSignal()
     get_pose = pyqtSignal()
     set_collision_level = pyqtSignal()
     clear_error = pyqtSignal()
@@ -128,6 +129,11 @@ class MainControlPanel(QWidget):
         self.get_pos_btn.setMinimumHeight(self.BTN_HEIGHT)
         robot_layout.addWidget(self.get_pos_btn)
 
+        self.move_initial_btn = QPushButton("回到初始位置")
+        set_button_role(self.move_initial_btn, "secondary")
+        self.move_initial_btn.setMinimumHeight(self.BTN_HEIGHT)
+        robot_layout.addWidget(self.move_initial_btn)
+
         # 碰撞等级
         collision_row = QHBoxLayout()
         collision_row.setSpacing(8)
@@ -215,6 +221,7 @@ class MainControlPanel(QWidget):
         self.d405_connect_btn.clicked.connect(self.connect_d405.emit)
         self.d405_disconnect_btn.clicked.connect(self.disconnect_d405.emit)
         self.run_task_btn.clicked.connect(self.run_grasp.emit)
+        self.move_initial_btn.clicked.connect(self.move_initial.emit)
         self.get_pos_btn.clicked.connect(self.get_pose.emit)
         self.collision_set_btn.clicked.connect(self.set_collision_level.emit)
         self.clear_error_btn.clicked.connect(self.clear_error.emit)

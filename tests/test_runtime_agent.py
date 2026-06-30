@@ -1,7 +1,13 @@
 """Regression tests for the unattended runtime agent."""
 import json
 import sys
+import threading
+import time
 import types
+from pathlib import Path
+
+if "pyrealsense2" not in sys.modules:
+    sys.modules["pyrealsense2"] = types.ModuleType("pyrealsense2")
 
 
 def _install_modbus_stub():
@@ -25,6 +31,8 @@ def _install_modbus_stub():
     module.CMD_STOP = 0
     module.CMD_RESET = 1
     module.CMD_HOOK = 3
+    module._CMD_DISPLAY = {0: "idle", 1: "reset", 3: "run", 4: "running", 5: "done", 110: "flow error", 111: "robot error", 112: "camera error"}
+    module._MODE_DISPLAY = {0: "auto", 1: "manual"}
     sys.modules["dobot_move.modbus_server"] = module
 
 
@@ -34,15 +42,22 @@ from runtime_agent import (  # noqa: E402
     DobotRuntimeAgent,
     RobotConnectionState,
     RobotConnectionSupervisor,
+    RuntimeProgramRunner,
 )
+from dobot_move.runtime_resilience import RuntimeState, RuntimeStateStore  # noqa: E402
 
 
 class _FakeDashboard:
     def __init__(self):
         self.closed = False
+        self.stop_calls = 0
 
     def close(self):
         self.closed = True
+
+    def Stop(self):
+        self.stop_calls += 1
+        return "0,{0},0;"
 
 
 class _FakeController:
@@ -65,6 +80,10 @@ class _FakeController:
         self.feed_thread = None
         self.feedback_health = {"health": "ok"}
         self.status_writes = []
+        self.finished = []
+        self.alarms = []
+        self._active_flow_thread = None
+        self.runtime_recovery_required = None
 
     def connect(self):
         self.connect_calls += 1
@@ -98,6 +117,15 @@ class _FakeController:
 
     def _write_modbus_status(self, status, mode=0):
         self.status_writes.append((status, mode))
+
+    def record_alarm(self, *args, **kwargs):
+        self.alarms.append((args, kwargs))
+
+    def mark_modbus_program_finished(self, success, mode=0, failure_status=None):
+        self.finished.append((success, mode, failure_status))
+
+    def set_runtime_recovery_required(self, required=True, on_cleared=None):
+        self.runtime_recovery_required = bool(required)
 
 
 def test_supervisor_reconnects_with_backoff():
@@ -146,17 +174,177 @@ def test_supervisor_closes_robot_connection_when_feedback_disconnected():
     assert supervisor.state == RobotConnectionState.DISCONNECTED
 
 
-def test_runtime_agent_writes_health_file(tmp_path):
+def test_supervisor_stops_active_flow_before_feedback_reconnect():
+    controller = _FakeController()
+    controller.is_connected = True
+    controller.feedback_health = {"health": "disconnected"}
+    dashboard = controller.dashboard
+    stop_event = threading.Event()
+    controller._active_flow_thread = types.SimpleNamespace(
+        _ctx=types.SimpleNamespace(stop_event=stop_event)
+    )
+    supervisor = RobotConnectionSupervisor(controller, reconnect_delays=(1.0,))
+
+    supervisor.step(now=300.0)
+
+    assert stop_event.is_set()
+    assert dashboard.stop_calls == 1
+    assert controller.status_writes[-1][0] == 111
+    assert controller.is_connected is False
+
+
+def test_runtime_agent_writes_health_file():
     controller = _FakeController()
     controller.modbus_running = True
     controller.is_connected = True
     controller.is_enabled = True
-    health_path = tmp_path / "runtime_health.json"
-    agent = DobotRuntimeAgent(controller=controller, health_path=health_path, startup_delay=0, poll_interval=0.1)
-    agent.write_health()
+    health_path = Path("_runtime_health_test.json")
+    try:
+        agent = DobotRuntimeAgent(controller=controller, health_path=health_path, startup_delay=0, poll_interval=0.1)
+        agent.write_health()
 
-    data = json.loads(health_path.read_text(encoding="utf-8"))
-    assert data["runtime"]["running"] is True
-    assert data["robot"]["connected"] is True
-    assert data["robot"]["enabled"] is True
-    assert data["modbus"]["is_running"] is True
+        data = json.loads(health_path.read_text(encoding="utf-8"))
+        assert data["runtime"]["running"] is True
+        assert data["robot"]["connected"] is True
+        assert data["robot"]["enabled"] is True
+        assert data["modbus"]["is_running"] is True
+        assert data["schema_version"] == 2
+        assert "process" in data
+        assert "thread_count" in data["process"]
+    finally:
+        health_path.unlink(missing_ok=True)
+
+
+def test_runtime_agent_latches_recovery_after_unclean_state():
+    controller = _FakeController()
+    health_path = Path("_runtime_recovery_health_test.json")
+    state_path = Path("_runtime_recovery_state_test.json")
+    try:
+        previous = RuntimeStateStore(state_path)
+        previous.begin_boot()
+        previous.transition(RuntimeState.RUNNING, flow_id="old-flow")
+
+        agent = DobotRuntimeAgent(
+            controller=controller,
+            health_path=health_path,
+            state_path=state_path,
+            startup_delay=0,
+            poll_interval=0.1,
+        )
+        agent.stop_event.set()
+        agent.run()
+
+        assert agent.recovery_required is True
+        assert controller.runtime_recovery_required is True
+    finally:
+        health_path.unlink(missing_ok=True)
+        state_path.unlink(missing_ok=True)
+
+
+def test_runtime_runner_camera_failure_writes_camera_error(monkeypatch):
+    controller = _FakeController()
+    runner = RuntimeProgramRunner(controller)
+    monkeypatch.setattr(
+        runner,
+        "_load_modules",
+        lambda: [{"type": "camera", "params": {"camera_type": "D405"}}],
+    )
+    monkeypatch.setattr(runner, "_ensure_required_cameras", lambda modules: False)
+
+    runner._run_once()
+
+    assert controller.finished == [(False, 0, 112)]
+
+
+def test_runtime_runner_passes_reused_cameras_to_flow(monkeypatch):
+    import dobot_move.workers as workers
+
+    controller = _FakeController()
+    runner = RuntimeProgramRunner(controller)
+    runner.vision_d405 = object()
+    captured = {}
+
+    class Signal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value):
+            for callback in self.callbacks:
+                callback(value)
+
+    class FakeFlowThread:
+        def __init__(self, controller_arg, vision_d435i, vision_d405, modules, paused):
+            captured["vision_d435i"] = vision_d435i
+            captured["vision_d405"] = vision_d405
+            self.flow_log = Signal()
+            self.flow_finished = Signal()
+
+        def run(self):
+            self.flow_finished.emit(True)
+
+    monkeypatch.setattr(
+        runner,
+        "_load_modules",
+        lambda: [{"type": "camera", "params": {"camera_type": "D405"}}],
+    )
+    monkeypatch.setattr(runner, "_ensure_required_cameras", lambda modules: True)
+    monkeypatch.setattr(workers, "FlowThread", FakeFlowThread)
+
+    runner._run_once()
+
+    assert captured["vision_d435i"] is None
+    assert captured["vision_d405"] is runner.vision_d405
+    assert controller.finished == [(True, 0, 110)]
+
+
+def test_runtime_runner_timeout_requests_flow_and_robot_stop(monkeypatch):
+    import dobot_move.workers as workers
+    import runtime_agent as runtime_module
+
+    controller = _FakeController()
+    runner = RuntimeProgramRunner(controller)
+    stopped = threading.Event()
+
+    class Signal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, *values):
+            for callback in self.callbacks:
+                callback(*values)
+
+    class HangingFlowThread:
+        def __init__(self, *args):
+            self.flow_log = Signal()
+            self.flow_finished = Signal()
+            self.flow_module_progress = Signal()
+
+        def run(self):
+            self.flow_module_progress.emit(1, 1, "卡死模块")
+            stopped.wait(1.0)
+
+        def stop(self):
+            stopped.set()
+
+    monkeypatch.setattr(
+        runner,
+        "_load_modules",
+        lambda: [{"type": "delay", "params": {"duration_s": 1}}],
+    )
+    monkeypatch.setattr(runner, "_ensure_required_cameras", lambda modules: True)
+    monkeypatch.setattr(workers, "FlowThread", HangingFlowThread)
+    monkeypatch.setattr(runtime_module, "module_timeout_seconds", lambda module: 0.03)
+    monkeypatch.setattr(runtime_module, "flow_timeout_seconds", lambda modules: 0.03)
+
+    runner._run_once()
+
+    assert stopped.is_set()
+    assert controller.dashboard.stop_calls == 1
+    assert controller.finished[-1][0] is False
+    assert any(args[0] == "Runtime流程看门狗" for args, _ in controller.alarms)

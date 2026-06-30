@@ -84,6 +84,7 @@ class VisionSystem:
         else:
             self.min_depth = float(depth_range_config.get("D435i_min_depth", 0.5))
             self.max_depth = float(depth_range_config.get("D435i_max_depth", 2.2))
+        self.max_camera_z_mm = 500.0
         self.session = None
         self.inference_provider = "未检测"
         self.input_name = None
@@ -413,7 +414,7 @@ class VisionSystem:
                 result = dict(cpp_result)
                 if "camera_coords" in result:
                     result["camera_coords"] = list(result["camera_coords"])
-                return result
+                return self._reject_camera_z_over_limit(result)
             except Exception as e:
                 logger.debug("C++ depth position fallback: %s", e)
 
@@ -491,12 +492,28 @@ class VisionSystem:
             {"total": (time.perf_counter() - start) * 1000.0},
         )
 
-        return {
+        return self._reject_camera_z_over_limit({
             'center_x': center_x,
             'center_y': center_y,
             'depth': depth_meters,
             'camera_coords': [X_mm, Y_mm, Z_mm]
-        }
+        })
+
+    def _reject_camera_z_over_limit(self, result):
+        if not result:
+            return None
+        coords = result.get("camera_coords") if isinstance(result, dict) else None
+        if coords is None or len(coords) < 3:
+            return result
+        try:
+            z_mm = float(coords[2])
+        except (TypeError, ValueError):
+            return result
+        max_z_mm = float(getattr(self, "max_camera_z_mm", 500.0))
+        if z_mm > max_z_mm:
+            logger.debug("camera Z filtered: %.2fmm > %.2fmm", z_mm, max_z_mm)
+            return None
+        return result
 
     def convert_to_end_coords(self, camera_coords):
         """
@@ -1024,7 +1041,17 @@ class VisionSystem:
             })
 
         img_size = (color_image.shape[1], color_image.shape[0])
-        tracked_tracks = self.tracker.update(det_list, img_size)
+        try:
+            tracked_tracks = self.tracker.update(det_list, img_size)
+        except Exception:
+            logger.exception("目标跟踪更新失败，重置跟踪器并使用当前帧检测结果兜底")
+            try:
+                self.tracker.reset()
+            except Exception:
+                logger.exception("目标跟踪器重置失败")
+            if detections:
+                return max(detections, key=lambda det: float(det.get('score', det.get('confidence', 0.0)) or 0.0))
+            return None
 
         target = self._select_target(tracked_tracks)
         return target
@@ -1069,14 +1096,15 @@ class VisionSystem:
     def calculate_object_position_smoothed(self, depth_frame, color_frame, target):
         if target is None:
             return None
+        detection_score = float(target.get('score', target.get('confidence', 0.0)) or 0.0)
 
         if target.get('predicted'):
-            return {
+            return self._reject_camera_z_over_limit({
                 'camera_coords': target['camera_coords'],
                 'smoothed': True,
                 'confidence': target.get('confidence', 0.0),
                 'source': 'kalman_predict',
-            }
+            })
 
         detections_for_calc = [{
             'bbox': target['bbox'],
@@ -1091,12 +1119,12 @@ class VisionSystem:
         if raw_result is None:
             if self.kalman_3d is not None and self.kalman_3d.initialized:
                 predicted = self.kalman_3d.predict()
-                return {
+                return self._reject_camera_z_over_limit({
                     'camera_coords': predicted.tolist(),
                     'smoothed': True,
                     'confidence': self.kalman_3d.get_confidence(),
                     'source': 'kalman_predict',
-                }
+                })
             return None
 
         if self.kalman_3d is not None:
@@ -1105,15 +1133,19 @@ class VisionSystem:
             result = dict(raw_result)
             result['camera_coords'] = smoothed.tolist()
             result['smoothed'] = True
-            result['confidence'] = self.kalman_3d.get_confidence()
+            result['confidence'] = detection_score
+            result['detection_score'] = detection_score
+            result['tracking_confidence'] = self.kalman_3d.get_confidence()
             result['source'] = 'kalman_smoothed'
             result['raw_coords'] = observed
-            return result
+            return self._reject_camera_z_over_limit(result)
 
         raw_result['smoothed'] = False
-        raw_result['confidence'] = 1.0
+        raw_result['confidence'] = detection_score if detection_score > 0 else 1.0
+        raw_result['detection_score'] = detection_score
+        raw_result['tracking_confidence'] = 0.0
         raw_result['source'] = 'direct'
-        return raw_result
+        return self._reject_camera_z_over_limit(raw_result)
 
     def reset_tracking(self):
         if self.tracker is not None:

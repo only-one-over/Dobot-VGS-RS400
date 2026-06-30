@@ -15,7 +15,19 @@
       "target": "saved_point",
       "motion_type": "MovL",
       "speed": 30,
-      "point_name": "p1"
+      "point_name": "pose",
+      "force_guard": {
+        "enabled": false,
+        "threshold_n": 5.0,
+        "mode": "resultant_delta"
+      }
+    }
+  },
+  {
+    "type": "camera",
+    "name": "识别物体并计算坐标",
+    "params": {
+      "camera_type": "D405"
     }
   },
   {
@@ -25,96 +37,51 @@
       "target": "saved_point",
       "motion_type": "MovL",
       "speed": 30,
-      "point_name": "p2"
+      "point_name": "p1",
+      "force_guard": {
+        "enabled": false,
+        "threshold_n": 5.0,
+        "mode": "resultant_delta"
+      }
     }
   },
   {
-    "type": "move",
-    "name": "直线运动到目标",
-    "params": {
-      "target": "saved_point",
-      "motion_type": "MovL",
-      "speed": 30,
-      "point_name": "p3"
-    }
-  },
-  {
-    "type": "move",
-    "name": "直线运动到目标",
-    "params": {
-      "target": "saved_point",
-      "motion_type": "MovL",
-      "speed": 30,
-      "point_name": "p4"
-    }
-  },
-  {
-    "type": "relative_path",
-    "name": "连续相对路径",
+    "type": "relative_move",
+    "name": "相对移动",
     "params": {
       "coord_system": "user",
       "motion_type": "linear",
+      "offsets": [
+        -50.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
       "speed": 30,
-      "acceleration": 30,
-      "cp": 0,
-      "execution_mode": "queued",
-      "segments": [
-        {
-          "enabled": true,
-          "name": "段1",
-          "x": 0.0,
-          "y": 40.0,
-          "z": 0.0,
-          "rx": 0.0,
-          "ry": 0.0,
-          "rz": 0.0,
-          "wait_after": true
-        },
-        {
-          "enabled": true,
-          "name": "段2",
-          "x": 0.0,
-          "y": 0.0,
-          "z": 65.0,
-          "rx": 0.0,
-          "ry": 0.0,
-          "rz": 0.0,
-          "wait_after": true
-        },
-        {
-          "enabled": true,
-          "name": "段3",
-          "x": 0.0,
-          "y": 70.0,
-          "z": 0.0,
-          "rx": 5.0,
-          "ry": 0.0,
-          "rz": 0.0,
-          "wait_after": true
-        },
-        {
-          "enabled": true,
-          "name": "段4",
-          "x": 0.0,
-          "y": 50.0,
-          "z": 60.0,
-          "rx": 15.0,
-          "ry": 0.0,
-          "rz": 0.0,
-          "wait_after": true
-        },
-        {
-          "enabled": true,
-          "name": "段5",
-          "x": 200.0,
-          "y": 0.0,
-          "z": 0.0,
-          "rx": 0.0,
-          "ry": 0.0,
-          "rz": 0.0,
-          "wait_after": true
-        }
-      ]
+      "acceleration": 20,
+      "cp": 100,
+      "force_guard": {
+        "enabled": false,
+        "threshold_n": 5.0,
+        "mode": "resultant_delta"
+      }
+    }
+  },
+  {
+    "type": "move",
+    "name": "直线运动到目标",
+    "params": {
+      "target": "saved_point",
+      "motion_type": "MovL",
+      "speed": 30,
+      "point_name": "initial_point",
+      "force_guard": {
+        "enabled": false,
+        "threshold_n": 5.0,
+        "mode": "resultant_delta"
+      }
     }
   }
 ]

@@ -99,6 +99,18 @@ class _FakeStopDashboard:
         self.calls.append("Pause")
         return "0,{0},0;"
 
+    def ClearError(self):
+        self.calls.append("ClearError")
+        return "0,{0},0;"
+
+    def EmergencyStop(self, mode):
+        self.calls.append(("EmergencyStop", mode))
+        return "0,{0},0;"
+
+    def EnableRobot(self):
+        self.calls.append("EnableRobot")
+        return "0,{0},0;"
+
 
 def _controller_with_fake_relative_dashboard():
     _, robot_controller = _real_modules()
@@ -265,7 +277,7 @@ def test_stop_command_connected_stops_robot_and_holds_idle_status():
 
     controller._on_modbus_command(modbus_server.CMD_STOP, mode=modbus_server.MODE_AUTO)
 
-    assert fake_dashboard.calls == ["Stop"]
+    assert fake_dashboard.calls == ["Stop", "ClearError", "EnableRobot"]
     assert fake_server.calls == [
         {"status": modbus_server.STATUS_IDLE, "mode": modbus_server.MODE_AUTO}
     ]
@@ -283,11 +295,40 @@ def test_stop_command_is_not_ignored_in_manual_mode():
 
     controller._on_modbus_command(modbus_server.CMD_STOP, mode=modbus_server.MODE_MANUAL)
 
-    assert fake_dashboard.calls == ["Stop"]
+    assert fake_dashboard.calls == ["Stop", "ClearError", "EnableRobot"]
     assert fake_server.calls == [
         {"status": modbus_server.STATUS_IDLE, "mode": modbus_server.MODE_MANUAL}
     ]
     assert controller._modbus_status_override == modbus_server.STATUS_IDLE
+
+
+def test_stop_command_clears_fault_latches_and_software_estop():
+    modbus_server, robot_controller = _real_modules()
+    controller = robot_controller.DobotController("192.168.1.50")
+    fake_server = _FakeStatusServer()
+    fake_dashboard = _FakeStopDashboard()
+    controller.modbus_server = fake_server
+    controller.dashboard = fake_dashboard
+    controller.is_connected = True
+    controller.software_emergency_active = True
+    controller.last_error = "old fault"
+    controller.clear_error_retry_count = 2
+    controller._last_fault_code = 123
+    controller._robot_alarm_recorded = True
+    controller._modbus_status_override = modbus_server.STATUS_ROBOT_ERR
+
+    controller._on_modbus_command(modbus_server.CMD_STOP, mode=modbus_server.MODE_AUTO)
+
+    assert fake_dashboard.calls == ["Stop", ("EmergencyStop", 0), "ClearError", "EnableRobot"]
+    assert controller.software_emergency_active is False
+    assert controller.last_error == ""
+    assert controller.clear_error_retry_count == 0
+    assert controller._last_fault_code == 0
+    assert controller._robot_alarm_recorded is False
+    assert controller._modbus_status_override == modbus_server.STATUS_IDLE
+    assert fake_server.calls == [
+        {"status": modbus_server.STATUS_IDLE, "mode": modbus_server.MODE_AUTO}
+    ]
 
 
 def test_update_modbus_status_preserves_zero_override():
@@ -316,6 +357,78 @@ def test_reset_command_connected_dispatches_move_initial():
     controller._on_modbus_command(modbus_server.CMD_RESET, mode=modbus_server.MODE_AUTO)
 
     assert dispatched == [(controller._modbus_move_initial, "回原点")]
+
+
+def test_runtime_recovery_lock_only_accepts_zero():
+    modbus_server, robot_controller = _real_modules()
+    controller = robot_controller.DobotController("192.168.1.50")
+    fake_server = _FakeStatusServer()
+    controller.modbus_server = fake_server
+    controller.record_alarm = lambda *args, **kwargs: None
+    cleared = []
+    controller.set_runtime_recovery_required(True, on_cleared=lambda: cleared.append(True))
+
+    controller._on_modbus_command(modbus_server.CMD_RESET, mode=modbus_server.MODE_AUTO)
+    assert controller._runtime_recovery_required is True
+    assert cleared == []
+    assert fake_server.calls[-1]["status"] == modbus_server.STATUS_HOOK_ERR
+
+    controller._on_modbus_command(modbus_server.CMD_STOP, mode=modbus_server.MODE_AUTO)
+    assert controller._runtime_recovery_required is False
+    assert cleared == [True]
+    assert fake_server.calls[-1]["status"] == modbus_server.STATUS_IDLE
+
+
+def test_reset_value_releases_delay_instead_of_dispatching_reset():
+    modbus_server, robot_controller = _real_modules()
+    controller = robot_controller.DobotController("192.168.1.50")
+    fake_server = _FakeStatusServer()
+    controller.modbus_server = fake_server
+    controller._active_flow_thread = object()
+    dispatched = []
+    controller._modbus_dispatch_motion = lambda func, name: dispatched.append((func, name)) or True
+
+    controller.begin_modbus_delay_wait()
+    controller._on_modbus_command(modbus_server.CMD_HOOK, mode=modbus_server.MODE_AUTO)
+    assert not controller.is_modbus_delay_released()
+    controller._on_modbus_command(modbus_server.CMD_RESET, mode=modbus_server.MODE_AUTO)
+
+    assert fake_server.calls == [
+        {"status": modbus_server.STATUS_DELAY_WAIT, "mode": modbus_server.MODE_AUTO},
+        {"status": modbus_server.STATUS_DELAY_WAIT, "mode": modbus_server.MODE_AUTO},
+        {"status": modbus_server.STATUS_DELAY_WAIT, "mode": modbus_server.MODE_AUTO},
+    ]
+    assert controller.is_modbus_delay_released()
+    assert dispatched == []
+
+    controller.end_modbus_delay_wait()
+    assert fake_server.calls[-1] == {
+        "status": modbus_server.STATUS_RUNNING,
+        "mode": modbus_server.MODE_AUTO,
+    }
+
+
+def test_reset_and_hook_are_ignored_during_non_delay_flow_execution():
+    modbus_server, robot_controller = _real_modules()
+    controller = robot_controller.DobotController("192.168.1.50")
+    fake_server = _FakeStatusServer()
+    controller.modbus_server = fake_server
+    controller._active_flow_thread = object()
+    dispatched = []
+    runner_calls = []
+    controller._modbus_dispatch_motion = lambda func, name: dispatched.append((func, name)) or True
+    controller.set_modbus_program_runner(lambda: runner_calls.append("run") or True)
+
+    controller._on_modbus_command(modbus_server.CMD_RESET, mode=modbus_server.MODE_AUTO)
+    controller._on_modbus_command(modbus_server.CMD_HOOK, mode=modbus_server.MODE_AUTO)
+
+    assert dispatched == []
+    assert runner_calls == []
+    assert not controller.is_modbus_delay_released()
+    assert fake_server.calls == [
+        {"status": modbus_server.STATUS_RUNNING, "mode": modbus_server.MODE_AUTO},
+        {"status": modbus_server.STATUS_RUNNING, "mode": modbus_server.MODE_AUTO},
+    ]
 
 
 def test_reset_command_success_writes_running_then_reset_complete(monkeypatch):
@@ -574,6 +687,14 @@ def test_force_guard_relative_path_forces_stop_each_mode():
     assert 'if force_guard is not None and execution_mode == "queued":' in source
     assert 'execution_mode = "stop_each"' in source
     assert "force_guard=force_guard" in source
+
+
+def test_relative_path_segment_log_does_not_use_percent_formatting():
+    with open("dobot_move/workers.py", encoding="utf-8") as f:
+        source = f.read()
+
+    assert "%.3fs\" % seg_elapsed" not in source
+    assert "speed={seg_speed}% cp={seg_cp} r={seg_r} elapsed={seg_elapsed:.3f}s" in source
 
 
 def test_gui_modbus_program_uses_signal_and_resets_after_success():

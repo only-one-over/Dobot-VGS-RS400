@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -49,18 +50,9 @@ class FlowRunContext:
     stop_event: threading.Event = field(default_factory=threading.Event)
     module_timings: list = field(default_factory=list)
     motion_generation: int = 0
-    _flow_detection_cache: dict = field(default_factory=dict)
 
     def increment_motion_generation(self):
         self.motion_generation += 1
-
-    def is_cache_valid(self, camera_type: str) -> bool:
-        entry = self._flow_detection_cache.get(camera_type)
-        if entry is None:
-            return False
-        if entry.get("motion_generation") != self.motion_generation:
-            return False
-        return True
 
 
 def normalize_module_type(module: dict) -> dict:
@@ -79,12 +71,12 @@ def build_force_guard(params: dict):
         threshold_n = float(guard.get("threshold_n", 0))
         baseline_samples = int(guard.get("baseline_samples", 3))
         baseline_interval = float(guard.get("baseline_interval", 0.02))
-        debounce_samples = int(guard.get("debounce_samples", 2))
+        debounce_samples = int(guard.get("debounce_samples", 1))
     except (TypeError, ValueError):
         threshold_n = 0.0
         baseline_samples = 3
         baseline_interval = 0.02
-        debounce_samples = 2
+        debounce_samples = 1
     return {
         "enabled": True,
         "mode": "resultant_delta",
@@ -95,6 +87,70 @@ def build_force_guard(params: dict):
     }
 
 
+def coerce_float_vector(value, min_len, label):
+    """Convert list/tuple/numpy vectors to a plain float list with minimum length."""
+    if value is None:
+        raise ValueError(f"{label}长度不足")
+    try:
+        vector = np.asarray(value, dtype=float).reshape(-1).tolist()
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{label}格式无效: {e}") from e
+    if len(vector) < min_len:
+        raise ValueError(f"{label}长度不足: 需要至少{min_len}个值，实际{len(vector)}个")
+    return vector
+
+
+def wait_for_flow_delay_or_signal(
+    duration_s,
+    stop_event,
+    is_paused_ref=None,
+    poll_interval=0.05,
+    signal_checker=None,
+):
+    """Wait until timeout, stop, or an optional external signal matches."""
+    duration_s = float(duration_s)
+    if not math.isfinite(duration_s) or duration_s <= 0:
+        raise ValueError("延时时长必须是大于0的有限数值")
+
+    poll_interval = max(0.001, float(poll_interval))
+    remaining = duration_s
+    last_tick = time.monotonic()
+
+    while remaining > 0:
+        if stop_event.is_set():
+            return "stopped"
+
+        now = time.monotonic()
+        paused = bool(is_paused_ref and is_paused_ref[0])
+        if not paused:
+            remaining -= max(0.0, now - last_tick)
+        last_tick = now
+
+        if not paused and signal_checker is not None:
+            try:
+                if signal_checker():
+                    return "signal"
+            except Exception:
+                logger.debug("延时模块读取外部信号失败", exc_info=True)
+
+        if remaining <= 0:
+            return "timeout"
+        stop_event.wait(min(poll_interval, remaining) if not paused else poll_interval)
+
+    return "timeout"
+
+
+def wait_for_flow_delay(duration_s, stop_event, is_paused_ref=None, poll_interval=0.05):
+    """Wait for a flow delay while remaining responsive to pause and stop."""
+    result = wait_for_flow_delay_or_signal(
+        duration_s,
+        stop_event,
+        is_paused_ref=is_paused_ref,
+        poll_interval=poll_interval,
+    )
+    return result != "stopped"
+
+
 def validate_grasp_flow_modules(modules: list) -> list:
     """Validate grasp flow module configuration before execution.
 
@@ -102,6 +158,7 @@ def validate_grasp_flow_modules(modules: list) -> list:
     """
     errors = []
     has_camera_before = set()  # camera types seen so far
+    camera_point_names = {"D435i": "d435i", "D405": "d405"}
 
     for i, module in enumerate(modules):
         normalize_module_type(module)
@@ -122,9 +179,16 @@ def validate_grasp_flow_modules(modules: list) -> list:
                 if camera_type not in has_camera_before and "D405" not in has_camera_before:
                     errors.append(f"第{step}步「{name}」：目标为 camera_detected，但前面没有相机识别模块")
                 motion_type = params.get("motion_type", "")
-                point_name = params.get("point_name", "")
+                point_name = str(params.get("point_name", ""))
                 if motion_type == "MovL" and not point_name.strip():
                     errors.append(f"第{step}步「{name}」：直线运动目标为 camera_detected，但未指定目标点位")
+                expected_points = {camera_point_names.get(cam) for cam in has_camera_before}
+                expected_points.discard(None)
+                if point_name and point_name.lower() in set(camera_point_names.values()) and point_name.lower() not in expected_points:
+                    expected_text = " 或 ".join(sorted(expected_points)) if expected_points else "前序相机点位"
+                    errors.append(
+                        f"第{step}步「{name}」：目标点位 '{point_name}' 与前序相机识别不一致，应使用 {expected_text}"
+                    )
             elif target == "initial_position":
                 from .config_manager import get_point
                 if not get_point("initial_point"):
@@ -160,6 +224,19 @@ def validate_grasp_flow_modules(modules: list) -> list:
             camera_type = params.get("camera_type", "D435i")
             has_camera_before.add(camera_type)
 
+        elif mtype == "delay":
+            try:
+                duration_s = float(params.get("duration_s", 0))
+            except (TypeError, ValueError):
+                duration_s = 0.0
+            if not math.isfinite(duration_s) or duration_s <= 0:
+                errors.append(f"第{step}步「{name}」：延时时长必须大于0秒")
+            elif duration_s > 3600:
+                errors.append(f"第{step}步「{name}」：延时时长不能超过3600秒")
+            wait_mode = params.get("wait_mode", "time")
+            if wait_mode not in ("time", "modbus_or_timeout"):
+                errors.append(f"第{step}步「{name}」：延时等待方式无效")
+
     return errors
 
 
@@ -168,17 +245,26 @@ class FlowThread(QThread):
     flow_finished = pyqtSignal(bool)
     flow_module_progress = pyqtSignal(int, int, str)
 
-    def __init__(self, controller, vision_d435i, vision_d405, grasp_flow_modules, is_paused_ref, parent=None):
+    def __init__(
+        self,
+        controller,
+        vision_d435i,
+        vision_d405,
+        grasp_flow_modules,
+        is_paused_ref,
+        parent=None,
+        camera_test_workers=None,
+    ):
         super().__init__(parent)
         self.controller = controller
         self.vision_d435i = vision_d435i
         self.vision_d405 = vision_d405
         self.grasp_flow_modules = grasp_flow_modules
         self.is_paused_ref = is_paused_ref
+        self.camera_test_workers = camera_test_workers or {}
         self._stop_requested = False
         self._ctx: Optional[FlowRunContext] = None
         self.performance_config = get_performance_config()
-        self._flow_detection_cache = {}
 
     def _fail_module(self, ctx, module_index, module_name, reason):
         """Unified failure handler: record timing, emit log/signal, write alarm."""
@@ -204,6 +290,249 @@ class FlowThread(QThread):
         )
         return True
 
+    def _get_camera_test_worker(self, camera_type):
+        worker = self.camera_test_workers.get(camera_type)
+        if worker is None or not hasattr(worker, "get_flow_detection_snapshot"):
+            return None
+        if not bool(getattr(worker, "running", False)):
+            return None
+        try:
+            if hasattr(worker, "isRunning") and not worker.isRunning():
+                return None
+        except Exception:
+            return None
+        return worker
+
+    def _detect_camera_object_from_camera_test_worker(self, worker, camera_type, ctx, max_frames, early_confidence):
+        """Reuse live camera-test detection snapshots so the flow does not open a second camera pipeline."""
+        if hasattr(worker, "set_flow_detection_enabled"):
+            worker.set_flow_detection_enabled(True)
+        try:
+            best_result = None
+            best_confidence = 0.0
+            best_frame = 0
+            processed_frames = 0
+            no_frame_polls = 0
+            no_detection_frames = 0
+            no_position_frames = 0
+            start_snapshot = worker.get_flow_detection_snapshot() or {}
+            start_seq = int(start_snapshot.get("seq", -1) or -1)
+            last_seq = start_seq
+            deadline = time.perf_counter() + max(3.0, float(max_frames) * 0.5)
+
+            self.flow_log.emit(f"{camera_type} 相机测试运行中，流程复用测试线程实时识别")
+
+            while processed_frames < max_frames and time.perf_counter() < deadline:
+                if ctx.stop_event.is_set():
+                    return {
+                        "object_position": None,
+                        "confidence": 0.0,
+                        "failure_reason": "用户停止",
+                        "processed_frames": processed_frames,
+                    }
+
+                snapshot = worker.get_flow_detection_snapshot()
+                if not snapshot:
+                    no_frame_polls += 1
+                    time.sleep(0.01)
+                    continue
+
+                seq = int(snapshot.get("seq", -1) or -1)
+                if seq <= last_seq or seq <= start_seq:
+                    no_frame_polls += 1
+                    time.sleep(0.01)
+                    continue
+
+                last_seq = seq
+                processed_frames += 1
+                target = snapshot.get("target")
+                object_position = snapshot.get("object_position")
+
+                if target is None:
+                    no_detection_frames += 1
+                    self.flow_log.emit(
+                        f"📊 {camera_type} 测试帧{processed_frames}/{max_frames}: 未检测到目标"
+                    )
+                    continue
+
+                if (
+                    not object_position
+                    or len(object_position.get("camera_coords", [])) < 3
+                ):
+                    no_position_frames += 1
+                    target_score = float(target.get("score", target.get("confidence", 0.0)) or 0.0)
+                    self.flow_log.emit(
+                        f"📊 {camera_type} 测试帧{processed_frames}/{max_frames}: "
+                        f"检测到目标(score={target_score:.2f})，但深度/掩膜坐标计算失败"
+                    )
+                    continue
+
+                conf = float(object_position.get("confidence", snapshot.get("confidence", 0.0)) or 0.0)
+                source = object_position.get("source", "camera_test")
+                self.flow_log.emit(
+                    f"📊 {camera_type} 测试帧{processed_frames}/{max_frames}: "
+                    f"置信度={conf:.2f} 来源={source}"
+                )
+                if conf > best_confidence:
+                    best_result = object_position
+                    best_confidence = conf
+                    best_frame = processed_frames
+                if best_confidence >= early_confidence:
+                    self.flow_log.emit(f"✅ 置信度充足({best_confidence:.2f})，提前退出")
+                    break
+
+            if best_result is not None:
+                return {
+                    "object_position": best_result,
+                    "confidence": best_confidence,
+                    "best_frame": best_frame,
+                    "processed_frames": processed_frames,
+                    "failure_reason": "",
+                }
+
+            if processed_frames == 0:
+                reason = f"{camera_type} 相机测试未产生新的识别帧(no_frame_polls={no_frame_polls})"
+            elif no_position_frames > 0:
+                reason = (
+                    f"检测到目标但深度/掩膜坐标计算失败"
+                    f"(无检测{no_detection_frames}帧 坐标失败{no_position_frames}帧)"
+                )
+            else:
+                reason = f"未检测到物品(处理{processed_frames}帧)"
+            return {
+                "object_position": None,
+                "confidence": best_confidence,
+                "processed_frames": processed_frames,
+                "failure_reason": reason,
+            }
+        finally:
+            if hasattr(worker, "set_flow_detection_enabled"):
+                worker.set_flow_detection_enabled(False)
+
+    def _detect_camera_object_for_flow(self, vision, camera_type, ctx, max_frames, early_confidence):
+        """Run flow camera detection through the same numpy packet path as camera test."""
+        worker = self._get_camera_test_worker(camera_type)
+        if worker is not None:
+            return self._detect_camera_object_from_camera_test_worker(
+                worker,
+                camera_type,
+                ctx,
+                max_frames,
+                early_confidence,
+            )
+
+        vision.reset_tracking()
+        capture_thread = CaptureThread(vision)
+        capture_thread.start()
+
+        best_result = None
+        best_confidence = 0.0
+        best_frame = 0
+        last_seq = -1
+        processed_frames = 0
+        no_frame_polls = 0
+        no_detection_frames = 0
+        no_position_frames = 0
+        deadline = time.perf_counter() + max(3.0, float(max_frames) * 0.5)
+
+        try:
+            while processed_frames < max_frames and time.perf_counter() < deadline:
+                if ctx.stop_event.is_set():
+                    return {
+                        "object_position": None,
+                        "confidence": 0.0,
+                        "failure_reason": "用户停止",
+                        "processed_frames": processed_frames,
+                    }
+
+                packet, capture_ms = capture_thread.get_latest()
+                if packet is None or packet.seq == last_seq:
+                    no_frame_polls += 1
+                    time.sleep(0.005)
+                    continue
+
+                last_seq = packet.seq
+                processed_frames += 1
+
+                target = vision.run_detection_tracked(packet.color_image)
+                if target is None:
+                    no_detection_frames += 1
+                    self.flow_log.emit(
+                        f"📊 {camera_type} 帧{processed_frames}/{max_frames}: 未检测到目标"
+                    )
+                    continue
+
+                object_position = vision.calculate_object_position_smoothed(
+                    packet.depth_image,
+                    packet.color_image,
+                    target,
+                )
+                if (
+                    not object_position
+                    or len(object_position.get("camera_coords", [])) < 3
+                ):
+                    no_position_frames += 1
+                    target_score = float(target.get("score", target.get("confidence", 0.0)) or 0.0)
+                    self.flow_log.emit(
+                        f"📊 {camera_type} 帧{processed_frames}/{max_frames}: "
+                        f"检测到目标(score={target_score:.2f})，但深度/掩膜坐标计算失败"
+                    )
+                    continue
+
+                conf = float(object_position.get("confidence", target.get("score", 0.0)) or 0.0)
+                source = object_position.get("source", "unknown")
+                self.flow_log.emit(
+                    f"📊 {camera_type} 帧{processed_frames}/{max_frames}: "
+                    f"置信度={conf:.2f} 来源={source} capture={capture_ms:.1f}ms"
+                )
+                if conf > best_confidence:
+                    best_result = object_position
+                    best_confidence = conf
+                    best_frame = processed_frames
+                if best_confidence >= early_confidence:
+                    self.flow_log.emit(f"✅ 置信度充足({best_confidence:.2f})，提前退出")
+                    break
+
+            if best_result is not None:
+                return {
+                    "object_position": best_result,
+                    "confidence": best_confidence,
+                    "best_frame": best_frame,
+                    "processed_frames": processed_frames,
+                    "failure_reason": "",
+                }
+
+            if processed_frames == 0:
+                reason = f"{camera_type} 未获取到有效图像帧(no_frame_polls={no_frame_polls})"
+            elif no_position_frames > 0:
+                reason = (
+                    f"检测到目标但深度/掩膜坐标计算失败"
+                    f"(无检测{no_detection_frames}帧, 坐标失败{no_position_frames}帧)"
+                )
+            else:
+                reason = f"未检测到物品(处理{processed_frames}帧)"
+            return {
+                "object_position": None,
+                "confidence": best_confidence,
+                "processed_frames": processed_frames,
+                "failure_reason": reason,
+            }
+        finally:
+            capture_thread.stop()
+            capture_thread.join(timeout=1.0)
+
+    def _set_camera_test_flow_active(self, active):
+        seen = set()
+        for worker in self.camera_test_workers.values():
+            if worker is None or id(worker) in seen:
+                continue
+            seen.add(id(worker))
+            if hasattr(worker, "set_flow_active"):
+                try:
+                    worker.set_flow_active(active)
+                except Exception:
+                    logger.exception("failed to update camera-test flow mode")
+
     def stop(self):
         if self._ctx is not None:
             self._ctx.stop_event.set()
@@ -225,6 +554,7 @@ class FlowThread(QThread):
                 self.flow_finished.emit(False)
                 return
 
+            self._set_camera_test_flow_active(True)
             try:
                 flow_start = ctx.start_time
                 wait_poll_interval = float(self.performance_config.get("flow_wait_poll_interval", 0.05))
@@ -590,11 +920,71 @@ class FlowThread(QThread):
                                 if self._log_force_guard_if_triggered(i, f"{name}/段{seg_idx+1}"):
                                     break
                                 logger.info("relative_path seg %d/%d: name=%s offsets=%s coord=%s speed=%d cp=%d r=%d elapsed=%.3fs", seg_idx + 1, len(segments), seg_name, offsets, seg_coord, seg_speed, seg_cp, seg_r, seg_elapsed)
-                                self.flow_log.emit(f"  段{seg_idx+1}/{len(segments)}「{seg_name}」: [{offsets[0]:.1f},{offsets[1]:.1f},{offsets[2]:.1f}] coord={seg_coord} speed={seg_speed}% cp={seg_cp} r={seg_r} %.3fs" % seg_elapsed)
+                                self.flow_log.emit(f"  段{seg_idx+1}/{len(segments)}「{seg_name}」: [{offsets[0]:.1f},{offsets[1]:.1f},{offsets[2]:.1f}] coord={seg_coord} speed={seg_speed}% cp={seg_cp} r={seg_r} elapsed={seg_elapsed:.3f}s")
 
                         ctx.increment_motion_generation()
                         cmd_elapsed = time.perf_counter() - module_start - camera_elapsed
                         wait_elapsed = 0.0
+
+                    elif module['type'] == "delay":
+                        p = module.get('params', {})
+                        try:
+                            duration_s = float(p.get('duration_s', 0))
+                        except (TypeError, ValueError):
+                            duration_s = 0.0
+                        if not math.isfinite(duration_s) or duration_s <= 0 or duration_s > 3600:
+                            self._fail_module(ctx, i, name, "延时时长必须大于0秒且不超过3600秒")
+                            return
+
+                        wait_mode = p.get('wait_mode', 'time')
+                        signal_checker = None
+                        if wait_mode == "modbus_or_timeout":
+                            self.flow_log.emit(
+                                f"⏱️ 最长等待 {duration_s:.1f} 秒，"
+                                "延时期间40001=5，收到40001=1时提前通过"
+                            )
+
+                            modbus_server = getattr(self.controller, "modbus_server", None)
+                            if modbus_server is None or not modbus_server.is_running():
+                                self.flow_log.emit("  Modbus服务未运行，将等待至超时后继续")
+
+                            self.controller.begin_modbus_delay_wait()
+                            signal_checker = self.controller.is_modbus_delay_released
+                        elif wait_mode == "time":
+                            self.flow_log.emit(f"⏱️ 延时 {duration_s:.1f} 秒")
+                        else:
+                            self._fail_module(ctx, i, name, "延时等待方式无效")
+                            return
+
+                        wait_start = time.perf_counter()
+                        try:
+                            wait_result = wait_for_flow_delay_or_signal(
+                                duration_s,
+                                ctx.stop_event,
+                                self.is_paused_ref,
+                                poll_interval=min(wait_poll_interval, 0.05),
+                                signal_checker=signal_checker,
+                            )
+                        finally:
+                            if wait_mode == "modbus_or_timeout":
+                                self.controller.end_modbus_delay_wait(
+                                    restore_running=not ctx.stop_event.is_set()
+                                )
+                        if wait_result == "stopped":
+                            self._fail_module(ctx, i, name, "用户停止（延时中）")
+                            return
+                        wait_elapsed = time.perf_counter() - wait_start
+                        cmd_elapsed = 0.0
+                        if wait_result == "signal":
+                            self.flow_log.emit(
+                                f"✅ 模块{i+1}收到Modbus信号，等待{wait_elapsed:.1f}秒后提前完成"
+                            )
+                        elif wait_mode == "modbus_or_timeout":
+                            self.flow_log.emit(
+                                f"✅ 模块{i+1}等待超时，继续下一步"
+                            )
+                        else:
+                            self.flow_log.emit(f"✅ 模块{i+1}延时完成")
 
                     elif module['type'] == "camera":
                         camera_type = module['params'].get('camera_type', 'D435i')
@@ -607,57 +997,25 @@ class FlowThread(QThread):
                             self._fail_module(ctx, i, name, f"{camera_type} 相机未连接，无法识别物体")
                             return
 
-                        cache_ttl = float(self.performance_config.get("flow_detection_cache_ttl", 1.0))
-                        if ctx.is_cache_valid(camera_type):
-                            entry = ctx._flow_detection_cache[camera_type]
-                            if time.perf_counter() - entry["time"] <= cache_ttl:
-                                best_result = entry["result"]
-                                best_confidence = entry["confidence"]
-                                self.flow_log.emit(f"✅ 复用{camera_type}最近识别结果，置信度={best_confidence:.2f}")
-                            else:
-                                best_result = None
-                                best_confidence = 0.0
-                        else:
-                            best_result = None
-                            best_confidence = 0.0
-
-                        if best_result is None:
-                            vision_to_use.reset_tracking()
-                            camera_start = time.perf_counter()
-                            N_FRAMES = max(1, int(self.performance_config.get("flow_camera_frames", 3)))
-                            early_confidence = float(self.performance_config.get("flow_camera_early_confidence", 0.85))
-                            best_result = None
-                            best_confidence = 0.0
-
-                            for frame_idx in range(N_FRAMES):
-                                if ctx.stop_event.is_set():
-                                    self._fail_module(ctx, i, name, "用户停止")
-                                    return
-                                depth_frame, color_frame = vision_to_use.capture_frames()
-                                if not depth_frame or not color_frame:
-                                    continue
-                                color_image = np.asanyarray(color_frame.get_data())
-
-                                target = vision_to_use.run_detection_tracked(color_image)
-                                object_position = vision_to_use.calculate_object_position_smoothed(depth_frame, color_frame, target)
-
-                                if object_position:
-                                    conf = object_position.get('confidence', 0.0)
-                                    self.flow_log.emit(f"📊 帧{frame_idx+1}/{N_FRAMES} 置信度={conf:.2f} 来源={object_position.get('source', 'unknown')}")
-                                    if conf > best_confidence:
-                                        best_result = object_position
-                                        best_confidence = conf
-                                    if best_confidence >= early_confidence:
-                                        self.flow_log.emit(f"✅ 置信度充足({best_confidence:.2f})，提前退出")
-                                        break
-                            camera_elapsed = time.perf_counter() - camera_start
-                            if best_result:
-                                ctx._flow_detection_cache[camera_type] = {
-                                    "time": time.perf_counter(),
-                                    "result": best_result,
-                                    "confidence": best_confidence,
-                                    "motion_generation": ctx.motion_generation,
-                                }
+                        camera_start = time.perf_counter()
+                        N_FRAMES = max(1, int(self.performance_config.get("flow_camera_frames", 10)))
+                        early_confidence = float(self.performance_config.get("flow_camera_early_confidence", 0.85))
+                        detection_result = self._detect_camera_object_for_flow(
+                            vision_to_use,
+                            camera_type,
+                            ctx,
+                            max_frames=N_FRAMES,
+                            early_confidence=early_confidence,
+                        )
+                        best_result = detection_result.get("object_position")
+                        best_confidence = float(detection_result.get("confidence", 0.0))
+                        camera_elapsed = time.perf_counter() - camera_start
+                        if not best_result:
+                            reason = detection_result.get("failure_reason") or "未检测到物品"
+                            if not str(reason).startswith("相机识别失败"):
+                                reason = f"相机识别失败：{reason}"
+                            self._fail_module(ctx, i, name, reason)
+                            return
 
                         min_confidence = float(self.performance_config.get("flow_camera_min_confidence", 0.3))
                         if not best_result or best_confidence < min_confidence:
@@ -667,19 +1025,52 @@ class FlowThread(QThread):
                         object_position = best_result
                         self.flow_log.emit(f"✅ 最终结果: 置信度={best_confidence:.2f}")
 
-                        end_coords = vision_to_use.convert_to_end_coords(object_position['camera_coords'])
-                        current_pose = self.controller.get_current_pose_fast(max_age=pose_cache_max_age)
-                        if not current_pose:
-                            self._fail_module(ctx, i, name, "无法获取当前机器人位姿")
+                        try:
+                            camera_coords = coerce_float_vector(
+                                object_position.get('camera_coords'),
+                                3,
+                                "相机坐标",
+                            )
+                        except ValueError as e:
+                            self._fail_module(ctx, i, name, str(e))
                             return
-                        base_coords = vision_to_use.convert_to_base_coords(end_coords, current_pose)
+                        try:
+                            end_coords = coerce_float_vector(
+                                vision_to_use.convert_to_end_coords(camera_coords),
+                                3,
+                                "末端坐标",
+                            )
+                        except Exception as e:
+                            self._fail_module(ctx, i, name, f"相机坐标转末端坐标失败: {e}")
+                            return
+                        current_pose = self.controller.get_current_pose_fast(max_age=pose_cache_max_age)
+                        try:
+                            current_pose = coerce_float_vector(
+                                current_pose,
+                                6,
+                                "机器人当前位姿",
+                            )
+                        except ValueError as e:
+                            self._fail_module(ctx, i, name, str(e))
+                            return
+                        try:
+                            base_coords = coerce_float_vector(
+                                vision_to_use.convert_to_base_coords(end_coords, current_pose),
+                                3,
+                                "基座坐标",
+                            )
+                        except Exception as e:
+                            self._fail_module(ctx, i, name, f"末端坐标转基座坐标失败: {e}")
+                            return
 
-                        if base_coords is not None and current_pose is not None:
-                            point_name = "d435i" if camera_type == "D435i" else "d405"
-                            point_data = get_point(point_name) or {"coords": [0]*6, "is_relative": False, "relative_to": None, "offset": [0]*6, "is_default": True}
-                            point_data["coords"] = list(base_coords) + list(current_pose[3:])
-                            set_point(point_name, point_data)
-                            self.flow_log.emit(f"📍 已更新点位 {point_name}")
+                        point_name = "d435i" if camera_type == "D435i" else "d405"
+                        point_data = get_point(point_name) or {"coords": [0]*6, "is_relative": False, "relative_to": None, "offset": [0]*6, "is_default": True}
+                        point_data["coords"] = base_coords[:3] + current_pose[3:6]
+                        set_point(point_name, point_data)
+                        self.flow_log.emit(
+                            f"📍 已更新点位 {point_name}: "
+                            f"base=[{float(base_coords[0]):.1f},{float(base_coords[1]):.1f},{float(base_coords[2]):.1f}]"
+                        )
 
                     elif module['type'] == "visual_servo":
                         if self.vision_d405 is None:
@@ -750,7 +1141,7 @@ class FlowThread(QThread):
 
                     module_elapsed = time.perf_counter() - module_start
                     # For non-motion modules, cmd_elapsed equals total module time
-                    if module['type'] not in ("move", "arc_motion", "relative_move", "relative_path", "joint_move"):
+                    if module['type'] not in ("move", "arc_motion", "relative_move", "relative_path", "joint_move", "delay"):
                         cmd_elapsed = module_elapsed
                     ctx.module_timings.append((i + 1, name, module_elapsed, camera_elapsed, cmd_elapsed, wait_elapsed))
                     logger.info("flow module %s/%s finished: %s total=%.3fs camera=%.3fs cmd=%.3fs wait=%.3fs", i + 1, total, name, module_elapsed, camera_elapsed, cmd_elapsed, wait_elapsed)
@@ -773,10 +1164,12 @@ class FlowThread(QThread):
                 self.flow_log.emit(f"流程总耗时 {total_elapsed:.2f}s")
                 self.flow_finished.emit(True)
             finally:
+                self._set_camera_test_flow_active(False)
                 self.controller.release_motion("flow")
                 self._ctx = None
                 self.controller._active_flow_thread = None
         except Exception as e:
+            logger.exception("流程异常")
             self.flow_log.emit(f"❌ 流程异常: {e}")
             self.flow_finished.emit(False)
 
@@ -844,6 +1237,11 @@ class CameraTestWorker(QThread):
         self._frame_count = 0
         self._last_processed_seq = -1
         self._detect_every_n_frames = max(1, int(round(self.detection_interval / max(0.001, self.frame_interval))))
+        self._snapshot_lock = threading.Lock()
+        self._last_detection_snapshot = None
+        self._flow_mode_lock = threading.Lock()
+        self._flow_active = False
+        self._flow_detection_enabled = False
 
     def _record_performance(self, timings):
         self._perf_count += 1
@@ -880,8 +1278,14 @@ class CameraTestWorker(QThread):
                 self._frame_count += 1
                 loop_start = time.perf_counter()
 
+                with self._flow_mode_lock:
+                    flow_active = self._flow_active
+                    flow_detection_enabled = self._flow_detection_enabled
+
+                detection_allowed = (not flow_active) or flow_detection_enabled
+
                 # Detection (frame count based)
-                should_detect = (self._frame_count % self._detect_every_n_frames) == 0
+                should_detect = detection_allowed and (self._frame_count % self._detect_every_n_frames) == 0
                 should_display = True  # display every processed frame
 
                 detection_start = time.perf_counter()
@@ -892,11 +1296,25 @@ class CameraTestWorker(QThread):
                     self.last_object_position = self.vision.calculate_object_position_smoothed(
                         packet.depth_image, packet.color_image, target
                     )
+                    confidence = 0.0
+                    if self.last_object_position:
+                        confidence = float(self.last_object_position.get('confidence', 0.0) or 0.0)
+                    elif target:
+                        confidence = float(target.get('score', target.get('confidence', 0.0)) or 0.0)
+                    with self._snapshot_lock:
+                        self._last_detection_snapshot = {
+                            'seq': packet.seq,
+                            'timestamp': packet.timestamp,
+                            'target': target,
+                            'object_position': self.last_object_position,
+                            'confidence': confidence,
+                            'capture_ms': capture_ms,
+                        }
                 else:
-                    target = self.last_target
+                    target = self.last_target if detection_allowed else None
                 detection_done = time.perf_counter()
 
-                object_position = self.last_object_position
+                object_position = self.last_object_position if detection_allowed else None
 
                 # Draw
                 draw_start = time.perf_counter()
@@ -968,3 +1386,28 @@ class CameraTestWorker(QThread):
         if self._capture_thread:
             self._capture_thread.stop()
             self._capture_thread.join(timeout=3.0)
+
+    def set_flow_active(self, active):
+        with self._flow_mode_lock:
+            self._flow_active = bool(active)
+            self._flow_detection_enabled = False
+        if active:
+            self.last_target = None
+            self.last_object_position = None
+            with self._snapshot_lock:
+                self._last_detection_snapshot = None
+
+    def set_flow_detection_enabled(self, enabled):
+        with self._flow_mode_lock:
+            self._flow_detection_enabled = bool(enabled) and self._flow_active
+        if enabled:
+            self.last_target = None
+            self.last_object_position = None
+            with self._snapshot_lock:
+                self._last_detection_snapshot = None
+
+    def get_flow_detection_snapshot(self):
+        with self._snapshot_lock:
+            if self._last_detection_snapshot is None:
+                return None
+            return dict(self._last_detection_snapshot)

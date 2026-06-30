@@ -16,28 +16,92 @@ python runtime_agent.py --startup-delay 20
 - `--startup-delay 20`：开机后等待网络和机器人稳定 20 秒，再开始连接机器人。
 - `--poll-interval 1`：后台 watchdog 周期，默认 1 秒。
 - `--health-path runtime_health.json`：健康状态文件路径。
+- `--state-path runtime_state.json`：崩溃恢复状态文件路径。
+- `--lock-path runtime_agent.lock`：后台进程单实例锁路径。
 - `--log-dir logs`：运行日志目录。
 
 ## 运行状态文件
 
 - `logs/runtime.log`：后台运行日志，自动滚动。
-- `runtime_health.json`：当前运行状态，包括机器人连接、反馈状态、Modbus 状态、最后一次主站命令和最后错误。
+- `logs/runtime_watchdog.log`：独立看门狗日志。
+- `runtime_health.json`：每秒更新的健康状态，包括 PID、启动编号、流程模块、设备心跳、线程、内存和磁盘空间。
+- `runtime_state.json`：原子保存的诊断状态，只用于判断是否异常退出，不会自动续跑流程。
+- `runtime_agent.lock`：后台进程单实例锁。
+- `robot_control.lock`：GUI 与后台共享的机器人控制租约。
+- `runtime_watchdog_restarts.json`：看门狗最近 10 分钟的重启记录。
+- `runtime_watchdog_lockout.json`：重启次数超限后的人工恢复锁。
 
-现场排查时优先看这两个文件：
+现场排查时优先查看以下文件：
 
 ```powershell
 Get-Content .\runtime_health.json
 Get-Content .\logs\runtime.log -Tail 100
+Get-Content .\logs\runtime_watchdog.log -Tail 100
 ```
+
+### 健康状态关键字段
+
+| 字段 | 说明 |
+|------|------|
+| `schema_version` | 健康文件结构版本，当前为 `2` |
+| `boot_id` | 本次后台启动的唯一编号 |
+| `runtime.state` | `STARTING/READY/RUNNING/WAITING_DELAY/DEGRADED/RECOVERY_REQUIRED/STOPPING` |
+| `runtime.recovery_required` | 是否必须先执行 `40001=0` |
+| `runtime.startup_errors` | 配置文件或流程文件启动校验错误 |
+| `robot.feedback_age_s` | 距离最近反馈包的秒数 |
+| `robot.feedback_thread_alive` | 30004 反馈线程是否存活 |
+| `modbus.thread_alive` | Modbus 服务线程是否存活 |
+| `flow.module_index/module_name` | 当前执行模块 |
+| `flow.orphaned_flow` | 超时流程线程是否未能退出 |
+| `process.thread_count/rss_mb` | 线程数和常驻内存 |
+| `process.disk_free_mb` | 健康文件所在磁盘剩余空间 |
 
 ## Modbus 协议
 
 - `40001=0`：立即停止当前机器人/流程运动，并保持 `40001=0`。
-- `40001=1`：移动到 `initial_point`；运动中写 `4`；完成后保持 `2`。
-- `40001=3`：运行保存的运动流程；运动中写 `4`；完成后保持 `5`。
+- 程序未运行时：
+  - 写 `40001=1`：移动到 `initial_point`；运动中写 `4`；完成后保持 `2`。
+  - 写 `40001=3`：运行保存的运动流程。
+- 程序普通运行阶段保持 `40001=4`，只接受 `40001=0`；写入 `1` 或 `3` 会被忽略。
+- 程序进入“40001放行或超时”延时模块时保持 `40001=5`：
+  - 写 `40001=1`：提前结束当前延时并进入下一步。
+  - 写 `40001=0`：停止整个流程。
+  - 未写入 `1` 时，达到模块设置的最长等待时间后仍正常进入下一步。
+- 延时结束且流程尚未结束时恢复 `40001=4`；整个流程成功完成后保持 `40001=5`。
 - 机器人未连接、报警、急停未解除、自动使能失败或反馈断流时，不执行运动，写机器人错误状态。
 
 断线期间收到的运动命令不会排队，避免机器人重连后执行过期动作。
+
+## 异常退出恢复
+
+后台发现上次未正常退出或退出时仍在运行流程，会进入 `RECOVERY_REQUIRED` 并保持 `40001=110`：
+
+1. PLC 写 `40001=0`，停止并解除恢复锁。
+2. PLC 写 `40001=1`，机器人复位完成后保持 `40001=2`。
+3. PLC 再写 `40001=3`，启动新流程。
+
+后台不会从 `runtime_state.json` 恢复上次模块，避免重复抓取或跳过动作。GUI 和后台共用 `robot_control.lock`；后台运行时 GUI 不允许再次连接机器人或启动第二个 Modbus 服务。
+
+如果 `config.json`、流程文件损坏或机器人 IP/Modbus 端口无效，也会保持 `RECOVERY_REQUIRED`。修复文件后重新写 `40001=0`，后台会再次校验；校验仍失败时恢复锁不会解除。
+
+## 可选运行配置
+
+`config.json` 可增加 `runtime` 对象；字段缺失时使用默认值：
+
+```json
+{
+  "runtime": {
+    "startup_delay": 20,
+    "poll_interval": 1,
+    "health_path": "runtime_health.json",
+    "state_path": "runtime_state.json",
+    "disk_free_min_mb": 512,
+    "camera_retry_count": 3,
+    "reconnect_stable_seconds": 10,
+    "reconnect_jitter_ratio": 0.2
+  }
+}
+```
 
 ## 安装开机自启动
 
@@ -57,15 +121,33 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install_runtime_task.ps1 `
   -StartupDelaySeconds 20
 ```
 
-安装脚本会注册 Windows Task Scheduler 任务：
+安装脚本会注册两个 Windows Task Scheduler 任务：
 
 - 任务名：`DobotRuntimeAgent`
+- 看门狗任务名：`DobotRuntimeWatchdog`
 - 触发：开机启动
 - 工作目录：项目根目录
 - 启动命令：`python runtime_agent.py --startup-delay <秒数>`
 - 权限：最高权限运行
-- 失败恢复：失败后 1 分钟自动重启
+- 单实例策略：忽略重复启动
+- 失败恢复：失败后 1 分钟自动重启，最多 3 次
 - 运行时间：不限制
+
+看门狗每 5 秒检查健康文件，超过 15 秒未更新时先尝试停止正在运行的机器人流程，再结束卡死进程并重启后台。10 分钟内达到 3 次重启会生成 `runtime_watchdog_lockout.json` 并停止自动恢复；排除故障后需手动删除该文件。
+
+手动运行看门狗：
+
+```powershell
+python runtime_watchdog.py --task-name DobotRuntimeAgent
+```
+
+默认参数：
+
+- 健康超时：15 秒。
+- 检查周期：5 秒。
+- 独立 `Stop()` 超时：2 秒。
+- 重启限制：10 分钟内 3 次。
+- 看门狗启动后先等待至少 30 秒，避免和系统开机过程冲突。
 
 ## 查看、停止和删除开机任务
 
@@ -73,6 +155,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install_runtime_task.ps1 `
 
 ```powershell
 Get-ScheduledTask -TaskName DobotRuntimeAgent
+Get-ScheduledTask -TaskName DobotRuntimeWatchdog
 Get-ScheduledTaskInfo -TaskName DobotRuntimeAgent
 ```
 
@@ -80,26 +163,38 @@ Get-ScheduledTaskInfo -TaskName DobotRuntimeAgent
 
 ```powershell
 Start-ScheduledTask -TaskName DobotRuntimeAgent
+Start-ScheduledTask -TaskName DobotRuntimeWatchdog
 ```
 
 停止任务：
 
 ```powershell
 Stop-ScheduledTask -TaskName DobotRuntimeAgent
+Stop-ScheduledTask -TaskName DobotRuntimeWatchdog
 ```
 
 删除任务：
 
 ```powershell
 Unregister-ScheduledTask -TaskName DobotRuntimeAgent -Confirm:$false
+Unregister-ScheduledTask -TaskName DobotRuntimeWatchdog -Confirm:$false
+```
+
+解除看门狗熔断：
+
+```powershell
+Stop-ScheduledTask -TaskName DobotRuntimeAgent
+Remove-Item .\runtime_watchdog_lockout.json -ErrorAction SilentlyContinue
+Remove-Item .\runtime_watchdog_restarts.json -ErrorAction SilentlyContinue
+Start-ScheduledTask -TaskName DobotRuntimeAgent
 ```
 
 ## 现场确认流程
 
 1. 管理员 PowerShell 执行安装脚本。
 2. 重启工控机。
-3. 打开任务计划程序，确认 `DobotRuntimeAgent` 为运行中。
-4. 确认 `logs/runtime.log` 持续写入。
+3. 打开任务计划程序，确认 `DobotRuntimeAgent` 和 `DobotRuntimeWatchdog` 均为运行中。
+4. 确认 `logs/runtime.log` 和 `logs/runtime_watchdog.log` 持续写入。
 5. 确认 `runtime_health.json` 中 `modbus.is_running=true`。
 6. 机器人上电并网络可达后，确认 `robot.connected=true`。
 7. 主站依次写入 `40001=0/1/3` 做联调。
@@ -107,5 +202,6 @@ Unregister-ScheduledTask -TaskName DobotRuntimeAgent -Confirm:$false
 ## 注意事项
 
 - 现场生产建议运行 `runtime_agent.py`，不要依赖打开 PyQt UI 来维持生产通信。
-- PyQt UI 可以手动打开用于配置和查看，但后台 runtime 才是 7x24 运行入口。
+- PyQt UI 可以打开用于查看配置，但后台持有 `robot_control.lock` 时 UI 连接机器人会被拒绝。
 - 如果端口 `502` 被占用，Modbus 从站无法启动，需要先关闭占用端口的进程。
+- 看门狗独立 `Stop()` 只是补充保护，不能替代物理急停、安全门和安全 PLC。

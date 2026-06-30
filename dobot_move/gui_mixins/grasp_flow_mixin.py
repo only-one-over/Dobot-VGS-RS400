@@ -56,6 +56,30 @@ class GraspFlowMixin:
             return
         self.run_grasp_flow()
 
+    def _stop_camera_test_before_flow(self, modbus_triggered=False):
+        worker = getattr(self, "cam_test_worker", None)
+        if worker is None:
+            return True
+        if hasattr(worker, "get_flow_detection_snapshot"):
+            self.statusBar().showMessage("相机测试运行中，流程将复用测试图像执行")
+            return True
+        message = "相机测试线程版本不支持流程复用，请先停止相机测试后再执行流程"
+        if modbus_triggered:
+            self.statusBar().showMessage(message)
+            self.controller.record_alarm("Modbus鎵ц娴佺▼", "CAMERA_TEST_RUNNING", "鏁呴殰", message)
+        else:
+            QMessageBox.warning(self, "相机测试运行中", message)
+        return False
+
+    def _get_flow_camera_test_workers(self):
+        worker = getattr(self, "cam_test_worker", None)
+        if worker is None or not hasattr(worker, "get_flow_detection_snapshot"):
+            return {}
+        cam_type = getattr(worker, "cam_type", None)
+        if not cam_type:
+            return {}
+        return {cam_type: worker}
+
     def add_module(self):
         module_type = self.module_combo.currentText()
         new_module = None
@@ -116,9 +140,7 @@ class GraspFlowMixin:
                     "cp": 0,
                     "execution_mode": "stop_each",
                     "force_guard": self._default_force_guard(),
-                    "segments": [
-                        {"enabled": True, "name": "X+200", "x": 200, "y": 0, "z": 0, "rx": 0, "ry": 0, "rz": 0}
-                    ],
+                    "segments": [],
                 },
             }
         elif module_type == "关节旋转":
@@ -140,6 +162,15 @@ class GraspFlowMixin:
                     "target_type": "grasp_point",
                     "converge_threshold": 2.0,
                     "max_iterations": 60,
+                },
+            }
+        elif module_type == "延时":
+            new_module = {
+                "type": "delay",
+                "name": "延时",
+                "params": {
+                    "wait_mode": "time",
+                    "duration_s": 1.0,
                 },
             }
 
@@ -187,6 +218,8 @@ class GraspFlowMixin:
             self.param_layout.addWidget(self.relative_path_params, 0, 0)
         elif module_type == "关节旋转":
             self.param_layout.addWidget(self.joint_rotation_params, 0, 0)
+        elif module_type == "延时":
+            self.param_layout.addWidget(self.delay_params, 0, 0)
         elif module_type in ("相机识别", "视觉伺服"):
             self.param_layout.addWidget(self.camera_params, 0, 0)
 
@@ -270,6 +303,16 @@ class GraspFlowMixin:
         elif module_type == "相机识别" and current_module["type"] == "camera":
             current_module["params"]["camera_type"] = self.camera_module_combo.currentText()
             QMessageBox.information(self, "成功", "相机识别参数已更新")
+        elif module_type == "延时" and current_module["type"] == "delay":
+            current_module["params"]["wait_mode"] = (
+                "modbus_or_timeout"
+                if self.delay_wait_mode.currentIndex() == 1
+                else "time"
+            )
+            current_module["params"]["duration_s"] = float(self.delay_seconds.value())
+            current_module["params"].pop("modbus_address", None)
+            current_module["params"].pop("modbus_target_value", None)
+            QMessageBox.information(self, "成功", "延时参数已更新")
         else:
             QMessageBox.warning(self, "警告", "请选择正确的模块类型")
 
@@ -299,6 +342,7 @@ class GraspFlowMixin:
             "relative_path": "连续相对路径",
             "joint_move": "关节旋转",
             "visual_servo": "视觉伺服",
+            "delay": "延时",
         }.get(module.get("type"))
         if module_type_text:
             idx = self.module_combo.findText(module_type_text)
@@ -417,6 +461,14 @@ class GraspFlowMixin:
                 self.rpath_seg_table.setItem(row, 13, QTableWidgetItem("是" if seg.get("wait_after", True) else "否"))
                 # note
                 self.rpath_seg_table.setItem(row, 14, QTableWidgetItem(seg.get("note", "")))
+        elif module["type"] == "delay":
+            params = module.get("params", {})
+            wait_mode = params.get("wait_mode", "time")
+            self.delay_wait_mode.setCurrentIndex(
+                1 if wait_mode == "modbus_or_timeout" else 0
+            )
+            duration_s = float(params.get("duration_s", 1.0))
+            self.delay_seconds.setValue(duration_s)
 
     def save_grasp_flow(self):
         if not self.grasp_flow_modules:
@@ -452,6 +504,8 @@ class GraspFlowMixin:
         if self._flow_running:
             self.statusBar().showMessage("流程已在运行中")
             return False
+        if not self._stop_camera_test_before_flow(modbus_triggered=modbus_triggered):
+            return False
         self._flow_running = True
         self.is_paused = False
         if hasattr(self, "_refresh_action_states"):
@@ -484,6 +538,7 @@ class GraspFlowMixin:
             self.grasp_flow_modules,
             self._is_paused_ref,
             self,
+            camera_test_workers=self._get_flow_camera_test_workers(),
         )
         self._flow_thread.flow_log.connect(self._on_flow_log)
         self._flow_thread.flow_finished.connect(self._on_flow_finished)

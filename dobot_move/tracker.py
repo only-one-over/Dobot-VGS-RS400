@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import logging
+
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+
+logger = logging.getLogger(__name__)
 
 
 def iou_distance(atracks, btracks):
     if len(atracks) == 0 or len(btracks) == 0:
         return np.empty((len(atracks), len(btracks)), dtype=np.float64)
-    abboxes = np.array([a.bbox for a in atracks])
-    bbboxes = np.array([b.bbox for b in btracks])
-    xx1 = np.maximum(abboxes[:, 0], bbboxes[:, 0])
-    yy1 = np.maximum(abboxes[:, 1], bbboxes[:, 1])
-    xx2 = np.minimum(abboxes[:, 2], bbboxes[:, 2])
-    yy2 = np.minimum(abboxes[:, 3], bbboxes[:, 3])
+    abboxes = np.asarray([a.bbox for a in atracks], dtype=np.float64)
+    bbboxes = np.asarray([b.bbox for b in btracks], dtype=np.float64)
+    xx1 = np.maximum(abboxes[:, None, 0], bbboxes[None, :, 0])
+    yy1 = np.maximum(abboxes[:, None, 1], bbboxes[None, :, 1])
+    xx2 = np.minimum(abboxes[:, None, 2], bbboxes[None, :, 2])
+    yy2 = np.minimum(abboxes[:, None, 3], bbboxes[None, :, 3])
     w = np.maximum(0.0, xx2 - xx1)
     h = np.maximum(0.0, yy2 - yy1)
     inter = w * h
-    area_a = (abboxes[:, 2] - abboxes[:, 0]) * (abboxes[:, 3] - abboxes[:, 1])
-    area_b = (bbboxes[:, 2] - bbboxes[:, 0]) * (bbboxes[:, 3] - bbboxes[:, 1])
-    union = area_a[:, None] + area_b[None, :] - inter
+    area_a = ((abboxes[:, 2] - abboxes[:, 0]) * (abboxes[:, 3] - abboxes[:, 1]))[:, None]
+    area_b = ((bbboxes[:, 2] - bbboxes[:, 0]) * (bbboxes[:, 3] - bbboxes[:, 1]))[None, :]
+    union = area_a + area_b - inter
     iou = inter / (union + 1e-6)
     return 1.0 - iou
 
@@ -149,11 +153,22 @@ class BYTETracker:
             cost = iou_distance(self.tracked_stracks, stracks_high)
             matches, u_track, u_det = linear_assignment(cost, self.match_thresh)
             for m_t, m_d in matches:
-                self.tracked_stracks[m_t].update(dets_high[m_d])
+                if 0 <= m_t < len(self.tracked_stracks) and 0 <= m_d < len(dets_high):
+                    self.tracked_stracks[m_t].update(dets_high[m_d])
+                else:
+                    logger.warning("忽略非法跟踪匹配索引: track=%s det=%s", m_t, m_d)
             for t_idx in u_track:
-                self.tracked_stracks[t_idx].state = "lost"
-                self.lost_stracks.append(self.tracked_stracks[t_idx])
-            new_tracks = [stracks_high[d_idx] for d_idx in u_det]
+                if 0 <= t_idx < len(self.tracked_stracks):
+                    self.tracked_stracks[t_idx].state = "lost"
+                    self.lost_stracks.append(self.tracked_stracks[t_idx])
+                else:
+                    logger.warning("忽略非法未匹配track索引: track=%s", t_idx)
+            new_tracks = []
+            for d_idx in u_det:
+                if 0 <= d_idx < len(stracks_high):
+                    new_tracks.append(stracks_high[d_idx])
+                else:
+                    logger.warning("忽略非法未匹配检测索引: det=%s high_count=%s", d_idx, len(stracks_high))
         elif len(stracks_high) > 0:
             new_tracks = stracks_high
         else:
@@ -167,9 +182,12 @@ class BYTETracker:
             cost_low = iou_distance(self.lost_stracks, stracks_low)
             matches_low, _, _ = linear_assignment(cost_low, self.match_thresh)
             for m_t, m_d in matches_low:
-                self.lost_stracks[m_t].update(dets_low[m_d])
-                self.lost_stracks[m_t].state = "tracked"
-                new_tracks.append(self.lost_stracks[m_t])
+                if 0 <= m_t < len(self.lost_stracks) and 0 <= m_d < len(dets_low):
+                    self.lost_stracks[m_t].update(dets_low[m_d])
+                    self.lost_stracks[m_t].state = "tracked"
+                    new_tracks.append(self.lost_stracks[m_t])
+                else:
+                    logger.warning("忽略非法低置信匹配索引: track=%s det=%s", m_t, m_d)
             self.lost_stracks = [t for i, t in enumerate(self.lost_stracks) if i not in set(m_t for m_t, _ in matches_low)]
 
         self.tracked_stracks = [t for t in self.tracked_stracks if t.state == "tracked"]

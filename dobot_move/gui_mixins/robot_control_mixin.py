@@ -34,6 +34,22 @@ class RobotControlMixin:
             return
         self._run_cmd_thread("清除故障", self.controller.clear_error)
 
+    def move_to_initial_position(self):
+        if not self.controller.is_connected:
+            QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
+            return
+
+        def _move_home():
+            if not getattr(self.controller, "is_enabled", False):
+                if not self.controller.enable_robot():
+                    return False
+            return self.controller.move_to_initial_position(
+                verify_start_pose=False,
+                verify_end_pose=True,
+            )
+
+        self._run_cmd_thread("回到初始位置", _move_home)
+
     def on_pause(self):
         if not self._flow_running:
             self.statusBar().showMessage("当前没有运行中的任务")

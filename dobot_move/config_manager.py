@@ -26,7 +26,7 @@ DEFAULT_PERFORMANCE_CONFIG = {
     "robot_mode_dashboard_fallback_interval": 1.0,
     "pose_cache_max_age": 0.3,
     "motion_settle_time": 0.15,
-    "flow_camera_frames": 3,
+    "flow_camera_frames": 10,
     "flow_camera_early_confidence": 0.85,
     "flow_camera_min_confidence": 0.3,
     "flow_detection_cache_ttl": 1.0,

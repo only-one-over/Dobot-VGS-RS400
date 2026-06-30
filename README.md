@@ -36,7 +36,9 @@
 - 🆔 **指令 ID 追踪** — 按官方 TCP-IP-Python-V4 模式，CurrentCommandId 精确判定运动完成
 - 🛑 **急停独立连接** — 独立临时 Dashboard 连接发送 EmergencyStop，避免主连接锁阻塞
 - 📊 **统一反馈快照** — get_motion_feedback_snapshot() 一次性返回位姿、速度、队列状态、运行状态
-- 🔄 **Modbus 异步执行** — 运动命令投递独立线程，cmd=9 急停走快速路径，200ms 周期不阻塞
+- 🔄 **Modbus 异步执行** — 运动命令投递独立线程，`40001=0` 停止走快速路径，不被长时间运动阻塞
+- 🛡️ **7×24 后台加固** — 崩溃恢复锁、流程看门狗、反馈断流先停、相机预检和独立进程外看门狗
+- 🔐 **跨进程控制租约** — GUI 与后台互斥占用机器人控制权，避免重复连接和重复 Modbus 服务
 - 📋 **连续相对路径编辑器** — 15 列段表、stop_each/queued 执行模式、段级参数覆盖
 - 🧲 **TCP 力到位保护** — 运动中监控 ActualTCPForce，超过用户阈值即 Stop 当前运动并继续下一步
 - 🎯 **saved_point 目标** — 直线运动支持已保存点位/相机识别坐标/初始位置三种目标
@@ -131,6 +133,9 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 | 流程步骤列表 | `flow_step_list.py` | 流程步骤列表，拖拽排序+状态图标 |
 | Qt 兼容层 | `qt_compat.py` | Qt 框架兼容层（PySide6） |
 | 工作线程 | `workers.py` | 流程执行、FlowRunContext、模块验证、运动互斥锁 |
+| 后台代理 | `runtime_agent.py` | 设备监督、流程看门狗、健康状态和崩溃恢复 |
+| 外部看门狗 | `runtime_watchdog.py` | 卡死检测、独立 Stop、进程重启和重启熔断 |
+| 韧性基础 | `runtime_resilience.py` | 状态持久化、单实例锁、资源指标和超时预算 |
 | C++ 核心 | `cpp_core/` | pybind11 加速模块 |
 
 ### 硬件要求
@@ -157,7 +162,7 @@ python -m dobot_move
 python runtime_agent.py --startup-delay 20
 ```
 
-开机自启动和状态排查见 [docs/runtime_agent.md](docs/runtime_agent.md)。
+生产环境应同时运行 `runtime_agent.py` 和 `runtime_watchdog.py`。开机自启动、异常恢复、`40001` 状态协议和状态排查见 [docs/runtime_agent.md](docs/runtime_agent.md)。
 
 ### 首次设置
 

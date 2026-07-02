@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from dobot_move.alarm_history import AlarmHistory
+import dobot_move.runtime_watchdog as watchdog_module
 from dobot_move.runtime_resilience import (
     RestartWindow,
     RuntimeState,
@@ -13,7 +14,7 @@ from dobot_move.runtime_resilience import (
     flow_timeout_seconds,
     module_timeout_seconds,
 )
-from runtime_watchdog import RuntimeWatchdog
+from dobot_move.runtime_watchdog import RuntimeWatchdog
 
 
 @contextmanager
@@ -24,6 +25,10 @@ def _workspace_temp_dir():
         yield path
     finally:
         shutil.rmtree(path, ignore_errors=True)
+
+
+def test_watchdog_project_root_stays_outside_package():
+    assert watchdog_module.PROJECT_ROOT == Path(__file__).resolve().parents[1]
 
 
 def test_unclean_runtime_boot_requires_recovery():

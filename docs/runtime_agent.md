@@ -1,6 +1,7 @@
 # 后台 Runtime 与开机自启动
 
-`runtime_agent.py` 是生产现场使用的无界面后台入口，和 `run.py` 位于项目根目录。
+`dobot_move/runtime_agent.py` 是生产现场使用的无界面后台模块，通过 `python -m dobot_move.runtime_agent` 启动。
+项目根目录的 `runtime_agent.py` 只保留为旧命令兼容入口。
 它不会打开 PyQt 界面，会自动启动 Modbus TCP 从站、持续连接机器人，并按主站写入 `40001` 的命令运行对应程序。
 
 ## 手动启动
@@ -8,7 +9,7 @@
 在项目根目录运行：
 
 ```powershell
-python runtime_agent.py --startup-delay 20
+python -m dobot_move.runtime_agent --startup-delay 20
 ```
 
 参数说明：
@@ -127,7 +128,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install_runtime_task.ps1 `
 - 看门狗任务名：`DobotRuntimeWatchdog`
 - 触发：开机启动
 - 工作目录：项目根目录
-- 启动命令：`python runtime_agent.py --startup-delay <秒数>`
+- 启动命令：`python -m dobot_move.runtime_agent --startup-delay <秒数>`
 - 权限：最高权限运行
 - 单实例策略：忽略重复启动
 - 失败恢复：失败后 1 分钟自动重启，最多 3 次
@@ -138,7 +139,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install_runtime_task.ps1 `
 手动运行看门狗：
 
 ```powershell
-python runtime_watchdog.py --task-name DobotRuntimeAgent
+python -m dobot_move.runtime_watchdog --task-name DobotRuntimeAgent
 ```
 
 默认参数：
@@ -201,7 +202,7 @@ Start-ScheduledTask -TaskName DobotRuntimeAgent
 
 ## 注意事项
 
-- 现场生产建议运行 `runtime_agent.py`，不要依赖打开 PyQt UI 来维持生产通信。
+- 现场生产建议运行 `python -m dobot_move.runtime_agent`，不要依赖打开 PyQt UI 来维持生产通信。
 - PyQt UI 可以打开用于查看配置，但后台持有 `robot_control.lock` 时 UI 连接机器人会被拒绝。
 - 如果端口 `502` 被占用，Modbus 从站无法启动，需要先关闭占用端口的进程。
 - 看门狗独立 `Stop()` 只是补充保护，不能替代物理急停、安全门和安全 PLC。

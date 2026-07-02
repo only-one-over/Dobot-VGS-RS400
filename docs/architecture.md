@@ -19,6 +19,9 @@
 │   ├── dobot_api.py             # Dobot Dashboard/Feedback Socket API 封装
 │   ├── vision_system.py         # RealSense、ONNX 推理、跟踪、3D 定位
 │   ├── config_manager.py        # 运行时 JSON 配置服务和点位/标定访问
+│   ├── runtime_agent.py         # 无界面生产后台
+│   ├── runtime_watchdog.py      # 进程外健康看门狗
+│   ├── runtime_resilience.py    # 后台状态、锁和恢复基础设施
 │   ├── ui_theme.py              # 共享的 PyQt 调色板和样式表辅助工具
 │   └── config.json              # 运行时配置、标定、点位、性能参数
 ├── cpp_core/                    # 可选的 C++17 pybind11 加速模块
@@ -41,6 +44,7 @@
 - `runtime_agent.py`：生产环境无界面入口，负责设备监督、流程执行、健康状态和崩溃恢复锁。
 - `runtime_watchdog.py`：独立进程外看门狗，检测后台卡死，必要时先独立 Stop 再重启任务。
 - `runtime_resilience.py`：运行状态持久化、单实例锁、重启窗口、资源指标和动态超时预算。
+- 根目录 `runtime_agent.py`、`runtime_watchdog.py`：仅为旧启动命令保留的薄兼容入口，不包含业务实现。
 - `cpp_core/`：在原生代码中镜像部分 Python 视觉数学运算以提升性能。必须保留 `vision_system.py` 使用的输入/输出契约。
 
 ## 数据流

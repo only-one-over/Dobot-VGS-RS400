@@ -19,16 +19,16 @@ if (-not $PythonExe) {
     }
 }
 
-$RuntimeScript = Join-Path $ProjectRoot "runtime_agent.py"
-if (-not (Test-Path $RuntimeScript)) {
-    throw "runtime_agent.py not found under ProjectRoot: $ProjectRoot"
+$RuntimeModuleFile = Join-Path $ProjectRoot "dobot_move\runtime_agent.py"
+if (-not (Test-Path $RuntimeModuleFile)) {
+    throw "dobot_move.runtime_agent not found under ProjectRoot: $ProjectRoot"
 }
-$WatchdogScript = Join-Path $ProjectRoot "runtime_watchdog.py"
-if (-not (Test-Path $WatchdogScript)) {
-    throw "runtime_watchdog.py not found under ProjectRoot: $ProjectRoot"
+$WatchdogModuleFile = Join-Path $ProjectRoot "dobot_move\runtime_watchdog.py"
+if (-not (Test-Path $WatchdogModuleFile)) {
+    throw "dobot_move.runtime_watchdog not found under ProjectRoot: $ProjectRoot"
 }
 
-$arguments = "`"$RuntimeScript`" --startup-delay $StartupDelaySeconds"
+$arguments = "-m dobot_move.runtime_agent --startup-delay $StartupDelaySeconds"
 $action = New-ScheduledTaskAction -Execute $PythonExe -Argument $arguments -WorkingDirectory $ProjectRoot
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet `
@@ -47,7 +47,7 @@ Register-ScheduledTask `
     -RunLevel Highest `
     -Force
 
-$watchdogArguments = "`"$WatchdogScript`" --task-name `"$TaskName`""
+$watchdogArguments = "-m dobot_move.runtime_watchdog --task-name `"$TaskName`""
 $watchdogAction = New-ScheduledTaskAction -Execute $PythonExe -Argument $watchdogArguments -WorkingDirectory $ProjectRoot
 $watchdogSettings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -69,6 +69,6 @@ Write-Host "Registered scheduled task '$TaskName'"
 Write-Host "Registered watchdog task '$WatchdogTaskName'"
 Write-Host "ProjectRoot: $ProjectRoot"
 Write-Host "PythonExe:   $PythonExe"
-Write-Host "Script:      $RuntimeScript"
+Write-Host "Module:      dobot_move.runtime_agent"
 Write-Host "Arguments:   $arguments"
-Write-Host "Watchdog:    $WatchdogScript"
+Write-Host "Watchdog:    dobot_move.runtime_watchdog"

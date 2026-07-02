@@ -38,7 +38,8 @@ def _install_modbus_stub():
 
 _install_modbus_stub()
 
-from runtime_agent import (  # noqa: E402
+import dobot_move.runtime_agent as runtime_module  # noqa: E402
+from dobot_move.runtime_agent import (  # noqa: E402
     DobotRuntimeAgent,
     RobotConnectionState,
     RobotConnectionSupervisor,
@@ -126,6 +127,16 @@ class _FakeController:
 
     def set_runtime_recovery_required(self, required=True, on_cleared=None):
         self.runtime_recovery_required = bool(required)
+
+
+def test_runtime_defaults_stay_in_project_root_after_package_move():
+    project_root = Path(__file__).resolve().parents[1]
+
+    assert runtime_module.PROJECT_ROOT == project_root
+    assert runtime_module.DEFAULT_HEALTH_PATH == project_root / "runtime_health.json"
+    assert runtime_module.DEFAULT_STATE_PATH == project_root / "runtime_state.json"
+    assert runtime_module.DEFAULT_LOCK_PATH == project_root / "runtime_agent.lock"
+    assert runtime_module.DEFAULT_LOG_DIR == project_root / "logs"
 
 
 def test_supervisor_reconnects_with_backoff():
@@ -302,7 +313,6 @@ def test_runtime_runner_passes_reused_cameras_to_flow(monkeypatch):
 
 def test_runtime_runner_timeout_requests_flow_and_robot_stop(monkeypatch):
     import dobot_move.workers as workers
-    import runtime_agent as runtime_module
 
     controller = _FakeController()
     runner = RuntimeProgramRunner(controller)

@@ -133,8 +133,8 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 | 流程步骤列表 | `flow_step_list.py` | 流程步骤列表，拖拽排序+状态图标 |
 | Qt 兼容层 | `qt_compat.py` | Qt 框架兼容层（PySide6） |
 | 工作线程 | `workers.py` | 流程执行、FlowRunContext、模块验证、运动互斥锁 |
-| 后台代理 | `runtime_agent.py` | 设备监督、流程看门狗、健康状态和崩溃恢复 |
-| 外部看门狗 | `runtime_watchdog.py` | 卡死检测、独立 Stop、进程重启和重启熔断 |
+| 后台代理 | `dobot_move/runtime_agent.py` | 设备监督、流程看门狗、健康状态和崩溃恢复 |
+| 外部看门狗 | `dobot_move/runtime_watchdog.py` | 卡死检测、独立 Stop、进程重启和重启熔断 |
 | 韧性基础 | `runtime_resilience.py` | 状态持久化、单实例锁、资源指标和超时预算 |
 | C++ 核心 | `cpp_core/` | pybind11 加速模块 |
 
@@ -156,13 +156,13 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 python -m dobot_move
 ```
 
-生产现场 7x24 后台运行使用根目录脚本：
+生产现场 7x24 后台运行使用包内模块：
 
 ```powershell
-python runtime_agent.py --startup-delay 20
+python -m dobot_move.runtime_agent --startup-delay 20
 ```
 
-生产环境应同时运行 `runtime_agent.py` 和 `runtime_watchdog.py`。开机自启动、异常恢复、`40001` 状态协议和状态排查见 [docs/runtime_agent.md](docs/runtime_agent.md)。
+生产环境应同时运行 `dobot_move.runtime_agent` 和 `dobot_move.runtime_watchdog`。根目录同名脚本只保留为旧命令兼容入口。开机自启动、异常恢复、`40001` 状态协议和状态排查见 [docs/runtime_agent.md](docs/runtime_agent.md)。
 
 ### 首次设置
 

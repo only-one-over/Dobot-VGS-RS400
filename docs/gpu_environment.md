@@ -73,15 +73,15 @@ python -c "import PySide6, numpy, cv2, pyrealsense2, onnxruntime; print('All dep
 
 ### GPU 真实启用验证
 
-仅检查 `get_available_providers()` 不够——它只说明 onnxruntime 能识别 CUDA provider，不代表实际能创建 CUDA session。正确验证方式是使用项目模型创建 InferenceSession：
+仅检查 `get_available_providers()` 或成功创建 `InferenceSession` 都不够：CUDA provider 可能已注册，但直到第一次卷积推理才发现 cuDNN 子库缺失。正确验证方式是关闭 ONNX Runtime 的隐式回退，并用项目模型执行一次真实 dummy inference：
 
 ```powershell
-python -c "import onnxruntime as ort; s = ort.InferenceSession('dobot_move/best.onnx', providers=['CUDAExecutionProvider']); print('Active providers:', s.get_providers())"
+.\.venv\Scripts\python.exe -c "import numpy as np, onnxruntime as ort; from dobot_move.vision_system import preload_onnx_runtime_dlls; preload_onnx_runtime_dlls(ort); s=ort.InferenceSession('dobot_move/best.onnx',providers=['CUDAExecutionProvider','CPUExecutionProvider']); s.disable_fallback(); i=s.get_inputs()[0]; s.run(None,{i.name:np.zeros(tuple(i.shape),dtype=np.float32)}); print('GPU inference OK:',s.get_providers())"
 ```
 
-**通过标准**：输出包含 `CUDAExecutionProvider`。
+**通过标准**：命令完成推理并输出包含 `CUDAExecutionProvider`。
 
-**未通过**：输出仅剩 `['CPUExecutionProvider']`，说明 CUDA provider 注册但未能激活，需要排查 CUDA/cuDNN DLL 是否缺失。
+**未通过**：创建会话或 `session.run()` 报错，说明 CUDA provider 未真正可用，需要排查 CUDA/cuDNN DLL。应用会显式重建 CPU 会话继续连接相机，并显示 `CPU (CUDA运行失败回退)`。
 
 ### C++ 加速模块验证
 
@@ -109,6 +109,33 @@ pip install --force-reinstall onnxruntime-gpu[cuda,cudnn]
 ```powershell
 pip --version  # 应 >= 21.2
 ```
+
+### 缺少 cudnn_engines_tensor_ir64_9.dll
+
+**错误信息**：
+```
+Could not locate cudnn_engines_tensor_ir64_9.dll
+CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
+```
+
+**原因**：当前 `onnxruntime-gpu` 使用 cuDNN 9。虚拟环境中的 cuDNN 9 子库可能安装不完整、版本不匹配，或者文件虽然存在，但当前 ONNX Runtime 的 `preload_dlls()` 未预加载这个较新的 Tensor IR 子库。近期 PyPI GPU 包默认使用 CUDA 12.x，ONNX Runtime 与其他框架共用 DLL 时必须匹配 CUDA 和 cuDNN 的主版本。
+
+先确认文件是否存在：
+
+```powershell
+Get-ChildItem .\.venv\Lib\site-packages\nvidia\cudnn\bin\cudnn_engines_tensor_ir64_9.dll
+```
+
+- 文件存在：更新到包含 `preload_onnx_runtime_dlls()` 的最新项目代码，程序会在创建 CUDA 会话前用绝对路径预加载该子库。
+- 文件不存在：重新安装 GPU 运行依赖：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip uninstall -y onnxruntime onnxruntime-gpu
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install --no-cache-dir --force-reinstall "onnxruntime-gpu[cuda,cudnn]"
+```
+
+重启应用后重新执行上面的 GPU 真实推理验证。
 
 ### CUDA 版本不匹配
 

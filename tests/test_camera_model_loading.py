@@ -23,10 +23,15 @@ class _FakeSession:
         output_shape=(1, 300, 38),
         output_count=2,
         mask_shape=(1, 32, 160, 160),
+        providers=None,
+        run_error=None,
     ):
         self._outputs = [_ModelInfo("output0", list(output_shape))]
         if output_count > 1:
             self._outputs.append(_ModelInfo("output1", list(mask_shape)))
+        self._providers = list(providers or ["CPUExecutionProvider"])
+        self._run_error = run_error
+        self.fallback_disabled = False
 
     def get_inputs(self):
         return [_ModelInfo("images", [1, 3, 640, 640])]
@@ -35,9 +40,14 @@ class _FakeSession:
         return self._outputs
 
     def get_providers(self):
-        return ["CPUExecutionProvider"]
+        return list(self._providers)
+
+    def disable_fallback(self):
+        self.fallback_disabled = True
 
     def run(self, output_names, inputs):
+        if self._run_error is not None:
+            raise self._run_error
         return []
 
 
@@ -73,6 +83,47 @@ def test_compatible_segmentation_model_metadata_is_accepted(monkeypatch):
     assert vision.input_shape == [1, 3, 640, 640]
     assert vision.is_seg_model is True
     assert vision.model_format == "yolo26"
+
+
+def test_cuda_warmup_failure_recreates_cpu_session(monkeypatch):
+    monkeypatch.setattr(vision_module, "_CUDA_RUNTIME_FAILURE", None)
+    gpu_session = _FakeSession(
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        run_error=RuntimeError("missing cudnn_engines_tensor_ir64_9.dll"),
+    )
+    cpu_session = _FakeSession()
+    session_requests = []
+
+    def create_session(model_path, providers):
+        session_requests.append(list(providers))
+        return gpu_session if "CUDAExecutionProvider" in providers else cpu_session
+
+    fake_ort = types.SimpleNamespace(
+        get_available_providers=lambda: [
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ],
+        InferenceSession=create_session,
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+    vision = _vision_shell()
+
+    vision._initialize_onnx_model()
+
+    assert gpu_session.fallback_disabled is True
+    assert vision.session is cpu_session
+    assert vision.inference_provider == "CPU (CUDA运行失败回退)"
+    assert session_requests == [
+        ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        ["CPUExecutionProvider"],
+    ]
+
+    second_vision = _vision_shell()
+    second_vision._initialize_onnx_model()
+
+    assert second_vision.session is cpu_session
+    assert second_vision.inference_provider == "CPU (CUDA运行失败回退)"
+    assert session_requests[-1] == ["CPUExecutionProvider"]
 
 
 def test_incompatible_model_clears_session(monkeypatch):

@@ -11,10 +11,10 @@ try:
 except ImportError:
     raise ImportError("缺少依赖 opencv-python，请执行: pip install opencv-python")
 import logging
+import os
 import time
 from dataclasses import dataclass
 
-logger = logging.getLogger(__name__)
 from .config_manager import (
     get_calibration,
     get_camera_handeye_matrix,
@@ -25,6 +25,42 @@ from .config_manager import (
 
 
 from .transform_utils import euler2rot as _euler2rot, pose2matrix as _pose2matrix
+
+logger = logging.getLogger(__name__)
+_CUDA_RUNTIME_FAILURE = None
+_CUDA_DLL_HANDLES = []
+
+
+def preload_onnx_runtime_dlls(ort):
+    """Preload ONNX Runtime dependencies, including a cuDNN 9 Windows sublibrary."""
+    if hasattr(ort, "preload_dlls"):
+        ort.preload_dlls(directory="")
+    if os.name != "nt":
+        return
+
+    try:
+        import ctypes
+        import importlib.util
+        from pathlib import Path
+
+        spec = importlib.util.find_spec("nvidia.cudnn")
+        locations = list(spec.submodule_search_locations or []) if spec else []
+        if not locations:
+            return
+        tensor_ir_path = (
+            Path(locations[0]) / "bin" / "cudnn_engines_tensor_ir64_9.dll"
+        )
+        if tensor_ir_path.is_file():
+            resolved = str(tensor_ir_path.resolve())
+            already_loaded = any(
+                getattr(handle, "_name", None) == resolved
+                for handle in _CUDA_DLL_HANDLES
+            )
+            if not already_loaded:
+                _CUDA_DLL_HANDLES.append(ctypes.CDLL(resolved))
+                logger.debug("已预加载 cuDNN Tensor IR 子库: %s", resolved)
+    except Exception as exc:
+        logger.warning("预加载 cuDNN Tensor IR 子库失败，将通过真实推理检测: %s", exc)
 
 try:
     import dobot_core
@@ -183,24 +219,30 @@ class VisionSystem:
         self.last_valid_position = None
 
     def _initialize_onnx_model(self):
+        global _CUDA_RUNTIME_FAILURE
         logger.info("正在为 %s 加载模型: %s", self.camera_type, self.model_path)
         try:
             import onnxruntime as ort
 
-            if hasattr(ort, 'preload_dlls'):
-                ort.preload_dlls(directory="")
+            preload_onnx_runtime_dlls(ort)
             available_providers = ort.get_available_providers()
             self.inference_provider = "CPU"
+            using_cuda = False
 
-            if 'CUDAExecutionProvider' in available_providers:
+            if (
+                'CUDAExecutionProvider' in available_providers
+                and _CUDA_RUNTIME_FAILURE is None
+            ):
                 self.session = ort.InferenceSession(
                     self.model_path,
-                    providers=['CUDAExecutionProvider'],
+                    providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
                 )
                 active_providers = self.session.get_providers()
                 if 'CUDAExecutionProvider' in active_providers:
+                    using_cuda = True
                     self.inference_provider = "GPU (CUDA)"
-                    logger.info("实例分割模型加载成功（GPU CUDA 模式）")
+                    if hasattr(self.session, "disable_fallback"):
+                        self.session.disable_fallback()
                 else:
                     self.inference_provider = "CPU (CUDA回退)"
                     logger.warning(
@@ -212,19 +254,23 @@ class VisionSystem:
                     self.model_path,
                     providers=['CPUExecutionProvider'],
                 )
-                self.inference_provider = "CPU"
-                logger.warning(
-                    "CUDA 不可用，使用 CPU 推理。当前可用 providers: %s",
-                    available_providers,
-                )
+                if _CUDA_RUNTIME_FAILURE is not None:
+                    self.inference_provider = "CPU (CUDA运行失败回退)"
+                    logger.warning(
+                        "本进程已检测到 CUDA 运行环境异常，%s 直接使用 CPU: %s",
+                        self.camera_type,
+                        _CUDA_RUNTIME_FAILURE,
+                    )
+                else:
+                    self.inference_provider = "CPU"
+                    logger.warning(
+                        "CUDA 不可用，使用 CPU 推理。当前可用 providers: %s",
+                        available_providers,
+                    )
 
             input_infos = self.session.get_inputs()
-            output_infos = self.session.get_outputs()
             if not input_infos or len(input_infos[0].shape) != 4:
                 raise ValueError("模型必须具有一个四维 NCHW 输入")
-            if not output_infos or len(output_infos[0].shape) != 3:
-                raise ValueError("模型主输出必须是三维 YOLO 检测张量")
-
             self.input_name = input_infos[0].name
             self.input_shape = input_infos[0].shape
             height, width = self.input_shape[2], self.input_shape[3]
@@ -232,7 +278,43 @@ class VisionSystem:
                 raise ValueError("模型输入高度和宽度必须是固定正整数")
             logger.debug(f"模型输入: {self.input_name}, 形状: {self.input_shape}")
 
-            self.warmup_onnx()
+            try:
+                self.warmup_onnx()
+            except Exception as cuda_exc:
+                if not using_cuda:
+                    raise
+                error_summary = str(cuda_exc).splitlines()[0][:500]
+                _CUDA_RUNTIME_FAILURE = error_summary
+                logger.warning(
+                    "CUDA 首次推理失败，显式回退 CPU；请检查 CUDA/cuDNN DLL: %s",
+                    error_summary,
+                )
+                logger.debug("CUDA 首次推理完整异常", exc_info=True)
+                self.session = ort.InferenceSession(
+                    self.model_path,
+                    providers=['CPUExecutionProvider'],
+                )
+                self.inference_provider = "CPU (CUDA运行失败回退)"
+                input_infos = self.session.get_inputs()
+                self.input_name = input_infos[0].name
+                self.input_shape = input_infos[0].shape
+                self.warmup_onnx()
+                using_cuda = False
+
+            if using_cuda:
+                active_providers = self.session.get_providers()
+                if 'CUDAExecutionProvider' in active_providers:
+                    logger.info("实例分割模型加载成功（GPU CUDA 模式）")
+                else:
+                    self.inference_provider = "CPU (CUDA运行时回退)"
+                    logger.warning(
+                        "CUDA 首次推理后已切换到 CPU。活跃 providers: %s",
+                        active_providers,
+                    )
+
+            output_infos = self.session.get_outputs()
+            if not output_infos or len(output_infos[0].shape) != 3:
+                raise ValueError("模型主输出必须是三维 YOLO 检测张量")
             self.model_format = "yolov8"
             output_shape = output_infos[0].shape
             dim1, dim2 = output_shape[1], output_shape[2]
@@ -284,12 +366,12 @@ class VisionSystem:
         """ONNX session warmup：运行一次 dummy inference 消除 CUDA JIT 延迟"""
         if self.session is None:
             return
-        try:
-            dummy_input = np.zeros((1, 3, self.input_shape[2], self.input_shape[3]), dtype=np.float32)
-            self.session.run(None, {self.input_name: dummy_input})
-            logger.info("ONNX warmup 完成 (%s)", self.inference_provider)
-        except Exception as e:
-            logger.debug("ONNX warmup 跳过: %s", e)
+        dummy_input = np.zeros(
+            (1, 3, self.input_shape[2], self.input_shape[3]),
+            dtype=np.float32,
+        )
+        self.session.run(None, {self.input_name: dummy_input})
+        logger.info("ONNX warmup 完成 (%s)", self.inference_provider)
 
     def _record_performance(self, scope, timings):
         stats = self._perf_stats.setdefault(

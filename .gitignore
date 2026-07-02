@@ -29,3 +29,5 @@ vendor/
 docs/code_wiki.md
 logs/
 runtime_health.json
+runtime_state.json
+*.lock

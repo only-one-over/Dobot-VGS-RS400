@@ -3,7 +3,7 @@ param(
     [string]$WatchdogTaskName = "DobotRuntimeWatchdog",
     [string]$ProjectRoot = "",
     [string]$PythonExe = "",
-    [int]$StartupDelaySeconds = 20
+    [int]$StartupDelaySeconds = 0
 )
 
 if (-not $ProjectRoot) {

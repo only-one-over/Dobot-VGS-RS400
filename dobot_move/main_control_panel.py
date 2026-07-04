@@ -35,6 +35,7 @@ class MainControlPanel(QWidget):
     resume = pyqtSignal()
     collision_level_changed = pyqtSignal(int)
     ip_changed = pyqtSignal(str)
+    main_flow_changed = pyqtSignal(str)
 
     BTN_HEIGHT = 38
 
@@ -87,6 +88,13 @@ class MainControlPanel(QWidget):
 
         # ── 任务控制卡片 ──
         task_card, task_layout = self._make_card("任务控制", "#2563eb")
+
+        flow_row = QHBoxLayout()
+        flow_row.setSpacing(8)
+        flow_row.addWidget(QLabel("主流程:"))
+        self.main_flow_combo = QComboBox()
+        flow_row.addWidget(self.main_flow_combo, 1)
+        task_layout.addLayout(flow_row)
 
         self.run_task_btn = QPushButton("▶  运行抓取任务")
         set_button_role(self.run_task_btn, "primary")
@@ -264,6 +272,25 @@ class MainControlPanel(QWidget):
         self.ip_input.editingFinished.connect(
             lambda: self.ip_changed.emit(self.ip_input.text().strip())
         )
+        self.main_flow_combo.currentIndexChanged.connect(
+            self._emit_main_flow_changed
+        )
+
+    def _emit_main_flow_changed(self, index):
+        flow_id = self.main_flow_combo.itemData(index)
+        if flow_id:
+            self.main_flow_changed.emit(str(flow_id))
+
+    def set_main_flows(self, flows, selected_id):
+        self.main_flow_combo.blockSignals(True)
+        self.main_flow_combo.clear()
+        selected_index = 0
+        for index, flow in enumerate(flows):
+            self.main_flow_combo.addItem(flow["name"], flow["id"])
+            if flow["id"] == selected_id:
+                selected_index = index
+        self.main_flow_combo.setCurrentIndex(selected_index)
+        self.main_flow_combo.blockSignals(False)
 
     def set_camera_model_path(self, camera_type, model_path):
         field = self.d435i_model_path if camera_type == "D435i" else self.d405_model_path

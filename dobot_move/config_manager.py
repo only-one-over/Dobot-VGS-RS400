@@ -43,6 +43,11 @@ DEFAULT_PERFORMANCE_CONFIG = {
     "motion_wait_robot_mode_fallback": True,
 }
 
+DEFAULT_RUNTIME_CONFIG = {
+    "startup_connect_timeout_s": 5.0,
+    "camera_retry_interval_s": 10.0,
+}
+
 
 DEFAULT_VISUAL_SERVO_CONFIG = {
     "servo_period": 0.06,
@@ -248,6 +253,14 @@ def get_performance_config():
     if isinstance(config.get("performance"), dict):
         performance.update(config["performance"])
     return performance
+
+
+def get_runtime_config():
+    config = load_config()
+    runtime = dict(DEFAULT_RUNTIME_CONFIG)
+    if isinstance(config.get("runtime"), dict):
+        runtime.update(config["runtime"])
+    return runtime
 
 
 def _validate_camera_type(camera_type):

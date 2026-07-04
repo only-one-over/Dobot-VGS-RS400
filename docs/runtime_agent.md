@@ -9,12 +9,12 @@
 在项目根目录运行：
 
 ```powershell
-python -m dobot_move.runtime_agent --startup-delay 20
+python -m dobot_move.runtime_agent
 ```
 
 参数说明：
 
-- `--startup-delay 20`：开机后等待网络和机器人稳定 20 秒，再开始连接机器人。
+- `--startup-delay`：仅保留旧命令兼容；即使设置该参数，首次设备探测也会立即开始。
 - `--poll-interval 1`：后台 watchdog 周期，默认 1 秒。
 - `--health-path runtime_health.json`：健康状态文件路径。
 - `--state-path runtime_state.json`：崩溃恢复状态文件路径。
@@ -49,6 +49,11 @@ Get-Content .\logs\runtime_watchdog.log -Tail 100
 | `runtime.state` | `STARTING/READY/RUNNING/WAITING_DELAY/DEGRADED/RECOVERY_REQUIRED/STOPPING` |
 | `runtime.recovery_required` | 是否必须先执行 `40001=0` |
 | `runtime.startup_errors` | 配置文件或流程文件启动校验错误 |
+| `startup_connection.main_flow_id/main_flow_name` | 当前主流程 |
+| `startup_connection.deadline_at_monotonic` | 本轮启动连接截止时间 |
+| `startup_connection.required_cameras` | 主流程实际引用的相机 |
+| `startup_connection.missing_devices` | 当前缺失的机器人或相机 |
+| `startup_connection.fault_latched/fault_code` | 启动连接故障锁及 `111/112` |
 | `robot.feedback_age_s` | 距离最近反馈包的秒数 |
 | `robot.feedback_thread_alive` | 30004 反馈线程是否存活 |
 | `modbus.thread_alive` | Modbus 服务线程是否存活 |
@@ -60,7 +65,7 @@ Get-Content .\logs\runtime_watchdog.log -Tail 100
 ## Modbus 协议
 
 - `40001=0`：立即停止当前机器人/流程运动，并保持 `40001=0`。
-- 程序未运行时：
+- 程序未运行且无启动故障锁时：
   - 写 `40001=1`：移动到 `initial_point`；运动中写 `4`；完成后保持 `2`。
   - 写 `40001=3`：运行保存的运动流程。
 - 程序普通运行阶段保持 `40001=4`，只接受 `40001=0`；写入 `1` 或 `3` 会被忽略。
@@ -70,6 +75,8 @@ Get-Content .\logs\runtime_watchdog.log -Tail 100
   - 未写入 `1` 时，达到模块设置的最长等待时间后仍正常进入下一步。
 - 延时结束且流程尚未结束时恢复 `40001=4`；整个流程成功完成后保持 `40001=5`。
 - 机器人未连接、报警、急停未解除、自动使能失败或反馈断流时，不执行运动，写机器人错误状态。
+- 启动后默认 5 秒内机器人未连接写 `111`；机器人已连接但主流程需要的相机未通过初始化和抓帧预检写 `112`；两者同时失败优先 `111`。
+- `111/112` 锁定后只接受 `40001=0`。后台仍低频重连，但设备迟到恢复不会自动清除错误；PLC 写 `0` 时重新检查，全部就绪才回到 `0`，否则重新发布当前错误码。
 
 断线期间收到的运动命令不会排队，避免机器人重连后执行过期动作。
 
@@ -92,7 +99,8 @@ Get-Content .\logs\runtime_watchdog.log -Tail 100
 ```json
 {
   "runtime": {
-    "startup_delay": 20,
+    "startup_connect_timeout_s": 5.0,
+    "camera_retry_interval_s": 10.0,
     "poll_interval": 1,
     "health_path": "runtime_health.json",
     "state_path": "runtime_state.json",
@@ -112,14 +120,13 @@ Get-Content .\logs\runtime_watchdog.log -Tail 100
 powershell -ExecutionPolicy Bypass -File .\scripts\install_runtime_task.ps1
 ```
 
-指定项目路径、Python 路径和启动延迟：
+指定项目路径和 Python 路径：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install_runtime_task.ps1 `
   -TaskName DobotRuntimeAgent `
   -ProjectRoot D:\桌面\dobot_move_python `
-  -PythonExe D:\桌面\dobot_move_python\.venv\Scripts\python.exe `
-  -StartupDelaySeconds 20
+  -PythonExe D:\桌面\dobot_move_python\.venv\Scripts\python.exe
 ```
 
 安装脚本会注册两个 Windows Task Scheduler 任务：
@@ -128,7 +135,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install_runtime_task.ps1 `
 - 看门狗任务名：`DobotRuntimeWatchdog`
 - 触发：开机启动
 - 工作目录：项目根目录
-- 启动命令：`python -m dobot_move.runtime_agent --startup-delay <秒数>`
+- 启动命令：`python -m dobot_move.runtime_agent --startup-delay 0`（参数仅为旧版本兼容）
 - 权限：最高权限运行
 - 单实例策略：忽略重复启动
 - 失败恢复：失败后 1 分钟自动重启，最多 3 次

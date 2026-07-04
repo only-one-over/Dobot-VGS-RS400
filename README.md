@@ -159,10 +159,10 @@ python -m dobot_move
 生产现场 7x24 后台运行使用包内模块：
 
 ```powershell
-python -m dobot_move.runtime_agent --startup-delay 20
+python -m dobot_move.runtime_agent
 ```
 
-生产环境应同时运行 `dobot_move.runtime_agent` 和 `dobot_move.runtime_watchdog`。根目录同名脚本只保留为旧命令兼容入口。开机自启动、异常恢复、`40001` 状态协议和状态排查见 [docs/runtime_agent.md](docs/runtime_agent.md)。
+生产环境应同时运行 `dobot_move.runtime_agent` 和 `dobot_move.runtime_watchdog`。GUI 与后台都会先启动 Modbus，再立即并发连接机器人和主流程需要的相机；默认 5 秒未就绪时发布 `111/112`。根目录同名脚本只保留为旧命令兼容入口。开机自启动、异常恢复、`40001` 状态协议和状态排查见 [docs/runtime_agent.md](docs/runtime_agent.md)。
 
 ### 首次设置
 
@@ -174,7 +174,8 @@ python -m dobot_move.runtime_agent --startup-delay 20
    - 点击"计算"生成标定矩阵
 4. **选择并连接相机模型** — 在主控制页分别为 D435i、D405 选择兼容的 ONNX 模型，然后连接相机
 5. **测试视觉** — 点击"相机测试"验证检测效果
-6. **运行抓取流程** — 在"抓取流程"选项卡中启动自动抓取
+6. **选择主流程** — 可新建、重命名、复制和切换多个流程；主控制页选择的主流程供手动运行和 Modbus `40001=3` 使用
+7. **运行抓取流程** — 运动编辑页运行当前编辑流程，主控制页运行已选主流程；两处均可暂停和继续
 
 ### 抓取流程
 

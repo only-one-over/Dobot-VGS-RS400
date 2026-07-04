@@ -20,6 +20,7 @@ DobotControl.spec
 test_yolo26_*.py
 dobot_move/config.json
 dobot_move/config.json.bak
+dobot_move/gui_mixins/*.json.bak
 .pytest_cache/
 AGENTS.md
 PORTING_GUIDE.md

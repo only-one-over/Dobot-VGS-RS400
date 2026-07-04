@@ -1,87 +1,98 @@
-[
-  {
-    "type": "move",
-    "name": "移动到初始位置",
-    "params": {
-      "target": "initial_position",
-      "motion_type": "MovJ",
-      "speed": 20
+{
+  "schema_version": 2,
+  "main_flow_id": "flow-1",
+  "last_edited_flow_id": "flow-1",
+  "flows": [
+    {
+      "id": "flow-1",
+      "name": "流程 1",
+      "modules": [
+        {
+          "type": "move",
+          "name": "移动到初始位置",
+          "params": {
+            "target": "initial_position",
+            "motion_type": "MovJ",
+            "speed": 20
+          }
+        },
+        {
+          "type": "move",
+          "name": "直线运动到目标",
+          "params": {
+            "target": "saved_point",
+            "motion_type": "MovL",
+            "speed": 30,
+            "point_name": "pose",
+            "force_guard": {
+              "enabled": false,
+              "threshold_n": 5.0,
+              "mode": "resultant_delta"
+            }
+          }
+        },
+        {
+          "type": "camera",
+          "name": "识别物体并计算坐标",
+          "params": {
+            "camera_type": "D405"
+          }
+        },
+        {
+          "type": "move",
+          "name": "直线运动到目标",
+          "params": {
+            "target": "saved_point",
+            "motion_type": "MovL",
+            "speed": 30,
+            "point_name": "p1",
+            "force_guard": {
+              "enabled": false,
+              "threshold_n": 5.0,
+              "mode": "resultant_delta"
+            }
+          }
+        },
+        {
+          "type": "relative_move",
+          "name": "相对移动",
+          "params": {
+            "coord_system": "user",
+            "motion_type": "linear",
+            "offsets": [
+              -50.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            "speed": 30,
+            "acceleration": 20,
+            "cp": 100,
+            "force_guard": {
+              "enabled": false,
+              "threshold_n": 5.0,
+              "mode": "resultant_delta"
+            }
+          }
+        },
+        {
+          "type": "move",
+          "name": "直线运动到目标",
+          "params": {
+            "target": "saved_point",
+            "motion_type": "MovL",
+            "speed": 30,
+            "point_name": "initial_point",
+            "force_guard": {
+              "enabled": false,
+              "threshold_n": 5.0,
+              "mode": "resultant_delta"
+            }
+          }
+        }
+      ]
     }
-  },
-  {
-    "type": "move",
-    "name": "直线运动到目标",
-    "params": {
-      "target": "saved_point",
-      "motion_type": "MovL",
-      "speed": 30,
-      "point_name": "pose",
-      "force_guard": {
-        "enabled": false,
-        "threshold_n": 5.0,
-        "mode": "resultant_delta"
-      }
-    }
-  },
-  {
-    "type": "camera",
-    "name": "识别物体并计算坐标",
-    "params": {
-      "camera_type": "D405"
-    }
-  },
-  {
-    "type": "move",
-    "name": "直线运动到目标",
-    "params": {
-      "target": "saved_point",
-      "motion_type": "MovL",
-      "speed": 30,
-      "point_name": "p1",
-      "force_guard": {
-        "enabled": false,
-        "threshold_n": 5.0,
-        "mode": "resultant_delta"
-      }
-    }
-  },
-  {
-    "type": "relative_move",
-    "name": "相对移动",
-    "params": {
-      "coord_system": "user",
-      "motion_type": "linear",
-      "offsets": [
-        -50.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0
-      ],
-      "speed": 30,
-      "acceleration": 20,
-      "cp": 100,
-      "force_guard": {
-        "enabled": false,
-        "threshold_n": 5.0,
-        "mode": "resultant_delta"
-      }
-    }
-  },
-  {
-    "type": "move",
-    "name": "直线运动到目标",
-    "params": {
-      "target": "saved_point",
-      "motion_type": "MovL",
-      "speed": 30,
-      "point_name": "initial_point",
-      "force_guard": {
-        "enabled": false,
-        "threshold_n": 5.0,
-        "mode": "resultant_delta"
-      }
-    }
-  }
-]
+  ]
+}

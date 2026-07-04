@@ -7,8 +7,6 @@
 import sys
 import time
 import numpy as np
-import os
-import json
 import logging
 from .qt_compat import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -28,11 +26,12 @@ from .gui_mixins import (
     ModbusMixin,
     PointManagementMixin,
     GraspFlowMixin,
-    JogMixin,
+    StartupConnectionMixin,
 )
 from .ui_theme import apply_theme, apply_status_visual, set_button_role, NAV_ICONS, card_style, metric_label_style, metric_title_style
 from .flow_step_list import FlowStepList
 from .main_control_panel import MainControlPanel
+from .flow_library import FlowLibrary, required_camera_types
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +117,7 @@ _DEFAULT_GRASP_FLOW_MODULES = [
     }
 ]
 
-class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManagementMixin, GraspFlowMixin, JogMixin, QMainWindow):
+class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, ModbusMixin, PointManagementMixin, GraspFlowMixin, QMainWindow):
     """机器人控制GUI"""
     _modbus_program_requested = pyqtSignal()
     
@@ -142,6 +141,9 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.is_paused = False
         self._flow_running = False
         self._flow_started_by_modbus = False
+        self._active_flow_id = None
+        self._active_flow_name = None
+        self._active_flow_modules = []
         self._software_emergency_active = False
         self._emergency_cmd_running = False
         self._last_emergency_click_ts = 0.0
@@ -153,20 +155,26 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         if HANDEYE_AVAILABLE:
             self._load_calib_matrix("D435i")
         self.statusBar().showMessage("正在初始化状态监控...")
-        QTimer.singleShot(100, self.start_monitor_threads)
+        QTimer.singleShot(0, self._initialize_startup_connections)
 
     def _load_grasp_flow_modules(self):
         """加载抓取流程配置文件"""
         file_path = get_grasp_flow_file()
-        if os.path.exists(file_path):
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    self.grasp_flow_modules = json.load(f)
-            except Exception as e:
-                logger.error(f"加载抓取流程失败: {e}")
-                self.grasp_flow_modules = list(_DEFAULT_GRASP_FLOW_MODULES)
-        else:
-            self.grasp_flow_modules = list(_DEFAULT_GRASP_FLOW_MODULES)
+        try:
+            self.flow_library = FlowLibrary.load(
+                file_path,
+                default_modules=_DEFAULT_GRASP_FLOW_MODULES,
+            )
+        except Exception as e:
+            logger.error(f"加载抓取流程失败: {e}")
+            self.flow_library = FlowLibrary.from_modules(
+                _DEFAULT_GRASP_FLOW_MODULES,
+                file_path,
+            )
+        self.editing_flow_id = self.flow_library.last_edited_flow_id
+        self.grasp_flow_modules = self.flow_library.get_flow(
+            self.editing_flow_id
+        )["modules"]
 
     def _request_modbus_program_from_modbus(self):
         if getattr(self, "_flow_running", False):
@@ -175,7 +183,10 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         return True
 
     def _run_modbus_program_from_signal(self):
-        started = self.run_grasp_flow(modbus_triggered=True)
+        started = self.run_grasp_flow(
+            modbus_triggered=True,
+            flow_id=self.flow_library.main_flow_id,
+        )
         if not started:
             self.controller.mark_modbus_program_finished(False)
 
@@ -338,6 +349,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.main_control.resume.connect(self.on_continue)
         self.main_control.collision_level_changed.connect(self.on_collision_level_changed)
         self.main_control.ip_changed.connect(lambda ip: ConfigService.instance().set_ip('robot_ip', ip))
+        self.main_control.main_flow_changed.connect(self._on_main_flow_changed)
         main_tab_layout.addWidget(self.main_control)
 
         # 向后兼容属性别名，供 mixins 和 _refresh_action_states 访问
@@ -373,6 +385,29 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         grasp_flow_group = QGroupBox("抓取流程编辑")
         grasp_flow_layout = QVBoxLayout()
         grasp_flow_layout.setSpacing(10)
+
+        flow_select_layout = QHBoxLayout()
+        flow_select_layout.setSpacing(8)
+        flow_select_layout.addWidget(QLabel("编辑流程:"))
+        self.edit_flow_combo = QComboBox()
+        self.edit_flow_combo.currentIndexChanged.connect(
+            self._on_edit_flow_changed
+        )
+        flow_select_layout.addWidget(self.edit_flow_combo, 1)
+        self.new_flow_btn = QPushButton("新建")
+        self.new_flow_btn.clicked.connect(self.create_flow)
+        flow_select_layout.addWidget(self.new_flow_btn)
+        self.rename_flow_btn = QPushButton("重命名")
+        self.rename_flow_btn.clicked.connect(self.rename_flow)
+        flow_select_layout.addWidget(self.rename_flow_btn)
+        self.duplicate_flow_btn = QPushButton("复制")
+        self.duplicate_flow_btn.clicked.connect(self.duplicate_flow)
+        flow_select_layout.addWidget(self.duplicate_flow_btn)
+        self.delete_flow_btn = QPushButton("删除")
+        set_button_role(self.delete_flow_btn, "danger")
+        self.delete_flow_btn.clicked.connect(self.delete_flow)
+        flow_select_layout.addWidget(self.delete_flow_btn)
+        grasp_flow_layout.addLayout(flow_select_layout)
         
         # 抓取流程显示
         self.flow_step_list = FlowStepList()
@@ -832,10 +867,26 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.run_flow_btn = QPushButton("执行流程")
         set_button_role(self.run_flow_btn, "primary")
         self.run_flow_btn.setDefault(True)
-        self.run_flow_btn.clicked.connect(self.run_grasp_flow)
+        self.run_flow_btn.clicked.connect(
+            lambda: self.run_grasp_flow(flow_id=self.editing_flow_id)
+        )
         flow_ops_layout.addWidget(self.run_flow_btn)
         
         grasp_flow_layout.addLayout(flow_ops_layout)
+
+        editor_pause_layout = QHBoxLayout()
+        self.editor_pause_btn = QPushButton("暂停")
+        set_button_role(self.editor_pause_btn, "warning")
+        self.editor_pause_btn.clicked.connect(self.on_pause)
+        self.editor_pause_btn.setEnabled(False)
+        editor_pause_layout.addWidget(self.editor_pause_btn)
+        self.editor_continue_btn = QPushButton("继续")
+        set_button_role(self.editor_continue_btn, "connect")
+        self.editor_continue_btn.clicked.connect(self.on_continue)
+        self.editor_continue_btn.setEnabled(False)
+        editor_pause_layout.addWidget(self.editor_continue_btn)
+        grasp_flow_layout.addLayout(editor_pause_layout)
+
         grasp_flow_group.setLayout(grasp_flow_layout)
         motion_tab_layout.addWidget(grasp_flow_group)
         
@@ -932,155 +983,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self._add_nav_page("Modbus 通信", self._wrap_in_scroll(modbus_tab))
 
         self._create_alarm_tab()
-
-        jog_tab = QWidget()
-        jog_tab_layout = QVBoxLayout(jog_tab)
-        jog_tab_layout.setSpacing(10)
-        jog_tab_layout.setContentsMargins(10, 10, 10, 10)
-
-        mode_layout = QHBoxLayout()
-        mode_layout.addWidget(QLabel("控制模式:"))
-        self.jog_mode_combo = QComboBox()
-        self.jog_mode_combo.addItem("坐标模式", 0)
-        self.jog_mode_combo.addItem("轴模式", 1)
-        self.jog_mode_combo.currentIndexChanged.connect(self._on_jog_mode_changed)
-        mode_layout.addWidget(self.jog_mode_combo)
-        mode_layout.addStretch()
-        jog_tab_layout.addLayout(mode_layout)
-
-        self.jog_stacked = QStackedWidget()
-
-        coord_widget = QWidget()
-        coord_layout = QVBoxLayout(coord_widget)
-        coord_layout.setSpacing(10)
-
-        coord_pos_group = QGroupBox("实时坐标")
-        coord_pos_layout = QGridLayout()
-        coord_pos_layout.setSpacing(5)
-        self.coord_x_label = QLabel("X: --")
-        self.coord_y_label = QLabel("Y: --")
-        self.coord_z_label = QLabel("Z: --")
-        self.coord_rx_label = QLabel("Rx: --")
-        self.coord_ry_label = QLabel("Ry: --")
-        self.coord_rz_label = QLabel("Rz: --")
-        coord_pos_layout.addWidget(self.coord_x_label, 0, 0)
-        coord_pos_layout.addWidget(self.coord_y_label, 0, 1)
-        coord_pos_layout.addWidget(self.coord_z_label, 0, 2)
-        coord_pos_layout.addWidget(self.coord_rx_label, 1, 0)
-        coord_pos_layout.addWidget(self.coord_ry_label, 1, 1)
-        coord_pos_layout.addWidget(self.coord_rz_label, 1, 2)
-        coord_pos_group.setLayout(coord_pos_layout)
-        coord_layout.addWidget(coord_pos_group)
-
-        coord_target_group = QGroupBox("目标坐标")
-        coord_target_layout = QGridLayout()
-        coord_target_layout.setSpacing(5)
-        self.coord_target_x = QDoubleSpinBox()
-        self.coord_target_y = QDoubleSpinBox()
-        self.coord_target_z = QDoubleSpinBox()
-        self.coord_target_rx = QDoubleSpinBox()
-        self.coord_target_ry = QDoubleSpinBox()
-        self.coord_target_rz = QDoubleSpinBox()
-        for i, (label, spinbox) in enumerate([("X:", self.coord_target_x), ("Y:", self.coord_target_y), ("Z:", self.coord_target_z), ("Rx:", self.coord_target_rx), ("Ry:", self.coord_target_ry), ("Rz:", self.coord_target_rz)]):
-            spinbox.setRange(-9999, 9999)
-            spinbox.setDecimals(2)
-            coord_target_layout.addWidget(QLabel(label), i // 3, (i % 3) * 2)
-            coord_target_layout.addWidget(spinbox, i // 3, (i % 3) * 2 + 1)
-        self.coord_move_btn = QPushButton("运动到目标")
-        self.coord_move_btn.setMinimumHeight(40)
-        self.coord_move_btn.clicked.connect(self._on_coord_move_to_target)
-        coord_target_layout.addWidget(self.coord_move_btn, 2, 0, 1, 6)
-        coord_target_group.setLayout(coord_target_layout)
-        coord_layout.addWidget(coord_target_group)
-
-        coord_jog_group = QGroupBox("坐标点动")
-        coord_jog_layout = QGridLayout()
-        coord_jog_layout.setSpacing(5)
-        coord_jog_layout.addWidget(self._create_jog_button("X-", "X-"), 0, 0)
-        coord_jog_layout.addWidget(self._create_jog_button("X+", "X+"), 0, 1)
-        coord_jog_layout.addWidget(self._create_jog_button("Y-", "Y-"), 1, 0)
-        coord_jog_layout.addWidget(self._create_jog_button("Y+", "Y+"), 1, 1)
-        coord_jog_layout.addWidget(self._create_jog_button("Z-", "Z-"), 2, 0)
-        coord_jog_layout.addWidget(self._create_jog_button("Z+", "Z+"), 2, 1)
-        coord_jog_layout.addWidget(self._create_jog_button("Rx-", "Rx-"), 3, 0)
-        coord_jog_layout.addWidget(self._create_jog_button("Rx+", "Rx+"), 3, 1)
-        coord_jog_layout.addWidget(self._create_jog_button("Ry-", "Ry-"), 4, 0)
-        coord_jog_layout.addWidget(self._create_jog_button("Ry+", "Ry+"), 4, 1)
-        coord_jog_layout.addWidget(self._create_jog_button("Rz-", "Rz-"), 5, 0)
-        coord_jog_layout.addWidget(self._create_jog_button("Rz+", "Rz+"), 5, 1)
-        coord_jog_group.setLayout(coord_jog_layout)
-        coord_layout.addWidget(coord_jog_group)
-
-        coord_type_layout = QHBoxLayout()
-        coord_type_layout.addWidget(QLabel("坐标类型:"))
-        self.jog_coord_combo = QComboBox()
-        self.jog_coord_combo.addItem("用户坐标", 1)
-        self.jog_coord_combo.addItem("工具坐标", 2)
-        coord_type_layout.addWidget(self.jog_coord_combo)
-        coord_type_layout.addStretch()
-        coord_layout.addLayout(coord_type_layout)
-
-        coord_layout.addStretch()
-        self.jog_stacked.addWidget(coord_widget)
-
-        axis_widget = QWidget()
-        axis_layout = QVBoxLayout(axis_widget)
-        axis_layout.setSpacing(10)
-
-        axis_pos_group = QGroupBox("实时关节角度")
-        axis_pos_layout = QGridLayout()
-        axis_pos_layout.setSpacing(5)
-        self.axis_j1_label = QLabel("J1: --")
-        self.axis_j2_label = QLabel("J2: --")
-        self.axis_j3_label = QLabel("J3: --")
-        self.axis_j4_label = QLabel("J4: --")
-        axis_pos_layout.addWidget(self.axis_j1_label, 0, 0)
-        axis_pos_layout.addWidget(self.axis_j2_label, 0, 1)
-        axis_pos_layout.addWidget(self.axis_j3_label, 1, 0)
-        axis_pos_layout.addWidget(self.axis_j4_label, 1, 1)
-        axis_pos_group.setLayout(axis_pos_layout)
-        axis_layout.addWidget(axis_pos_group)
-
-        axis_target_group = QGroupBox("目标关节角度")
-        axis_target_layout = QGridLayout()
-        axis_target_layout.setSpacing(5)
-        self.axis_target_j1 = QDoubleSpinBox()
-        self.axis_target_j2 = QDoubleSpinBox()
-        self.axis_target_j3 = QDoubleSpinBox()
-        self.axis_target_j4 = QDoubleSpinBox()
-        for i, (label, spinbox) in enumerate([("J1:", self.axis_target_j1), ("J2:", self.axis_target_j2), ("J3:", self.axis_target_j3), ("J4:", self.axis_target_j4)]):
-            spinbox.setRange(-9999, 9999)
-            spinbox.setDecimals(2)
-            axis_target_layout.addWidget(QLabel(label), i // 2, (i % 2) * 2)
-            axis_target_layout.addWidget(spinbox, i // 2, (i % 2) * 2 + 1)
-        self.axis_move_btn = QPushButton("运动到目标")
-        self.axis_move_btn.setMinimumHeight(40)
-        self.axis_move_btn.setEnabled(False)
-        self.axis_move_btn.setToolTip("需补齐 J1-J6 后启用")
-        self.axis_move_btn.clicked.connect(self._on_axis_move_to_target)
-        axis_target_layout.addWidget(self.axis_move_btn, 2, 0, 1, 4)
-        axis_target_group.setLayout(axis_target_layout)
-        axis_layout.addWidget(axis_target_group)
-
-        axis_jog_group = QGroupBox("关节点动")
-        axis_jog_layout = QGridLayout()
-        axis_jog_layout.setSpacing(5)
-        axis_jog_layout.addWidget(self._create_jog_button("J1-", "J1-"), 0, 0)
-        axis_jog_layout.addWidget(self._create_jog_button("J1+", "J1+"), 0, 1)
-        axis_jog_layout.addWidget(self._create_jog_button("J2-", "J2-"), 1, 0)
-        axis_jog_layout.addWidget(self._create_jog_button("J2+", "J2+"), 1, 1)
-        axis_jog_layout.addWidget(self._create_jog_button("J3-", "J3-"), 2, 0)
-        axis_jog_layout.addWidget(self._create_jog_button("J3+", "J3+"), 2, 1)
-        axis_jog_layout.addWidget(self._create_jog_button("J4-", "J4-"), 3, 0)
-        axis_jog_layout.addWidget(self._create_jog_button("J4+", "J4+"), 3, 1)
-        axis_jog_group.setLayout(axis_jog_layout)
-        axis_layout.addWidget(axis_jog_group)
-
-        axis_layout.addStretch()
-        self.jog_stacked.addWidget(axis_widget)
-
-        jog_tab_layout.addWidget(self.jog_stacked)
-        self._add_nav_page("点动控制", self._wrap_in_scroll(jog_tab))
 
         calib_tab = QWidget()
         calib_layout = QVBoxLayout(calib_tab)
@@ -1218,6 +1120,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
 
         self._set_status_visual(self.robot_status_label, "未连接")
         self._set_status_visual(self.camera_status_label, "未连接")
+        self._select_editing_flow(self.editing_flow_id)
         self._refresh_action_states()
 
     def on_collision_level_changed(self, level):
@@ -1241,9 +1144,27 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
 
     def _refresh_action_states(self):
         robot_ready = bool(getattr(self.controller, "is_connected", False))
-        camera_ready = self.vision_d435i is not None or self.vision_d405 is not None
+        required_cameras = required_camera_types(
+            self.flow_library.get_main_flow()["modules"]
+        )
+        camera_ready = all(
+            (
+                camera_type == "D435i"
+                and self.vision_d435i is not None
+            ) or (
+                camera_type == "D405"
+                and self.vision_d405 is not None
+            )
+            for camera_type in required_cameras
+        )
         flow_running = bool(getattr(self, "_flow_running", False))
         cmd_running = bool(getattr(self, "_cmd_running", False))
+        connect_tasks = getattr(self, "_device_connect_tasks", {})
+        connecting = {
+            name
+            for name, task in connect_tasks.items()
+            if task is not None and task.is_alive
+        }
 
         for attr in (
             "enable_robot_btn", "disable_robot_btn", "get_pos_btn",
@@ -1254,12 +1175,49 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
 
         if hasattr(self, "run_task_btn"):
             self.run_task_btn.setEnabled(robot_ready and camera_ready and not flow_running and not cmd_running)
+        if hasattr(self.main_control, "main_flow_combo"):
+            self.main_control.main_flow_combo.setEnabled(
+                not flow_running and not cmd_running
+            )
         if hasattr(self, "connect_robot_btn"):
-            self.connect_robot_btn.setEnabled(not robot_ready and not flow_running and not cmd_running)
+            self.connect_robot_btn.setEnabled(
+                not robot_ready
+                and "robot" not in connecting
+                and not flow_running
+                and not cmd_running
+            )
+        for camera_type, vision, connect_btn, disconnect_btn in (
+            ("D435i", self.vision_d435i, self.d435i_connect_btn, self.d435i_disconnect_btn),
+            ("D405", self.vision_d405, self.d405_connect_btn, self.d405_disconnect_btn),
+        ):
+            camera_connected = vision is not None
+            connect_btn.setEnabled(
+                not camera_connected
+                and camera_type not in connecting
+                and not flow_running
+            )
+            disconnect_btn.setEnabled(camera_connected and not flow_running)
+            self.main_control.set_camera_model_selection_enabled(
+                camera_type,
+                not camera_connected and camera_type not in connecting,
+            )
         if hasattr(self, "pause_btn"):
             self.pause_btn.setEnabled(flow_running and not self.is_paused)
         if hasattr(self, "continue_btn"):
             self.continue_btn.setEnabled(flow_running and self.is_paused)
+        if hasattr(self, "editor_pause_btn"):
+            self.editor_pause_btn.setEnabled(flow_running and not self.is_paused)
+        if hasattr(self, "editor_continue_btn"):
+            self.editor_continue_btn.setEnabled(flow_running and self.is_paused)
+        for attr in (
+            "edit_flow_combo",
+            "new_flow_btn",
+            "rename_flow_btn",
+            "duplicate_flow_btn",
+            "delete_flow_btn",
+        ):
+            if hasattr(self, attr):
+                getattr(self, attr).setEnabled(not flow_running)
         if hasattr(self, "emergency_stop_btn"):
             self.emergency_stop_btn.setEnabled(robot_ready)
             self._update_emergency_stop_button()
@@ -1498,6 +1456,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
     def closeEvent(self, event):
         """窗口关闭 - 按顺序停止所有线程和服务"""
         logger.info("正在关闭应用程序...")
+        self._shutdown_startup_connections()
 
         # 0. 停止状态定时器
         if hasattr(self, '_status_timer') and self._status_timer is not None:
@@ -1540,7 +1499,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             self.vision_d405 = None
 
         # 5. 停止实时反馈和监控线程
-        self.stop_monitor_threads()
 
         # 6. 断开机器人连接
         if hasattr(self, 'controller') and self.controller is not None:

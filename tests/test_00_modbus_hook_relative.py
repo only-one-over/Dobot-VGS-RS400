@@ -379,6 +379,35 @@ def test_runtime_recovery_lock_only_accepts_zero():
     assert fake_server.calls[-1]["status"] == modbus_server.STATUS_IDLE
 
 
+def test_startup_connection_fault_stays_latched_until_zero_recheck_succeeds():
+    modbus_server, robot_controller = _real_modules()
+    controller = robot_controller.DobotController("192.168.1.50")
+    fake_server = _FakeStatusServer()
+    controller.modbus_server = fake_server
+    readiness = {"error": modbus_server.STATUS_CAMERA_ERR}
+    controller.set_startup_connection_fault(
+        modbus_server.STATUS_CAMERA_ERR,
+        ready_checker=lambda: readiness["error"],
+    )
+
+    controller._on_modbus_command(modbus_server.CMD_RESET, mode=modbus_server.MODE_AUTO)
+    assert controller.get_startup_connection_fault() == modbus_server.STATUS_CAMERA_ERR
+    assert fake_server.calls[-1]["status"] == modbus_server.STATUS_CAMERA_ERR
+
+    controller._on_modbus_command(modbus_server.CMD_STOP, mode=modbus_server.MODE_AUTO)
+    assert controller.get_startup_connection_fault() == modbus_server.STATUS_CAMERA_ERR
+    assert fake_server.calls[-1]["status"] == modbus_server.STATUS_CAMERA_ERR
+
+    controller.dashboard = _FakeStopDashboard()
+    controller.is_connected = True
+    readiness["error"] = None
+    controller._on_modbus_command(modbus_server.CMD_STOP, mode=modbus_server.MODE_AUTO)
+
+    assert controller.get_startup_connection_fault() is None
+    assert controller.dashboard.calls == ["Stop", "ClearError", "EnableRobot"]
+    assert fake_server.calls[-1]["status"] == modbus_server.STATUS_IDLE
+
+
 def test_reset_value_releases_delay_instead_of_dispatching_reset():
     modbus_server, robot_controller = _real_modules()
     controller = robot_controller.DobotController("192.168.1.50")
@@ -705,6 +734,6 @@ def test_gui_modbus_program_uses_signal_and_resets_after_success():
 
     assert "_modbus_program_requested = pyqtSignal()" in gui_source
     assert "set_modbus_program_runner" in gui_source
-    assert "run_grasp_flow(modbus_triggered=True)" in gui_source
+    assert "flow_id=self.flow_library.main_flow_id" in gui_source
     assert "mark_modbus_program_finished(True)" in flow_source
     assert "reset_modbus_status_to_idle" not in flow_source

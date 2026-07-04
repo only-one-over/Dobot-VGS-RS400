@@ -99,26 +99,44 @@ class VisionMixin:
             _logger.warning("探测设备失败: %s", e)
             return {}
 
-    def connect_d435i(self):
+    def _create_camera_system(self, camera_type):
         if not VISION_AVAILABLE:
-            QMessageBox.critical(self, "错误", "视觉系统不可用")
-            return
+            raise RuntimeError("视觉系统不可用")
+        serial = self._detect_camera_serials().get(camera_type)
+        vision = None
         try:
-            serials = self._detect_camera_serials()
-            serial = serials.get("D435i")
-            self.vision_d435i = VisionSystem(camera_type="D435i", serial_number=serial)
-            self._set_camera_status("D435i", "已连接")
-            self.d435i_connect_btn.setEnabled(False)
-            self.d435i_disconnect_btn.setEnabled(True)
-            self.main_control.set_camera_model_selection_enabled("D435i", False)
-            if hasattr(self, "_refresh_action_states"):
-                self._refresh_action_states()
-            self.update_gpu_status(self.vision_d435i.inference_provider)
-            QMessageBox.information(self, "成功", f"D435i 相机连接成功" + (f" (SN: {serial})" if serial else "") + f" [{self.vision_d435i.inference_provider}]")
-        except Exception as e:
-            self.vision_d435i = None
-            self._set_camera_status("D435i", "连接失败")
-            QMessageBox.critical(self, "错误", f"D435i 相机连接失败: {e}")
+            vision = VisionSystem(camera_type=camera_type, serial_number=serial)
+            depth_frame, color_frame = vision.capture_frames()
+            if depth_frame is None or color_frame is None:
+                raise RuntimeError(f"{camera_type} 相机抓帧预检失败")
+            return vision
+        except Exception:
+            if vision is not None:
+                try:
+                    vision.close()
+                except Exception:
+                    _logger.exception("释放连接失败的 %s 相机资源时出错", camera_type)
+            raise
+
+    def _adopt_camera_system(self, camera_type, vision):
+        if camera_type == "D435i":
+            self.vision_d435i = vision
+            connect_btn = self.d435i_connect_btn
+            disconnect_btn = self.d435i_disconnect_btn
+        else:
+            self.vision_d405 = vision
+            connect_btn = self.d405_connect_btn
+            disconnect_btn = self.d405_disconnect_btn
+        self._set_camera_status(camera_type, "已连接")
+        connect_btn.setEnabled(False)
+        disconnect_btn.setEnabled(True)
+        self.main_control.set_camera_model_selection_enabled(camera_type, False)
+        self.update_gpu_status(vision.inference_provider)
+        if hasattr(self, "_refresh_action_states"):
+            self._refresh_action_states()
+
+    def connect_d435i(self):
+        self._request_device_connection("D435i", manual=True)
 
     def disconnect_d435i(self):
         try:
@@ -137,25 +155,7 @@ class VisionMixin:
             QMessageBox.critical(self, "错误", f"D435i 相机关闭失败: {e}")
 
     def connect_d405(self):
-        if not VISION_AVAILABLE:
-            QMessageBox.critical(self, "错误", "视觉系统不可用")
-            return
-        try:
-            serials = self._detect_camera_serials()
-            serial = serials.get("D405")
-            self.vision_d405 = VisionSystem(camera_type="D405", serial_number=serial)
-            self._set_camera_status("D405", "已连接")
-            self.d405_connect_btn.setEnabled(False)
-            self.d405_disconnect_btn.setEnabled(True)
-            self.main_control.set_camera_model_selection_enabled("D405", False)
-            if hasattr(self, "_refresh_action_states"):
-                self._refresh_action_states()
-            self.update_gpu_status(self.vision_d405.inference_provider)
-            QMessageBox.information(self, "成功", f"D405 相机连接成功" + (f" (SN: {serial})" if serial else "") + f" [{self.vision_d405.inference_provider}]")
-        except Exception as e:
-            self.vision_d405 = None
-            self._set_camera_status("D405", "连接失败")
-            QMessageBox.critical(self, "错误", f"D405 相机连接失败: {e}")
+        self._request_device_connection("D405", manual=True)
 
     def disconnect_d405(self):
         try:
@@ -259,4 +259,3 @@ class VisionMixin:
             self.cam_test_end_coords.setText("X: ---  Y: ---  Z: ---")
             self.cam_test_base_coords.setText("X: ---  Y: ---  Z: ---")
             self.cam_test_confidence.setText("---")
-

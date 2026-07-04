@@ -107,6 +107,9 @@ class DobotController:
         self._modbus_delay_release_event = threading.Event()
         self._runtime_recovery_required = False
         self._runtime_recovery_cleared_callback = None
+        self._startup_connection_lock = threading.RLock()
+        self._startup_connection_fault_code = None
+        self._startup_connection_ready_checker = None
         self.alarm_history = AlarmHistory()
 
         self._motion_owner = None
@@ -2322,6 +2325,12 @@ class DobotController:
     def _write_modbus_status(self, status, mode=None):
         if mode is None:
             mode = getattr(self, '_modbus_mode', MODE_AUTO)
+        if self._runtime_recovery_required:
+            status = STATUS_HOOK_ERR
+        else:
+            with self._startup_connection_lock:
+                if self._startup_connection_fault_code is not None:
+                    status = self._startup_connection_fault_code
         self._modbus_status_override = status
         if self.modbus_server:
             self.modbus_server.update_status_registers(status=status, mode=mode)
@@ -2428,6 +2437,38 @@ class DobotController:
             except Exception:
                 logger.exception("运行时恢复锁清除回调失败")
 
+    def set_startup_connection_fault(self, error_code, ready_checker=None):
+        """Latch a startup device error until Modbus 40001=0 rechecks readiness."""
+        error_code = int(error_code)
+        if error_code not in (STATUS_ROBOT_ERR, STATUS_CAMERA_ERR):
+            raise ValueError(f"不支持的启动连接错误码: {error_code}")
+        with self._startup_connection_lock:
+            self._startup_connection_fault_code = error_code
+            if ready_checker is not None:
+                self._startup_connection_ready_checker = ready_checker
+        self._write_modbus_status(error_code)
+
+    def get_startup_connection_fault(self):
+        with self._startup_connection_lock:
+            return self._startup_connection_fault_code
+
+    def _recheck_startup_connection_fault(self):
+        with self._startup_connection_lock:
+            checker = self._startup_connection_ready_checker
+        if checker is None:
+            return self.get_startup_connection_fault()
+        try:
+            error_code = checker()
+        except Exception:
+            logger.exception("启动设备就绪复查失败")
+            error_code = self.get_startup_connection_fault() or STATUS_ROBOT_ERR
+        if error_code is not None:
+            self.set_startup_connection_fault(error_code, checker)
+            return int(error_code)
+        with self._startup_connection_lock:
+            self._startup_connection_fault_code = None
+        return None
+
     def _wait_robot_ready_for_modbus_program(self, timeout=5.0, poll_interval=0.1):
         """Wait briefly for robot connection, fresh feedback, no alarm, and enable."""
         deadline = time.time() + max(0.1, float(timeout))
@@ -2454,10 +2495,32 @@ class DobotController:
             if cmd == CMD_STOP:
                 self._modbus_stop_immediate(mode=mode)
                 self._clear_runtime_recovery_required()
+                if self.get_startup_connection_fault() is not None:
+                    self._recheck_startup_connection_fault()
                 self._write_modbus_status(STATUS_IDLE, mode=mode)
             else:
                 logger.warning("运行时恢复锁生效，忽略40001=%d；请先下发0", cmd)
                 self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
+            return
+        startup_fault = self.get_startup_connection_fault()
+        if startup_fault is not None:
+            if cmd == CMD_STOP:
+                remaining_fault = self._recheck_startup_connection_fault()
+                if remaining_fault is None:
+                    self._modbus_stop_immediate(mode=mode)
+                    logger.info("启动设备已全部就绪，40001=0 已清除启动故障锁")
+                else:
+                    logger.warning(
+                        "启动设备仍未就绪，保持40001=%d；不会自动复位或运行",
+                        remaining_fault,
+                    )
+                    self._write_modbus_status(remaining_fault, mode=mode)
+            else:
+                logger.warning(
+                    "启动连接故障锁生效，忽略40001=%d；请在设备恢复后下发0",
+                    cmd,
+                )
+                self._write_modbus_status(startup_fault, mode=mode)
             return
         if cmd == CMD_STOP:
             self._modbus_stop_immediate(mode=mode)
@@ -2519,8 +2582,6 @@ class DobotController:
         with self._modbus_flow_state_lock:
             self._modbus_delay_waiting = False
             self._modbus_delay_release_event.set()
-
-        self.release_motion("jog")
 
         if self.is_connected and self.dashboard:
             try:
@@ -2811,9 +2872,6 @@ class DobotController:
         self.is_enabled = False
         self._last_speed_factor = None
 
-        # Release jog motion lock during emergency stop
-        self.release_motion("jog")
-
         # Signal active flow thread to stop immediately
         if self._active_flow_thread is not None and hasattr(self._active_flow_thread, '_ctx') and self._active_flow_thread._ctx is not None:
             self._active_flow_thread._ctx.stop_event.set()
@@ -2909,47 +2967,6 @@ class DobotController:
         except Exception as e:
             logger.error(f"❌ 继续失败: {e}")
             return False
-
-    def move_jog(self, axis_id, coordtype=1):
-        if not self.is_connected:
-            logger.warning("机器人未连接，无法点动")
-            return False
-        if not self.is_enabled:
-            logger.warning("机器人未使能，无法点动")
-            return False
-        if not self.acquire_motion("jog"):
-            logger.warning("无法获取运动控制权(jog)，可能被其他操作占用")
-            return False
-        try:
-            if axis_id.startswith("J"):
-                response = self.dashboard.MoveJog(axis_id)
-            else:
-                response = self.dashboard.MoveJog(axis_id, coordtype=coordtype, user=self._user_index, tool=self._tool_index)
-            response_code = self.parse_response_code(response)
-            if response_code != 0:
-                logger.error("点动控制失败，响应码: %s, axis_id=%s", response_code, axis_id)
-                self.release_motion("jog")
-                return False
-            return True
-        except Exception as e:
-            logger.error(f"❌ 点动控制失败: {e}")
-            self.release_motion("jog")
-            return False
-
-    def stop_jog(self):
-        try:
-            if self.dashboard is not None:
-                self.dashboard.MoveJog("")
-                logger.debug("点动停止指令已发送")
-            else:
-                logger.debug("Dashboard未连接，跳过MoveJog停止指令")
-        except Exception as e:
-            logger.error(f"停止点动失败: {e}")
-        finally:
-            # 仅在运动控制权属于 jog 时释放，避免重复释放警告
-            if self._motion_owner == "jog":
-                self.release_motion("jog")
-        return True
 
     def _modbus_auto_hook(self):
         """执行自动提钩控制流程（状态机：3→4→5 或 3→4→110）"""

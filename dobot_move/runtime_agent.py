@@ -28,7 +28,9 @@ from .config_manager import (
     get_modbus_slave_id,
     get_performance_config,
     get_robot_ip,
+    get_runtime_config,
 )
+from .flow_library import FlowLibrary, required_camera_types
 from .modbus_server import STATUS_CAMERA_ERR, STATUS_HOOK_ERR, STATUS_ROBOT_ERR
 from .robot_controller import DobotController
 from .runtime_resilience import (
@@ -40,6 +42,7 @@ from .runtime_resilience import (
     get_process_metrics,
     module_timeout_seconds,
 )
+from .startup_connection import StartupConnectionState
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +140,10 @@ class RobotConnectionSupervisor:
     connected_since: float = 0.0
     _delay_index: int = 0
     _motion_abort_issued: bool = False
+    _connect_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
+    _connect_result: Optional[tuple[bool, str]] = field(default=None, init=False, repr=False)
+    _connect_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _shutting_down: bool = field(default=False, init=False, repr=False)
 
     def _set_state(self, state: str) -> None:
         if self.state != state:
@@ -210,23 +217,62 @@ class RobotConnectionSupervisor:
             self.close_robot_connection()
             return False
 
+    def _connect_worker(self) -> None:
+        ok = False
+        error = ""
+        try:
+            ok = bool(self.controller.connect())
+            error = "" if ok else (self.controller.last_error or "connect failed")
+        except Exception as exc:
+            error = str(exc)
+            logger.exception("robot background connect failed")
+        if self._shutting_down and ok:
+            self.close_robot_connection()
+            ok = False
+            error = "runtime stopping"
+        with self._connect_lock:
+            self._connect_result = (ok, error)
+
+    def _consume_connect_result(self, now: float) -> bool:
+        with self._connect_lock:
+            result = self._connect_result
+            self._connect_result = None
+        if result is None:
+            return False
+        ok, error = result
+        if ok and self.controller.is_connected:
+            self.next_attempt_at = 0.0
+            self.last_error = ""
+            self.connected_since = now
+            self._set_state(RobotConnectionState.CONNECTED)
+        else:
+            self.close_robot_connection()
+            self._schedule_reconnect(now, error or "connect failed")
+        return True
+
+    def request_connect(self, now: Optional[float] = None) -> str:
+        now = time.time() if now is None else now
+        self._consume_connect_result(now)
+        thread = self._connect_thread
+        if thread is not None and thread.is_alive():
+            self._set_state(RobotConnectionState.CONNECTING)
+            return self.state
+        if self.controller.is_connected or now < self.next_attempt_at or self._shutting_down:
+            return self.state
+        self._set_state(RobotConnectionState.CONNECTING)
+        self._connect_thread = threading.Thread(
+            target=self._connect_worker,
+            name="RuntimeRobotConnect",
+            daemon=True,
+        )
+        self._connect_thread.start()
+        return self.state
+
     def step(self, now: Optional[float] = None) -> str:
         now = time.time() if now is None else now
         try:
             if not self.controller.is_connected:
-                if now < self.next_attempt_at:
-                    return self.state
-
-                self._set_state(RobotConnectionState.CONNECTING)
-                if self.controller.connect():
-                    self.next_attempt_at = 0.0
-                    self.last_error = ""
-                    self.connected_since = now
-                    self._set_state(RobotConnectionState.CONNECTED)
-                else:
-                    self.close_robot_connection()
-                    self._schedule_reconnect(now, self.controller.last_error or "connect failed")
-                return self.state
+                return self.request_connect(now)
 
             self._restart_feedback_if_thread_dead()
             health = self.controller.get_feedback_health(max_age=self.feedback_max_age)
@@ -255,6 +301,10 @@ class RobotConnectionSupervisor:
             self._schedule_reconnect(now, str(e))
             return self.state
 
+    def shutdown(self) -> None:
+        self._shutting_down = True
+        self.close_robot_connection()
+
 
 class RuntimeProgramRunner:
     """Run the saved motion flow in a background thread for Modbus command 3."""
@@ -272,13 +322,20 @@ class RuntimeProgramRunner:
         self._thread: Optional[threading.Thread] = None
         self.vision_d435i = None
         self.vision_d405 = None
+        self._camera_locks = {
+            "D435i": threading.Lock(),
+            "D405": threading.Lock(),
+        }
         self._camera_serials: Optional[dict[str, str]] = None
         self.current_flow_id: Optional[str] = None
+        self.main_flow_id: Optional[str] = None
+        self.main_flow_name: Optional[str] = None
         self.current_module_index: Optional[int] = None
         self.current_module_name: Optional[str] = None
         self.last_progress_time = 0.0
         self.orphaned_flow = False
         self.failure_latched = False
+        self._closing = False
 
     def __call__(self) -> bool:
         with self._lock:
@@ -294,23 +351,14 @@ class RuntimeProgramRunner:
             return True
 
     def _load_modules(self) -> list[dict[str, Any]]:
-        path = get_grasp_flow_file()
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            raise ValueError(f"grasp flow file must contain a list: {path}")
-        return data
+        library = FlowLibrary.load(get_grasp_flow_file())
+        main_flow = library.get_main_flow()
+        self.main_flow_id = main_flow["id"]
+        self.main_flow_name = main_flow["name"]
+        return library.snapshot_modules(main_flow["id"])
 
     def _required_camera_types(self, modules: list[dict[str, Any]]) -> set[str]:
-        required: set[str] = set()
-        for module in modules:
-            mtype = module.get("type")
-            params = module.get("params") or {}
-            if mtype == "camera":
-                required.add(str(params.get("camera_type", "D435i")))
-            elif mtype == "visual_servo":
-                required.add("D405")
-        return {camera_type for camera_type in required if camera_type in {"D435i", "D405"}}
+        return required_camera_types(modules)
 
     def _detect_camera_serials(self) -> dict[str, str]:
         if self._camera_serials is not None:
@@ -336,6 +384,12 @@ class RuntimeProgramRunner:
         return serials
 
     def _ensure_camera(self, camera_type: str) -> bool:
+        if camera_type not in self._camera_locks:
+            raise ValueError(f"不支持的相机类型: {camera_type}")
+        with self._camera_locks[camera_type]:
+            return self._ensure_camera_unlocked(camera_type)
+
+    def _ensure_camera_unlocked(self, camera_type: str) -> bool:
         attr = "vision_d405" if camera_type == "D405" else "vision_d435i"
         vision = getattr(self, attr)
         if vision is not None and getattr(vision, "is_available", True):
@@ -349,6 +403,8 @@ class RuntimeProgramRunner:
             setattr(self, attr, None)
 
         for attempt in range(1, self.camera_preflight_attempts + 1):
+            if self._closing:
+                return False
             try:
                 from .vision_system import VisionSystem
 
@@ -362,6 +418,9 @@ class RuntimeProgramRunner:
                 )
                 vision = VisionSystem(camera_type=camera_type, serial_number=serial)
                 if self._camera_preflight_ok(vision):
+                    if self._closing:
+                        vision.close()
+                        return False
                     setattr(self, attr, vision)
                     return True
                 vision.close()
@@ -399,6 +458,7 @@ class RuntimeProgramRunner:
         return ok
 
     def close_cameras(self) -> None:
+        self._closing = True
         for attr in ("vision_d435i", "vision_d405"):
             vision = getattr(self, attr)
             if vision is None:
@@ -415,6 +475,8 @@ class RuntimeProgramRunner:
         return {
             "running": running,
             "flow_id": self.current_flow_id,
+            "main_flow_id": self.main_flow_id,
+            "main_flow_name": self.main_flow_name,
             "module_index": self.current_module_index,
             "module_name": self.current_module_name,
             "last_progress_time": self.last_progress_time,
@@ -578,7 +640,10 @@ class DobotRuntimeAgent:
     ):
         config = get_config()
         performance = get_performance_config()
-        runtime_config = config.get("runtime", {}) if isinstance(config.get("runtime"), dict) else {}
+        runtime_config = get_runtime_config()
+        raw_runtime = config.get("runtime", {})
+        if isinstance(raw_runtime, dict):
+            runtime_config.update(raw_runtime)
 
         self.controller = controller or DobotController(
             get_robot_ip(),
@@ -592,6 +657,12 @@ class DobotRuntimeAgent:
         self.modbus_slave_id = int(runtime_config.get("modbus_slave_id", get_modbus_slave_id()))
         self.disk_free_min_mb = float(runtime_config.get("disk_free_min_mb", 512))
         self.camera_preflight_attempts = int(runtime_config.get("camera_retry_count", 3))
+        self.startup_connect_timeout_s = float(
+            runtime_config.get("startup_connect_timeout_s", 5.0)
+        )
+        self.camera_retry_interval_s = float(
+            runtime_config.get("camera_retry_interval_s", 10.0)
+        )
         self.state_store = RuntimeStateStore(self.state_path)
         self.supervisor = RobotConnectionSupervisor(
             self.controller,
@@ -610,6 +681,113 @@ class DobotRuntimeAgent:
         self._state_initialized = False
         self._stopped = False
         self.startup_errors: list[str] = []
+        self.startup_connection = StartupConnectionState(
+            timeout_s=self.startup_connect_timeout_s
+        )
+        self._startup_main_flow_id: Optional[str] = None
+        self._startup_main_flow_name: Optional[str] = None
+        self._startup_camera_threads: dict[str, threading.Thread] = {}
+        self._startup_camera_next_attempt: dict[str, float] = {}
+
+    def _refresh_startup_requirements(self, force=False) -> None:
+        library = FlowLibrary.load(get_grasp_flow_file())
+        main_flow = library.get_main_flow()
+        flow_id = main_flow["id"]
+        cameras = required_camera_types(main_flow.get("modules", []))
+        if (
+            force
+            or flow_id != self._startup_main_flow_id
+            or main_flow["name"] != self._startup_main_flow_name
+            or cameras != self.startup_connection.required_cameras
+        ):
+            self._startup_main_flow_id = flow_id
+            self._startup_main_flow_name = main_flow["name"]
+            self.program_runner.main_flow_id = flow_id
+            self.program_runner.main_flow_name = main_flow["name"]
+            self.startup_connection.begin(cameras)
+            logger.info(
+                "startup connection check: main_flow=%s required_cameras=%s deadline=%.1fs",
+                main_flow["name"],
+                sorted(cameras),
+                self.startup_connect_timeout_s,
+            )
+
+    def _camera_connection_status(self) -> dict[str, bool]:
+        return {
+            "D435i": bool(
+                self.program_runner.vision_d435i is not None
+                and getattr(self.program_runner.vision_d435i, "is_available", True)
+            ),
+            "D405": bool(
+                self.program_runner.vision_d405 is not None
+                and getattr(self.program_runner.vision_d405, "is_available", True)
+            ),
+        }
+
+    def _current_startup_connection_error(self):
+        self.startup_connection.update(
+            robot_connected=bool(self.controller.is_connected),
+            camera_connected=self._camera_connection_status(),
+        )
+        return self.startup_connection.recheck_fault()
+
+    def _camera_connect_worker(self, camera_type: str) -> None:
+        try:
+            self.program_runner._ensure_camera(camera_type)
+        except Exception:
+            logger.exception("startup %s camera connection worker failed", camera_type)
+        finally:
+            self._startup_camera_next_attempt[camera_type] = (
+                time.monotonic() + self.camera_retry_interval_s
+            )
+
+    def _start_required_camera_connections(self) -> None:
+        now = time.monotonic()
+        status = self._camera_connection_status()
+        for camera_type in self.startup_connection.required_cameras:
+            if status.get(camera_type):
+                continue
+            thread = self._startup_camera_threads.get(camera_type)
+            if thread is not None and thread.is_alive():
+                continue
+            if now < self._startup_camera_next_attempt.get(camera_type, 0.0):
+                continue
+            thread = threading.Thread(
+                target=self._camera_connect_worker,
+                args=(camera_type,),
+                name=f"Runtime{camera_type}Connect",
+                daemon=True,
+            )
+            self._startup_camera_threads[camera_type] = thread
+            thread.start()
+
+    def _update_startup_connection(self) -> None:
+        try:
+            self._refresh_startup_requirements()
+        except Exception:
+            logger.exception("failed to refresh startup main-flow requirements")
+        self._start_required_camera_connections()
+        self.startup_connection.update(
+            robot_connected=bool(self.controller.is_connected),
+            camera_connected=self._camera_connection_status(),
+        )
+        was_latched = self.startup_connection.fault_code is not None
+        error_code = self.startup_connection.latch_if_due()
+        if error_code is None:
+            return
+        self.controller.set_startup_connection_fault(
+            error_code,
+            ready_checker=self._current_startup_connection_error,
+        )
+        if not was_latched:
+            snapshot = self.startup_connection.snapshot()
+            self.controller.record_alarm(
+                "启动自动连接",
+                str(error_code),
+                "故障",
+                f"启动连接超时，缺失设备: {', '.join(snapshot['missing_devices'])}",
+                "检查机器人、相机、模型与网络；设备恢复后由PLC写40001=0复查",
+            )
 
     def validate_startup_inputs(self) -> list[str]:
         errors = []
@@ -629,10 +807,8 @@ class DobotRuntimeAgent:
         except Exception as e:
             errors.append(f"config.json不可用: {e}")
         try:
-            with open(get_grasp_flow_file(), "r", encoding="utf-8") as handle:
-                modules = json.load(handle)
-            if not isinstance(modules, list):
-                errors.append("流程文件根节点必须是列表")
+            library = FlowLibrary.load(get_grasp_flow_file(), migrate=False)
+            library.get_main_flow()
         except Exception as e:
             errors.append(f"流程文件不可用: {e}")
         return errors
@@ -678,6 +854,7 @@ class DobotRuntimeAgent:
                 "state": state.get("state", RuntimeState.STARTING.value),
                 "recovery_required": self.recovery_required,
                 "startup_delay": self.startup_delay,
+                "startup_connect_timeout_s": self.startup_connect_timeout_s,
                 "poll_interval": self.poll_interval,
                 "last_error": self.last_error or self.supervisor.last_error,
                 "startup_errors": list(self.startup_errors),
@@ -707,6 +884,16 @@ class DobotRuntimeAgent:
                 ),
             },
             "flow": runner,
+            "startup_connection": {
+                **self.startup_connection.snapshot(),
+                "main_flow_id": self._startup_main_flow_id,
+                "main_flow_name": self._startup_main_flow_name,
+                "controller_fault_code": (
+                    self.controller.get_startup_connection_fault()
+                    if hasattr(self.controller, "get_startup_connection_fault")
+                    else None
+                ),
+            },
             "process": metrics,
             "last_command": {
                 "value": getattr(self.controller, "_last_modbus_command", None),
@@ -722,6 +909,7 @@ class DobotRuntimeAgent:
             if self.controller.modbus_server:
                 self.controller._write_modbus_status(STATUS_ROBOT_ERR)
         supervisor_state = self.supervisor.step()
+        self._update_startup_connection()
         metrics = get_process_metrics(self.health_path)
         if metrics["disk_free_mb"] < self.disk_free_min_mb:
             self.last_error = (
@@ -760,15 +948,23 @@ class DobotRuntimeAgent:
             self.recovery_required,
             on_cleared=self._on_recovery_cleared,
         )
+        startup_requirements_ready = True
+        try:
+            self._refresh_startup_requirements(force=True)
+        except Exception:
+            startup_requirements_ready = False
+            logger.exception("startup main-flow requirements are unavailable")
+        if not self.stop_event.is_set():
+            self.supervisor.request_connect()
+            if startup_requirements_ready:
+                self._start_required_camera_connections()
         self.write_health()
 
         if self.startup_delay > 0:
-            logger.info("runtime startup delay %.1fs for network/robot boot stabilization", self.startup_delay)
-            startup_deadline = time.monotonic() + self.startup_delay
-            while not self.stop_event.is_set() and time.monotonic() < startup_deadline:
-                self.write_health()
-                remaining = startup_deadline - time.monotonic()
-                self.stop_event.wait(min(self.poll_interval, max(0.0, remaining)))
+            logger.warning(
+                "runtime.startup_delay=%.1f 已弃用；首次设备连接已立即开始",
+                self.startup_delay,
+            )
 
         while not self.stop_event.is_set():
             try:
@@ -833,7 +1029,7 @@ class DobotRuntimeAgent:
         except Exception as e:
             logger.warning("stop_modbus during runtime shutdown failed: %s", e)
         self.program_runner.close_cameras()
-        self.supervisor.close_robot_connection()
+        self.supervisor.shutdown()
         if hasattr(self.controller, "release_control_lease"):
             self.controller.release_control_lease()
         if clean and self._state_initialized:
@@ -849,7 +1045,7 @@ class DobotRuntimeAgent:
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Dobot unattended runtime agent.")
-    parser.add_argument("--startup-delay", type=float, default=None, help="Seconds to wait before robot reconnect loop starts.")
+    parser.add_argument("--startup-delay", type=float, default=None, help="Deprecated compatibility option; initial connection starts immediately.")
     parser.add_argument("--poll-interval", type=float, default=1.0, help="Runtime watchdog interval in seconds.")
     parser.add_argument("--health-path", type=Path, default=DEFAULT_HEALTH_PATH, help="Path to runtime health JSON.")
     parser.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH, help="Path to durable runtime state JSON.")
@@ -870,7 +1066,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         agent = DobotRuntimeAgent(
             health_path=args.health_path,
             state_path=args.state_path,
-            startup_delay=10.0 if args.startup_delay is None else args.startup_delay,
+            startup_delay=0.0 if args.startup_delay is None else args.startup_delay,
             poll_interval=args.poll_interval,
         )
 

@@ -30,8 +30,9 @@
 - ✅ queued 模式 send_relative_command 统一封装：替换直接 dashboard 调用
 - ✅ ServoP 队列延迟保护：超周期跳帧降频 + 连续失败暂停
 - ✅ 报警详情异步补全报警记录：GetError 详情追加到 alarm_history
-- ✅ QEvent ImportError 修复：qt_compat.py 导出 QEvent
-- ✅ 全项目官方文档审查：move_jog user/tool、move_joint_relative is_connected、MovC v 参数
+- ✅ 多流程编辑与主流程持久化：GUI 手动运行和 Modbus `40001=3` 共用主流程快照
+- ✅ 启动自动连接：Modbus 优先启动，机器人/必需相机并发探测，`111/112` 故障锁等待 PLC 复查
+- ✅ 删除应用层点动页面、控制器方法和监控逻辑，保留底层 SDK `MoveJog`
 
 ## 短期任务
 

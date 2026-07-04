@@ -36,7 +36,7 @@
 
 - `gui_app.py`：拥有 `QApplication` 入口、`DobotMainWindow`、标签页组合、UI 生命周期、状态刷新和信号连接。
 - `main_control_panel.py`：提供机器人连接、相机连接、抓取执行、碰撞等级、暂停/恢复和错误清除的主控制控件。
-- `gui_mixins/`：按功能分离的行为 mixin，包括机器人控制、视觉、Modbus 从站服务、点位管理、抓取流程和点动控制。
+- `gui_mixins/`：按功能分离的行为 mixin，包括机器人控制、视觉、Modbus 从站服务、点位管理、多流程编辑和启动连接协调。
 - `workers.py`：在 UI 线程之外运行慢速或重复工作，包括流程执行、相机测试显示、机器人命令 Worker 和 D435i 低帧率识别。
 - `robot_controller.py`：协调 Dobot Dashboard/Feedback API、运动命令、安全状态、Modbus 从站集成、运动所有权、安全状态和位姿解析。
 - `vision_system.py`：拥有相机启动、RealSense 帧捕获、ONNX 模型加载、YOLO 后处理、跟踪、深度处理、平滑和坐标转换。
@@ -55,8 +55,10 @@
 4. 相机操作为 D435i 和/或 D405 创建 `VisionSystem` 实例，并从 `camera.models` 读取该相机的模型路径。
 5. `VisionSystem` 先校验并加载对应 ONNX 模型，再打开 RealSense 管线、捕获帧、运行推理、跟踪目标、估算深度，并通过手眼标定转换相机坐标。
 6. 检测到的基座坐标通过 `config_manager.py` 更新默认点位，如 `d435i` 和 `d405`。
-7. `FlowThread` 执行 `grasp_flow_modules.json` 中配置的模块，解析点位并协调机器人运动、视觉检测、视觉伺服、相对移动和原生圆弧操作。
+7. `FlowLibrary` 管理 `schema_version=2` 的流程集合、当前编辑流程和主流程；`FlowThread` 接收流程快照，解析点位并协调机器人运动、视觉检测、视觉伺服、相对移动和原生圆弧操作。
 8. UI 更新通过 Qt 信号返回，保持主线程响应。
+
+GUI 和后台启动时均先启动 Modbus，再并发连接机器人及主流程引用的 D435i/D405。设备连接由后台线程执行，5 秒截止只负责发布启动故障，不强制终止仍在执行的连接任务；迟到成功可更新设备状态，但不会自动清除 `111/112` 或运行流程。
 
 ## 30004 反馈缓存
 
@@ -130,11 +132,12 @@ FlowThread 在 `run()` 开始时注册为 `controller._active_flow_thread`，在
 
 ## user/tool 统一参数
 
-所有运动命令（MovJ、MovL、MovC、Arc、RelMovLUser/Tool、RelMovJUser/Tool、MoveJog）统一从 `config.json` 读取 `user_index` 和 `tool_index` 并传入对应 API 参数：
+所有应用层运动命令（MovJ、MovL、MovC、Arc、RelMovLUser/Tool、RelMovJUser/Tool）统一从 `config.json` 读取 `user_index` 和 `tool_index` 并传入对应 API 参数：
 
 - 配置默认值：`user_index=0`, `tool_index=0`
 - `RelJointMovJ` 不支持 user/tool 参数（官方 API 签名无此参数）
-- `move_jog()` 坐标点动使用配置索引，关节点动仅传 axis_id
+
+应用层点动页面、控制器方法和监控定时器已移除；`dobot_api.py` 仍保留通用 `MoveJog` SDK 封装，供底层兼容使用。
 
 ## 急停独立连接
 

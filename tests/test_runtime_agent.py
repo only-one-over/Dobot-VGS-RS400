@@ -144,6 +144,8 @@ def test_supervisor_reconnects_with_backoff():
     supervisor = RobotConnectionSupervisor(controller, reconnect_delays=(1.0, 2.0))
 
     supervisor.step(now=100.0)
+    supervisor._connect_thread.join(timeout=1.0)
+    supervisor.step(now=100.0)
     assert controller.connect_calls == 1
     assert supervisor.state == RobotConnectionState.DISCONNECTED
     assert supervisor.next_attempt_at == 101.0
@@ -151,6 +153,8 @@ def test_supervisor_reconnects_with_backoff():
     supervisor.step(now=100.5)
     assert controller.connect_calls == 1
 
+    supervisor.step(now=101.1)
+    supervisor._connect_thread.join(timeout=1.0)
     supervisor.step(now=101.1)
     assert controller.connect_calls == 2
     assert supervisor.next_attempt_at == 103.1
@@ -161,6 +165,8 @@ def test_supervisor_marks_connected_after_successful_reconnect():
     controller.connect_results = [True]
     supervisor = RobotConnectionSupervisor(controller, reconnect_delays=(1.0,))
 
+    supervisor.step(now=200.0)
+    supervisor._connect_thread.join(timeout=1.0)
     supervisor.step(now=200.0)
 
     assert controller.connect_calls == 1

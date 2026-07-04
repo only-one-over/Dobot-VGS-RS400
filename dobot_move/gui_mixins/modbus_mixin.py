@@ -1,5 +1,4 @@
 from ..qt_compat import QMessageBox, QTableWidgetItem
-from ..modbus_server import _CMD_DISPLAY, _MODE_DISPLAY
 
 
 class ModbusMixin:

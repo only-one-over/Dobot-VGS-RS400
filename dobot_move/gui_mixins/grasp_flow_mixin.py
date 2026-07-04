@@ -1,13 +1,109 @@
-import json
 import os
 
-from ..qt_compat import QMessageBox, QTableWidgetItem
+from ..qt_compat import QInputDialog, QMessageBox, QTableWidgetItem
 
 from ..config_manager import get_grasp_flow_file
+from ..flow_library import FlowLibrary, required_camera_types
 from ..flow_step_list import STATUS_COMPLETED, STATUS_FAILED, STATUS_RUNNING
 
 
 class GraspFlowMixin:
+    def _refresh_flow_selectors(self):
+        flows = self.flow_library.flows
+        self.main_control.set_main_flows(
+            flows,
+            self.flow_library.main_flow_id,
+        )
+        if hasattr(self, "edit_flow_combo"):
+            self.edit_flow_combo.blockSignals(True)
+            self.edit_flow_combo.clear()
+            selected_index = 0
+            for index, flow in enumerate(flows):
+                self.edit_flow_combo.addItem(flow["name"], flow["id"])
+                if flow["id"] == self.editing_flow_id:
+                    selected_index = index
+            self.edit_flow_combo.setCurrentIndex(selected_index)
+            self.edit_flow_combo.blockSignals(False)
+
+    def _on_main_flow_changed(self, flow_id):
+        try:
+            self.flow_library.set_main_flow(flow_id)
+            self.flow_library.save()
+            self._refresh_flow_selectors()
+            if hasattr(self, "_restart_startup_connection_check"):
+                self._restart_startup_connection_check()
+        except Exception as exc:
+            QMessageBox.critical(self, "主流程设置失败", str(exc))
+
+    def _on_edit_flow_changed(self, index):
+        flow_id = self.edit_flow_combo.itemData(index)
+        if flow_id:
+            self._select_editing_flow(str(flow_id), persist=True)
+
+    def _select_editing_flow(self, flow_id, persist=False):
+        flow = self.flow_library.get_flow(flow_id)
+        self.editing_flow_id = flow_id
+        self.grasp_flow_modules = flow["modules"]
+        self.selected_step_index = -1
+        self.flow_step_list.set_steps(self.grasp_flow_modules)
+        if persist:
+            self.flow_library.set_last_edited_flow(flow_id)
+            self.flow_library.save()
+        self._refresh_flow_selectors()
+
+    def create_flow(self):
+        default_name = f"流程 {len(self.flow_library.flows) + 1}"
+        name, ok = QInputDialog.getText(self, "新建流程", "流程名称:", text=default_name)
+        if not ok:
+            return
+        try:
+            flow = self.flow_library.create_flow(name)
+            self.flow_library.save()
+            self._select_editing_flow(flow["id"])
+        except Exception as exc:
+            QMessageBox.warning(self, "新建流程失败", str(exc))
+
+    def rename_flow(self):
+        flow = self.flow_library.get_flow(self.editing_flow_id)
+        name, ok = QInputDialog.getText(
+            self,
+            "重命名流程",
+            "流程名称:",
+            text=flow["name"],
+        )
+        if not ok:
+            return
+        try:
+            self.flow_library.rename_flow(flow["id"], name)
+            self.flow_library.save()
+            self._refresh_flow_selectors()
+        except Exception as exc:
+            QMessageBox.warning(self, "重命名失败", str(exc))
+
+    def duplicate_flow(self):
+        try:
+            flow = self.flow_library.duplicate_flow(self.editing_flow_id)
+            self.flow_library.save()
+            self._select_editing_flow(flow["id"])
+        except Exception as exc:
+            QMessageBox.warning(self, "复制流程失败", str(exc))
+
+    def delete_flow(self):
+        flow = self.flow_library.get_flow(self.editing_flow_id)
+        answer = QMessageBox.question(
+            self,
+            "删除流程",
+            f"确定删除“{flow['name']}”吗？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.flow_library.delete_flow(flow["id"])
+            self.flow_library.save()
+            self._select_editing_flow(self.flow_library.last_edited_flow_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "删除流程失败", str(exc))
+
     @staticmethod
     def _default_force_guard(enabled=False, threshold_n=5.0):
         return {
@@ -45,8 +141,23 @@ class GraspFlowMixin:
                     params.pop(legacy_key, None)
 
     def run_grasping_task(self):
-        if self.vision_d435i is None and self.vision_d405 is None:
-            QMessageBox.warning(self, "警告", "相机未连接，请先连接至少一台相机")
+        main_flow = self.flow_library.get_main_flow()
+        required = required_camera_types(main_flow["modules"])
+        missing = [
+            camera_type
+            for camera_type in sorted(required)
+            if (
+                camera_type == "D435i" and self.vision_d435i is None
+            ) or (
+                camera_type == "D405" and self.vision_d405 is None
+            )
+        ]
+        if missing:
+            QMessageBox.warning(
+                self,
+                "警告",
+                f"主流程需要的相机未连接: {', '.join(missing)}",
+            )
             return
         if not self.controller.is_connected:
             QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
@@ -54,7 +165,7 @@ class GraspFlowMixin:
         if not self.controller.is_enabled and not self.controller.enable_robot():
             QMessageBox.critical(self, "错误", "机器人未使能，任务退出")
             return
-        self.run_grasp_flow()
+        self.run_grasp_flow(flow_id=main_flow["id"])
 
     def _stop_camera_test_before_flow(self, modbus_triggered=False):
         worker = getattr(self, "cam_test_worker", None)
@@ -476,12 +587,17 @@ class GraspFlowMixin:
             return
 
         self._normalize_flow_modules()
-        file_path = get_grasp_flow_file()
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(self.grasp_flow_modules, f, indent=2, ensure_ascii=False)
+            self.flow_library.get_flow(self.editing_flow_id)[
+                "modules"
+            ] = self.grasp_flow_modules
+            self.flow_library.save()
             self.view_current_grasp_flow()
-            QMessageBox.information(self, "成功", f"抓取流程已保存到: {file_path}")
+            QMessageBox.information(
+                self,
+                "成功",
+                f"流程“{self.flow_library.get_flow(self.editing_flow_id)['name']}”已保存",
+            )
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存抓取流程时出错: {e}")
 
@@ -492,15 +608,19 @@ class GraspFlowMixin:
             return
 
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                self.grasp_flow_modules = json.load(f)
+            self.flow_library = FlowLibrary.load(file_path)
+            self.editing_flow_id = self.flow_library.last_edited_flow_id
+            self.grasp_flow_modules = self.flow_library.get_flow(
+                self.editing_flow_id
+            )["modules"]
             self._normalize_flow_modules()
             self.view_current_grasp_flow()
+            self._refresh_flow_selectors()
             QMessageBox.information(self, "成功", f"抓取流程已从: {file_path} 加载")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载抓取流程时出错: {e}")
 
-    def run_grasp_flow(self, modbus_triggered=False):
+    def run_grasp_flow(self, modbus_triggered=False, flow_id=None):
         if self._flow_running:
             self.statusBar().showMessage("流程已在运行中")
             return False
@@ -511,11 +631,13 @@ class GraspFlowMixin:
         if hasattr(self, "_refresh_action_states"):
             self._refresh_action_states()
         self._is_paused_ref = [False]
-        self._normalize_flow_modules()
+        selected_flow_id = flow_id or self.editing_flow_id
+        selected_flow = self.flow_library.get_flow(selected_flow_id)
+        modules = self.flow_library.snapshot_modules(selected_flow_id)
 
         from ..workers import validate_grasp_flow_modules
 
-        errors = validate_grasp_flow_modules(self.grasp_flow_modules)
+        errors = validate_grasp_flow_modules(modules)
         if errors:
             self._flow_running = False
             error_text = "\n".join(errors)
@@ -531,11 +653,14 @@ class GraspFlowMixin:
         from ..workers import FlowThread
 
         self._flow_started_by_modbus = bool(modbus_triggered)
+        self._active_flow_id = selected_flow_id
+        self._active_flow_name = selected_flow["name"]
+        self._active_flow_modules = modules
         self._flow_thread = FlowThread(
             self.controller,
             self.vision_d435i,
             self.vision_d405,
-            self.grasp_flow_modules,
+            modules,
             self._is_paused_ref,
             self,
             camera_test_workers=self._get_flow_camera_test_workers(),
@@ -557,7 +682,10 @@ class GraspFlowMixin:
     def _on_flow_module_progress(self, current, total, name):
         self.statusBar().showMessage(f"执行模块 {current}/{total}: {name}")
         idx = current - 1
-        if 0 <= idx < len(self.grasp_flow_modules):
+        if (
+            self._active_flow_id == self.editing_flow_id
+            and 0 <= idx < len(self.grasp_flow_modules)
+        ):
             for i in range(idx):
                 self.flow_step_list.set_step_status(i, STATUS_COMPLETED)
             self.flow_step_list.set_step_status(idx, STATUS_RUNNING)
@@ -570,12 +698,18 @@ class GraspFlowMixin:
         self.is_paused = False
         if hasattr(self, "_refresh_action_states"):
             self._refresh_action_states()
-        for i in range(len(self.grasp_flow_modules)):
-            self.flow_step_list.set_step_status(i, STATUS_COMPLETED if success else STATUS_FAILED)
+        if self._active_flow_id == self.editing_flow_id:
+            for i in range(len(self.grasp_flow_modules)):
+                self.flow_step_list.set_step_status(
+                    i,
+                    STATUS_COMPLETED if success else STATUS_FAILED,
+                )
         if success:
             if modbus_triggered:
                 self.controller.mark_modbus_program_finished(True)
-                self.statusBar().showMessage("Modbus触发的运动编辑流程执行完成")
+                self.statusBar().showMessage(
+                    f"Modbus触发的主流程“{self._active_flow_name}”执行完成"
+                )
             else:
                 QMessageBox.information(self, "成功", "抓取流程执行完成")
         else:
@@ -584,12 +718,15 @@ class GraspFlowMixin:
                 self._refresh_alarm_table()
             if modbus_triggered:
                 self.controller.mark_modbus_program_finished(False)
-                self.statusBar().showMessage("Modbus触发的运动编辑流程执行失败")
+                self.statusBar().showMessage(
+                    f"Modbus触发的主流程“{self._active_flow_name}”执行失败"
+                )
             else:
                 QMessageBox.warning(self, "失败", "抓取流程执行失败，请检查状态栏信息")
 
     def _on_steps_reordered(self, modules):
         self.grasp_flow_modules = modules
+        self.flow_library.get_flow(self.editing_flow_id)["modules"] = modules
         self._normalize_flow_modules()
 
     # -- 连续相对路径 segment table helpers --

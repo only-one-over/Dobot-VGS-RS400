@@ -4,7 +4,6 @@
 
 from PySide6.QtCore import (
     QByteArray,
-    QEvent,
     QMimeData,
     QObject,
     Qt,

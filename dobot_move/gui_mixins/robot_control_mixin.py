@@ -1,6 +1,5 @@
-from ..qt_compat import QMessageBox, QTimer
+from ..qt_compat import QMessageBox
 
-from ..config_manager import ConfigService
 from ..workers import RobotCmdThread
 
 
@@ -76,15 +75,7 @@ class RobotControlMixin:
         if self.controller.is_connected:
             QMessageBox.information(self, "提示", "机器人已连接")
             return
-
-        ip = self.ip_input.text().strip()
-        if not ip:
-            QMessageBox.warning(self, "警告", "请输入机器人IP地址")
-            return
-
-        self.controller.set_robot_ip(ip)
-        ConfigService.instance().set_ip('robot_ip', ip)
-        self._run_cmd_thread("连接", self.controller.connect)
+        self._request_device_connection("robot", manual=True)
 
     def set_collision_level(self):
         if not self.controller.is_connected:
@@ -132,40 +123,3 @@ class RobotControlMixin:
             QMessageBox.information(self, "当前位置", f"当前位置:\n{current_pose}")
         else:
             QMessageBox.critical(self, "错误", "获取位置失败")
-
-    def start_monitor_threads(self):
-        self._pose_monitor_timer = QTimer()
-        self._pose_monitor_timer.timeout.connect(self._update_pose_display)
-        self._pose_monitor_timer.start(200)
-
-    def _update_pose_display(self):
-        data = self.controller.get_feed_data()
-        if data is not None:
-            try:
-                tool_vector = data.get("ToolVectorActual")
-                if tool_vector is not None and len(tool_vector) > 0:
-                    vals = tool_vector[0]
-                    if len(vals) >= 6:
-                        self.coord_x_label.setText(f"X: {float(vals[0]):.2f}")
-                        self.coord_y_label.setText(f"Y: {float(vals[1]):.2f}")
-                        self.coord_z_label.setText(f"Z: {float(vals[2]):.2f}")
-                        self.coord_rx_label.setText(f"Rx: {float(vals[3]):.2f}")
-                        self.coord_ry_label.setText(f"Ry: {float(vals[4]):.2f}")
-                        self.coord_rz_label.setText(f"Rz: {float(vals[5]):.2f}")
-            except Exception:
-                pass
-            try:
-                q_actual = data.get("QActual")
-                if q_actual is not None and len(q_actual) > 0:
-                    vals = q_actual[0]
-                    if len(vals) >= 4:
-                        self.axis_j1_label.setText(f"J1: {float(vals[0]):.2f}")
-                        self.axis_j2_label.setText(f"J2: {float(vals[1]):.2f}")
-                        self.axis_j3_label.setText(f"J3: {float(vals[2]):.2f}")
-                        self.axis_j4_label.setText(f"J4: {float(vals[3]):.2f}")
-            except Exception:
-                pass
-
-    def stop_monitor_threads(self):
-        if hasattr(self, '_pose_monitor_timer') and self._pose_monitor_timer:
-            self._pose_monitor_timer.stop()

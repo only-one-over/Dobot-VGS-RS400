@@ -53,7 +53,9 @@ Get-Content .\logs\runtime_watchdog.log -Tail 100
 | `startup_connection.deadline_at_monotonic` | 本轮启动连接截止时间 |
 | `startup_connection.required_cameras` | 主流程实际引用的相机 |
 | `startup_connection.missing_devices` | 当前缺失的机器人或相机 |
-| `startup_connection.fault_latched/fault_code` | 启动连接故障锁及 `111/112` |
+| `startup_connection.deadline_elapsed` | 5 秒启动观察窗口是否结束 |
+| `startup_connection.fault_latched/fault_code` | 兼容字段，固定为 `false/null` |
+| `startup_connection.retrying` | 是否有机器人或相机连接任务正在后台执行 |
 | `robot.feedback_age_s` | 距离最近反馈包的秒数 |
 | `robot.feedback_thread_alive` | 30004 反馈线程是否存活 |
 | `modbus.thread_alive` | Modbus 服务线程是否存活 |
@@ -65,7 +67,7 @@ Get-Content .\logs\runtime_watchdog.log -Tail 100
 ## Modbus 协议
 
 - `40001=0`：立即停止当前机器人/流程运动，并保持 `40001=0`。
-- 程序未运行且无启动故障锁时：
+- 程序未运行时：
   - 写 `40001=1`：移动到 `initial_point`；运动中写 `4`；完成后保持 `2`。
   - 写 `40001=3`：运行保存的运动流程。
 - 程序普通运行阶段保持 `40001=4`，只接受 `40001=0`；写入 `1` 或 `3` 会被忽略。
@@ -74,9 +76,10 @@ Get-Content .\logs\runtime_watchdog.log -Tail 100
   - 写 `40001=0`：停止整个流程。
   - 未写入 `1` 时，达到模块设置的最长等待时间后仍正常进入下一步。
 - 延时结束且流程尚未结束时恢复 `40001=4`；整个流程成功完成后保持 `40001=5`。
-- 机器人未连接、报警、急停未解除、自动使能失败或反馈断流时，不执行运动，写机器人错误状态。
-- 启动后默认 5 秒内机器人未连接写 `111`；机器人已连接但主流程需要的相机未通过初始化和抓帧预检写 `112`；两者同时失败优先 `111`。
-- `111/112` 锁定后只接受 `40001=0`。后台仍低频重连，但设备迟到恢复不会自动清除错误；PLC 写 `0` 时重新检查，全部就绪才回到 `0`，否则重新发布当前错误码。
+- 启动后 5 秒仅用于观察机器人和主流程相机状态；未就绪不报码、不锁定，后台继续低频重连。
+- 写 `40001=3` 时只读检查机器人连接、反馈缓存和主流程所需相机；缺少设备立即写 `110`，不等待连接或抓帧。
+- `110` 只拒绝本次流程启动。设备恢复后 PLC 可直接再次写 `3`，无需先写 `0`。
+- 流程运行中检测到机器人反馈或相机采集断线时立即停止并写 `110`；后台重连后不自动续跑。
 
 断线期间收到的运动命令不会排队，避免机器人重连后执行过期动作。
 

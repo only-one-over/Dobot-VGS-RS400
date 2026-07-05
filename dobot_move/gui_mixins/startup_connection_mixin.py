@@ -20,6 +20,7 @@ class StartupConnectionMixin:
         self._device_connect_tasks = {}
         self._device_connect_manual = {}
         self._device_next_attempt = {}
+        self._reconnect_requested_devices = set()
         self._startup_connection = StartupConnectionState(
             timeout_s=float(runtime.get("startup_connect_timeout_s", 5.0))
         )
@@ -55,19 +56,17 @@ class StartupConnectionMixin:
 
     def _device_is_connected(self, device_name):
         if device_name == "robot":
-            return bool(self.controller.is_connected)
+            if (
+                not self.controller.is_connected
+                or self.controller.dashboard is None
+            ):
+                return False
+            try:
+                return self.controller.get_feedback_health().get("health") == "ok"
+            except Exception:
+                return False
         vision = self.vision_d405 if device_name == "D405" else self.vision_d435i
         return bool(vision is not None and getattr(vision, "is_available", True))
-
-    def _current_startup_connection_error(self):
-        self._startup_connection.update(
-            robot_connected=bool(self.controller.is_connected),
-            camera_connected={
-                "D435i": self._device_is_connected("D435i"),
-                "D405": self._device_is_connected("D405"),
-            },
-        )
-        return self._startup_connection.recheck_fault()
 
     def _request_device_connection(self, device_name, manual=False):
         if getattr(self, "_startup_connection_closing", False):
@@ -90,13 +89,32 @@ class StartupConnectionMixin:
             ConfigService.instance().set_ip("robot_ip", ip)
 
             def connector():
+                if (
+                    self.controller.is_connected
+                    or self.controller.dashboard is not None
+                    or self.controller.feed_thread is not None
+                ):
+                    self.controller.close_robot_transport()
                 connected = self.controller.connect()
                 if connected and self._startup_connection_closing:
                     self.controller.disconnect()
                     return None
                 return self.controller if connected else None
         else:
+            stale_vision = (
+                self.vision_d405
+                if device_name == "D405"
+                else self.vision_d435i
+            )
+            if stale_vision is not None:
+                if device_name == "D405":
+                    self.vision_d405 = None
+                else:
+                    self.vision_d435i = None
+
             def connector():
+                if stale_vision is not None:
+                    stale_vision.close()
                 vision = self._create_camera_system(device_name)
                 if self._startup_connection_closing:
                     vision.close()
@@ -176,7 +194,7 @@ class StartupConnectionMixin:
 
     def _update_startup_connection_state(self):
         self._startup_connection.update(
-            robot_connected=bool(self.controller.is_connected),
+            robot_connected=self._device_is_connected("robot"),
             camera_connected={
                 "D435i": self._device_is_connected("D435i"),
                 "D405": self._device_is_connected("D405"),
@@ -185,26 +203,15 @@ class StartupConnectionMixin:
 
     def _on_startup_connection_deadline(self):
         self._update_startup_connection_state()
-        error_code = self._startup_connection.latch_if_due()
-        if error_code is None:
-            return
-        self.controller.set_startup_connection_fault(
-            error_code,
-            ready_checker=self._current_startup_connection_error,
-        )
         snapshot = self._startup_connection.snapshot()
-        self.controller.record_alarm(
-            "启动自动连接",
-            str(error_code),
-            "故障",
-            (
-                f"{self._startup_connection.timeout_s:g}秒内设备未就绪: "
-                f"{', '.join(snapshot['missing_devices'])}"
-            ),
-            "检查连接；恢复后由PLC写40001=0复查",
+        if not snapshot["missing_devices"]:
+            return
+        logger.warning(
+            "启动观察窗口结束，缺失设备=%s；后台将继续重连",
+            snapshot["missing_devices"],
         )
         self.statusBar().showMessage(
-            f"启动连接超时，40001={error_code}，等待设备恢复及PLC复位"
+            "启动连接观察结束，后台继续尝试缺失设备，不影响界面和Modbus"
         )
 
     def _retry_startup_connections(self):
@@ -212,11 +219,43 @@ class StartupConnectionMixin:
             return
         self._update_startup_connection_state()
         now = time.monotonic()
-        devices = {"robot", *self._startup_connection.required_cameras}
+        active_cameras = required_camera_types(
+            getattr(self, "_active_flow_modules", [])
+        )
+        devices = {
+            "robot",
+            *self._startup_connection.required_cameras,
+            *active_cameras,
+            *self._reconnect_requested_devices,
+        }
+        missing = [
+            device_name
+            for device_name in devices
+            if not self._device_is_connected(device_name)
+        ]
+        if missing and getattr(self, "_flow_running", False):
+            self._reconnect_requested_devices.update(missing)
+            reason = f"流程运行中设备断线: {', '.join(sorted(missing))}"
+            self.controller.record_alarm(
+                "流程设备断线",
+                "DEVICE_DISCONNECTED",
+                "故障",
+                reason,
+            )
+            self.controller.abort_active_flow_for_disconnect(reason)
+            return
         for device_name in devices:
             if self._device_is_connected(device_name):
+                self._reconnect_requested_devices.discard(device_name)
                 continue
             if now >= self._device_next_attempt.get(device_name, 0.0):
+                self._request_device_connection(device_name)
+
+    def _request_missing_devices_background(self, missing_devices):
+        for device_name in missing_devices:
+            if device_name in ("robot", "D435i", "D405"):
+                self._reconnect_requested_devices.add(device_name)
+                self._device_next_attempt[device_name] = 0.0
                 self._request_device_connection(device_name)
 
     def _shutdown_startup_connections(self):

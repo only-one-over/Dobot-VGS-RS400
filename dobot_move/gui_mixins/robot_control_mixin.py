@@ -1,6 +1,10 @@
+import logging
+
 from ..qt_compat import QMessageBox
 
 from ..workers import RobotCmdThread
+
+logger = logging.getLogger(__name__)
 
 
 class RobotControlMixin:
@@ -85,33 +89,53 @@ class RobotControlMixin:
         level = self.collision_combo.currentIndex()
         self._run_cmd_thread("设置碰撞等级", lambda: self.controller.set_collision_level(level))
 
-    def _run_cmd_thread(self, cmd_name, cmd_func):
+    def _run_cmd_thread(
+        self,
+        cmd_name,
+        cmd_func,
+        *,
+        on_success=None,
+        show_result=True,
+    ):
         if getattr(self, "_cmd_running", False):
             self.statusBar().showMessage("已有机器人命令正在执行，请稍候")
-            return
+            return False
         self._cmd_running = True
         if hasattr(self, "_refresh_action_states"):
             self._refresh_action_states()
         self.statusBar().showMessage(f"正在{cmd_name}...")
+        self._cmd_on_success = on_success
+        self._cmd_show_result = bool(show_result)
         self._cmd_thread = RobotCmdThread(cmd_name, cmd_func, self)
         self._cmd_thread.cmd_finished.connect(self._on_cmd_finished)
         self._cmd_thread.finished.connect(self._cmd_thread.deleteLater)
         self._cmd_thread.start()
+        return True
 
     def _on_cmd_finished(self, cmd_name, success):
+        on_success = getattr(self, "_cmd_on_success", None)
+        show_result = getattr(self, "_cmd_show_result", True)
+        self._cmd_on_success = None
+        self._cmd_show_result = True
         self._cmd_running = False
         self._cmd_thread = None
         if success:
-            QMessageBox.information(self, "成功", f"{cmd_name}成功")
+            if show_result:
+                QMessageBox.information(self, "成功", f"{cmd_name}成功")
         else:
             error_msg = self.controller.last_error if hasattr(self.controller, 'last_error') else ""
-            if error_msg:
+            if error_msg and show_result:
                 QMessageBox.critical(self, "错误", f"{cmd_name}失败\n\n原因: {error_msg}\n\n建议检查:\n1. 机器人IP地址是否正确\n2. 电脑和机器人是否在同一网段\n3. 机器人是否已启用TCP/IP控制模式\n4. 防火墙是否阻止了端口29999")
-            else:
+            elif show_result:
                 QMessageBox.critical(self, "错误", f"{cmd_name}失败")
         self.statusBar().showMessage(f"{cmd_name}{'成功' if success else '失败'}")
         if hasattr(self, "_refresh_action_states"):
             self._refresh_action_states()
+        if success and on_success is not None:
+            try:
+                on_success()
+            except Exception:
+                logger.exception("%s成功后的回调执行失败", cmd_name)
 
     def get_current_position(self):
         if not self.controller.is_connected:

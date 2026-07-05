@@ -31,7 +31,8 @@ from .config_manager import (
     get_runtime_config,
 )
 from .flow_library import FlowLibrary, required_camera_types
-from .modbus_server import STATUS_CAMERA_ERR, STATUS_HOOK_ERR, STATUS_ROBOT_ERR
+from .flow_readiness import check_flow_readiness
+from .modbus_server import STATUS_HOOK_ERR, STATUS_ROBOT_ERR
 from .robot_controller import DobotController
 from .runtime_resilience import (
     RuntimeState,
@@ -167,65 +168,34 @@ class RobotConnectionSupervisor:
         if flow is None or self._motion_abort_issued:
             return
         self._motion_abort_issued = True
-        ctx = getattr(flow, "_ctx", None)
-        if ctx is not None:
-            ctx.stop_event.set()
-        try:
-            if self.controller.dashboard:
-                self.controller.dashboard.Stop()
-        except Exception:
-            logger.exception("feedback failure Stop() failed")
+        self.controller.abort_active_flow_for_disconnect(reason)
         self.controller.record_alarm(
             "Runtime反馈",
             "FEEDBACK_DISCONNECTED",
             "故障",
             reason,
-            "检查机器人网络和30004反馈连接，重新复位后再启动流程",
+            "检查机器人网络和30004反馈连接，设备恢复后重新触发流程",
         )
-        self.controller._write_modbus_status(STATUS_ROBOT_ERR)
 
     def close_robot_connection(self) -> None:
         """Close robot sockets but keep Modbus service alive."""
         try:
-            self.controller.stop_feedback()
+            self.controller.close_robot_transport()
         except Exception as e:
-            logger.warning("stop_feedback during reconnect failed: %s", e)
-        try:
-            if self.controller.dashboard:
-                self.controller.dashboard.close()
-        except Exception as e:
-            logger.warning("dashboard close during reconnect failed: %s", e)
-        self.controller.dashboard = None
-        self.controller.is_connected = False
-        self.controller.is_enabled = False
-        self.controller._last_speed_factor = None
-
-    def _restart_feedback_if_thread_dead(self) -> bool:
-        thread = getattr(self.controller, "feed_thread", None)
-        if thread is None or thread.is_alive():
-            return False
-        logger.warning("feedback thread stopped; restarting feedback connection")
-        try:
-            self.controller.stop_feedback()
-            self.controller.start_feedback()
-            self.last_error = "feedback thread restarted"
-            self._set_state(RobotConnectionState.DEGRADED)
-            return True
-        except Exception as e:
-            self.last_error = f"feedback restart failed: {e}"
-            logger.warning(self.last_error)
-            self.close_robot_connection()
-            return False
+            logger.warning("close robot transport failed: %s", e)
 
     def _connect_worker(self) -> None:
         ok = False
         error = ""
         try:
+            self.close_robot_connection()
             ok = bool(self.controller.connect())
             error = "" if ok else (self.controller.last_error or "connect failed")
         except Exception as exc:
             error = str(exc)
             logger.exception("robot background connect failed")
+        if not ok:
+            self.close_robot_connection()
         if self._shutting_down and ok:
             self.close_robot_connection()
             ok = False
@@ -246,7 +216,6 @@ class RobotConnectionSupervisor:
             self.connected_since = now
             self._set_state(RobotConnectionState.CONNECTED)
         else:
-            self.close_robot_connection()
             self._schedule_reconnect(now, error or "connect failed")
         return True
 
@@ -274,12 +243,17 @@ class RobotConnectionSupervisor:
             if not self.controller.is_connected:
                 return self.request_connect(now)
 
-            self._restart_feedback_if_thread_dead()
+            thread = getattr(self.controller, "feed_thread", None)
+            if thread is not None and not thread.is_alive():
+                self._abort_active_flow("机器人反馈线程退出，当前流程已停止")
+                self.controller.is_connected = False
+                self._schedule_reconnect(now, "feedback thread stopped")
+                return self.state
             health = self.controller.get_feedback_health(max_age=self.feedback_max_age)
             health_state = health.get("health")
             if health_state == "disconnected":
                 self._abort_active_flow("流程运行期间机器人反馈断流，已先停止运动")
-                self.close_robot_connection()
+                self.controller.is_connected = False
                 self._schedule_reconnect(now, "feedback disconnected")
             elif health_state == "stale":
                 self.last_error = "feedback stale"
@@ -297,7 +271,7 @@ class RobotConnectionSupervisor:
             return self.state
         except Exception as e:
             logger.exception("robot supervisor step failed")
-            self.close_robot_connection()
+            self.controller.is_connected = False
             self._schedule_reconnect(now, str(e))
             return self.state
 
@@ -336,6 +310,7 @@ class RuntimeProgramRunner:
         self.orphaned_flow = False
         self.failure_latched = False
         self._closing = False
+        self.active_required_cameras: set[str] = set()
 
     def __call__(self) -> bool:
         with self._lock:
@@ -359,6 +334,15 @@ class RuntimeProgramRunner:
 
     def _required_camera_types(self, modules: list[dict[str, Any]]) -> set[str]:
         return required_camera_types(modules)
+
+    def check_main_flow_readiness(self):
+        modules = self._load_modules()
+        return check_flow_readiness(
+            self.controller,
+            self.vision_d435i,
+            self.vision_d405,
+            modules,
+        )
 
     def _detect_camera_serials(self) -> dict[str, str]:
         if self._camera_serials is not None:
@@ -451,12 +435,6 @@ class RuntimeProgramRunner:
             time.sleep(0.05)
         return False
 
-    def _ensure_required_cameras(self, modules: list[dict[str, Any]]) -> bool:
-        ok = True
-        for camera_type in sorted(self._required_camera_types(modules)):
-            ok = self._ensure_camera(camera_type) and ok
-        return ok
-
     def close_cameras(self) -> None:
         self._closing = True
         for attr in ("vision_d435i", "vision_d405"):
@@ -526,11 +504,23 @@ class RuntimeProgramRunner:
                 self.controller.record_alarm("Runtime流程", "VALIDATION_FAILED", "故障", message)
                 return
 
-            if not self._ensure_required_cameras(modules):
-                failure_status = STATUS_CAMERA_ERR
+            readiness = check_flow_readiness(
+                self.controller,
+                self.vision_d435i,
+                self.vision_d405,
+                modules,
+            )
+            if not readiness.ok:
+                self.controller.record_alarm(
+                    "Runtime流程",
+                    "DEVICE_NOT_READY",
+                    "故障",
+                    readiness.message,
+                )
                 return
 
             self.current_flow_id = uuid.uuid4().hex
+            self.active_required_cameras = self._required_camera_types(modules)
             self.current_module_index = None
             self.current_module_name = None
             self.last_progress_time = time.monotonic()
@@ -606,6 +596,7 @@ class RuntimeProgramRunner:
             logger.exception("runtime flow runner failed")
             self.controller.record_alarm("Runtime流程", "EXCEPTION", "故障", "后台流程执行异常", raw=e)
         finally:
+            self.active_required_cameras = set()
             if success:
                 self.failure_latched = False
                 self._transition(
@@ -688,6 +679,7 @@ class DobotRuntimeAgent:
         self._startup_main_flow_name: Optional[str] = None
         self._startup_camera_threads: dict[str, threading.Thread] = {}
         self._startup_camera_next_attempt: dict[str, float] = {}
+        self._flow_device_abort_reported = False
 
     def _refresh_startup_requirements(self, force=False) -> None:
         library = FlowLibrary.load(get_grasp_flow_file())
@@ -724,12 +716,16 @@ class DobotRuntimeAgent:
             ),
         }
 
-    def _current_startup_connection_error(self):
-        self.startup_connection.update(
-            robot_connected=bool(self.controller.is_connected),
-            camera_connected=self._camera_connection_status(),
-        )
-        return self.startup_connection.recheck_fault()
+    def _robot_connection_ready(self) -> bool:
+        if (
+            not self.controller.is_connected
+            or self.controller.dashboard is None
+        ):
+            return False
+        try:
+            return self.controller.get_feedback_health().get("health") == "ok"
+        except Exception:
+            return False
 
     def _camera_connect_worker(self, camera_type: str) -> None:
         try:
@@ -744,7 +740,33 @@ class DobotRuntimeAgent:
     def _start_required_camera_connections(self) -> None:
         now = time.monotonic()
         status = self._camera_connection_status()
-        for camera_type in self.startup_connection.required_cameras:
+        flow_running = self.program_runner.snapshot()["running"]
+        required_cameras = (
+            self.program_runner.active_required_cameras
+            if flow_running
+            else self.startup_connection.required_cameras
+        )
+        missing = [
+            camera_type
+            for camera_type in required_cameras
+            if not status.get(camera_type)
+        ]
+        if flow_running and missing:
+            if not self._flow_device_abort_reported:
+                self._flow_device_abort_reported = True
+                reason = f"流程运行中相机断线: {', '.join(sorted(missing))}"
+                self.controller.abort_active_flow_for_disconnect(reason)
+                self.controller.record_alarm(
+                    "Runtime相机",
+                    "CAMERA_DISCONNECTED",
+                    "故障",
+                    reason,
+                    "后台继续重连，恢复后需重新触发流程",
+                )
+            return
+        if not flow_running:
+            self._flow_device_abort_reported = False
+        for camera_type in required_cameras:
             if status.get(camera_type):
                 continue
             thread = self._startup_camera_threads.get(camera_type)
@@ -768,26 +790,9 @@ class DobotRuntimeAgent:
             logger.exception("failed to refresh startup main-flow requirements")
         self._start_required_camera_connections()
         self.startup_connection.update(
-            robot_connected=bool(self.controller.is_connected),
+            robot_connected=self._robot_connection_ready(),
             camera_connected=self._camera_connection_status(),
         )
-        was_latched = self.startup_connection.fault_code is not None
-        error_code = self.startup_connection.latch_if_due()
-        if error_code is None:
-            return
-        self.controller.set_startup_connection_fault(
-            error_code,
-            ready_checker=self._current_startup_connection_error,
-        )
-        if not was_latched:
-            snapshot = self.startup_connection.snapshot()
-            self.controller.record_alarm(
-                "启动自动连接",
-                str(error_code),
-                "故障",
-                f"启动连接超时，缺失设备: {', '.join(snapshot['missing_devices'])}",
-                "检查机器人、相机、模型与网络；设备恢复后由PLC写40001=0复查",
-            )
 
     def validate_startup_inputs(self) -> list[str]:
         errors = []
@@ -888,10 +893,15 @@ class DobotRuntimeAgent:
                 **self.startup_connection.snapshot(),
                 "main_flow_id": self._startup_main_flow_id,
                 "main_flow_name": self._startup_main_flow_name,
-                "controller_fault_code": (
-                    self.controller.get_startup_connection_fault()
-                    if hasattr(self.controller, "get_startup_connection_fault")
-                    else None
+                "fault_latched": False,
+                "fault_code": None,
+                "controller_fault_code": None,
+                "retrying": (
+                    self.supervisor.state == RobotConnectionState.CONNECTING
+                    or any(
+                        thread.is_alive()
+                        for thread in self._startup_camera_threads.values()
+                    )
                 ),
             },
             "process": metrics,
@@ -942,7 +952,10 @@ class DobotRuntimeAgent:
                 last_error=self.last_error,
             )
         self._state_initialized = True
-        self.controller.set_modbus_program_runner(self.program_runner)
+        self.controller.set_modbus_program_runner(
+            self.program_runner,
+            readiness_checker=self.program_runner.check_main_flow_readiness,
+        )
         self.ensure_modbus_running()
         self.controller.set_runtime_recovery_required(
             self.recovery_required,

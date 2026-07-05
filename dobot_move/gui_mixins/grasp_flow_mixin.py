@@ -3,8 +3,10 @@ import os
 from ..qt_compat import QInputDialog, QMessageBox, QTableWidgetItem
 
 from ..config_manager import get_grasp_flow_file
-from ..flow_library import FlowLibrary, required_camera_types
+from ..flow_library import FlowLibrary
+from ..flow_readiness import check_flow_readiness
 from ..flow_step_list import STATUS_COMPLETED, STATUS_FAILED, STATUS_RUNNING
+from ..modbus_server import STATUS_HOOK_ERR
 
 
 class GraspFlowMixin:
@@ -142,30 +144,39 @@ class GraspFlowMixin:
 
     def run_grasping_task(self):
         main_flow = self.flow_library.get_main_flow()
-        required = required_camera_types(main_flow["modules"])
-        missing = [
-            camera_type
-            for camera_type in sorted(required)
-            if (
-                camera_type == "D435i" and self.vision_d435i is None
-            ) or (
-                camera_type == "D405" and self.vision_d405 is None
-            )
-        ]
-        if missing:
-            QMessageBox.warning(
-                self,
-                "警告",
-                f"主流程需要的相机未连接: {', '.join(missing)}",
-            )
-            return
-        if not self.controller.is_connected:
-            QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
-            return
-        if not self.controller.is_enabled and not self.controller.enable_robot():
-            QMessageBox.critical(self, "错误", "机器人未使能，任务退出")
-            return
         self.run_grasp_flow(flow_id=main_flow["id"])
+
+    def check_main_flow_readiness(self):
+        main_flow = self.flow_library.get_main_flow()
+        return check_flow_readiness(
+            self.controller,
+            self.vision_d435i,
+            self.vision_d405,
+            self.flow_library.snapshot_modules(main_flow["id"]),
+        )
+
+    def _check_modules_readiness(self, modules):
+        return check_flow_readiness(
+            self.controller,
+            self.vision_d435i,
+            self.vision_d405,
+            modules,
+        )
+
+    def _handle_flow_readiness_failure(self, result, modbus_triggered):
+        if hasattr(self, "_request_missing_devices_background"):
+            self._request_missing_devices_background(result.missing_devices)
+        if modbus_triggered:
+            self.controller.record_alarm(
+                "Modbus执行流程",
+                "DEVICE_NOT_READY",
+                "故障",
+                result.message,
+            )
+            self.controller._write_modbus_status(STATUS_HOOK_ERR)
+            self.statusBar().showMessage(f"Modbus流程未启动: {result.message}")
+        else:
+            QMessageBox.warning(self, "设备未就绪", result.message)
 
     def _stop_camera_test_before_flow(self, modbus_triggered=False):
         worker = getattr(self, "cam_test_worker", None)
@@ -624,13 +635,6 @@ class GraspFlowMixin:
         if self._flow_running:
             self.statusBar().showMessage("流程已在运行中")
             return False
-        if not self._stop_camera_test_before_flow(modbus_triggered=modbus_triggered):
-            return False
-        self._flow_running = True
-        self.is_paused = False
-        if hasattr(self, "_refresh_action_states"):
-            self._refresh_action_states()
-        self._is_paused_ref = [False]
         selected_flow_id = flow_id or self.editing_flow_id
         selected_flow = self.flow_library.get_flow(selected_flow_id)
         modules = self.flow_library.snapshot_modules(selected_flow_id)
@@ -639,7 +643,6 @@ class GraspFlowMixin:
 
         errors = validate_grasp_flow_modules(modules)
         if errors:
-            self._flow_running = False
             error_text = "\n".join(errors)
             if modbus_triggered:
                 self.statusBar().showMessage(f"Modbus流程校验失败: {error_text}")
@@ -650,11 +653,58 @@ class GraspFlowMixin:
                 self._refresh_action_states()
             return False
 
+        readiness = self._check_modules_readiness(modules)
+        if not readiness.ok:
+            self._handle_flow_readiness_failure(readiness, modbus_triggered)
+            return False
+
+        if not modbus_triggered and not self.controller.is_enabled:
+            return self._run_cmd_thread(
+                "流程准备",
+                lambda: self.controller.ensure_robot_ready_for_motion(auto_enable=True),
+                on_success=lambda: self._start_grasp_flow_snapshot(
+                    selected_flow_id,
+                    selected_flow["name"],
+                    modules,
+                    False,
+                ),
+                show_result=False,
+            )
+
+        return self._start_grasp_flow_snapshot(
+            selected_flow_id,
+            selected_flow["name"],
+            modules,
+            modbus_triggered,
+        )
+
+    def _start_grasp_flow_snapshot(
+        self,
+        selected_flow_id,
+        selected_flow_name,
+        modules,
+        modbus_triggered,
+    ):
+        if self._flow_running:
+            return False
+        readiness = self._check_modules_readiness(modules)
+        if not readiness.ok:
+            self._handle_flow_readiness_failure(readiness, modbus_triggered)
+            return False
+        if not self._stop_camera_test_before_flow(modbus_triggered=modbus_triggered):
+            return False
+
+        self._flow_running = True
+        self.is_paused = False
+        self._is_paused_ref = [False]
+        if hasattr(self, "_refresh_action_states"):
+            self._refresh_action_states()
+
         from ..workers import FlowThread
 
         self._flow_started_by_modbus = bool(modbus_triggered)
         self._active_flow_id = selected_flow_id
-        self._active_flow_name = selected_flow["name"]
+        self._active_flow_name = selected_flow_name
         self._active_flow_modules = modules
         self._flow_thread = FlowThread(
             self.controller,

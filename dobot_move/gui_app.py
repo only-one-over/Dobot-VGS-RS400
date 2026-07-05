@@ -132,7 +132,10 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
         self.robot_ip = get_robot_ip()
         self.controller = DobotController(self.robot_ip, enforce_single_instance=True)
         self._modbus_program_requested.connect(self._run_modbus_program_from_signal)
-        self.controller.set_modbus_program_runner(self._request_modbus_program_from_modbus)
+        self.controller.set_modbus_program_runner(
+            self._request_modbus_program_from_modbus,
+            readiness_checker=self.check_main_flow_readiness,
+        )
         self.vision_d435i = None
         self.vision_d405 = None
         
@@ -1217,7 +1220,7 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
             "delete_flow_btn",
         ):
             if hasattr(self, attr):
-                getattr(self, attr).setEnabled(not flow_running)
+                getattr(self, attr).setEnabled(not flow_running and not cmd_running)
         if hasattr(self, "emergency_stop_btn"):
             self.emergency_stop_btn.setEnabled(robot_ready)
             self._update_emergency_stop_button()

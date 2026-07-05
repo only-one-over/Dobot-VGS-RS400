@@ -2,6 +2,7 @@
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 
@@ -257,12 +258,16 @@ def test_hook_command_disconnected_writes_110():
     controller.modbus_server = fake_server
     controller.is_connected = False
     controller.record_alarm = lambda *args, **kwargs: None
+    controller.set_modbus_program_runner(
+        lambda: True,
+        readiness_checker=lambda: False,
+    )
 
     controller._on_modbus_command(modbus_server.CMD_HOOK, mode=modbus_server.MODE_AUTO)
 
-    assert controller._modbus_status_override == modbus_server.STATUS_ROBOT_ERR
+    assert controller._modbus_status_override == modbus_server.STATUS_HOOK_ERR
     assert fake_server.calls == [
-        {"status": modbus_server.STATUS_ROBOT_ERR, "mode": modbus_server.MODE_AUTO}
+        {"status": modbus_server.STATUS_HOOK_ERR, "mode": modbus_server.MODE_AUTO}
     ]
 
 
@@ -379,35 +384,6 @@ def test_runtime_recovery_lock_only_accepts_zero():
     assert fake_server.calls[-1]["status"] == modbus_server.STATUS_IDLE
 
 
-def test_startup_connection_fault_stays_latched_until_zero_recheck_succeeds():
-    modbus_server, robot_controller = _real_modules()
-    controller = robot_controller.DobotController("192.168.1.50")
-    fake_server = _FakeStatusServer()
-    controller.modbus_server = fake_server
-    readiness = {"error": modbus_server.STATUS_CAMERA_ERR}
-    controller.set_startup_connection_fault(
-        modbus_server.STATUS_CAMERA_ERR,
-        ready_checker=lambda: readiness["error"],
-    )
-
-    controller._on_modbus_command(modbus_server.CMD_RESET, mode=modbus_server.MODE_AUTO)
-    assert controller.get_startup_connection_fault() == modbus_server.STATUS_CAMERA_ERR
-    assert fake_server.calls[-1]["status"] == modbus_server.STATUS_CAMERA_ERR
-
-    controller._on_modbus_command(modbus_server.CMD_STOP, mode=modbus_server.MODE_AUTO)
-    assert controller.get_startup_connection_fault() == modbus_server.STATUS_CAMERA_ERR
-    assert fake_server.calls[-1]["status"] == modbus_server.STATUS_CAMERA_ERR
-
-    controller.dashboard = _FakeStopDashboard()
-    controller.is_connected = True
-    readiness["error"] = None
-    controller._on_modbus_command(modbus_server.CMD_STOP, mode=modbus_server.MODE_AUTO)
-
-    assert controller.get_startup_connection_fault() is None
-    assert controller.dashboard.calls == ["Stop", "ClearError", "EnableRobot"]
-    assert fake_server.calls[-1]["status"] == modbus_server.STATUS_IDLE
-
-
 def test_reset_value_releases_delay_instead_of_dispatching_reset():
     modbus_server, robot_controller = _real_modules()
     controller = robot_controller.DobotController("192.168.1.50")
@@ -490,6 +466,7 @@ def test_hook_command_connected_requests_program_runner():
     controller.set_modbus_program_runner(lambda: calls.append("runner") or True)
 
     controller._on_modbus_command(modbus_server.CMD_HOOK, mode=modbus_server.MODE_AUTO)
+    controller._modbus_exec_thread.join(timeout=1.0)
 
     assert calls == ["runner"]
     assert fake_server.calls == [
@@ -508,11 +485,75 @@ def test_hook_command_not_ready_writes_robot_error():
     controller.set_modbus_program_runner(lambda: True)
 
     controller._on_modbus_command(modbus_server.CMD_HOOK, mode=modbus_server.MODE_AUTO)
+    controller._modbus_exec_thread.join(timeout=1.0)
 
-    assert controller._modbus_status_override == modbus_server.STATUS_ROBOT_ERR
+    assert controller._modbus_status_override == modbus_server.STATUS_HOOK_ERR
     assert fake_server.calls == [
-        {"status": modbus_server.STATUS_ROBOT_ERR, "mode": modbus_server.MODE_AUTO}
+        {"status": modbus_server.STATUS_RUNNING, "mode": modbus_server.MODE_AUTO},
+        {"status": modbus_server.STATUS_HOOK_ERR, "mode": modbus_server.MODE_AUTO},
     ]
+
+
+def test_hook_can_retry_directly_after_readiness_recovers():
+    modbus_server, robot_controller = _real_modules()
+    controller = robot_controller.DobotController("192.168.1.50")
+    fake_server = _FakeStatusServer()
+    controller.modbus_server = fake_server
+    controller.is_connected = True
+    controller.ensure_robot_ready_for_motion = lambda auto_enable=True: True
+    state = {"ready": False}
+    calls = []
+
+    class Result:
+        @property
+        def ok(self):
+            return state["ready"]
+
+        @property
+        def message(self):
+            return "设备已就绪" if self.ok else "D405 未连接"
+
+    controller.set_modbus_program_runner(
+        lambda: calls.append("runner") or True,
+        readiness_checker=Result,
+    )
+
+    controller._on_modbus_command(modbus_server.CMD_HOOK, mode=modbus_server.MODE_AUTO)
+    assert controller._modbus_status_override == modbus_server.STATUS_HOOK_ERR
+    assert calls == []
+
+    state["ready"] = True
+    controller._on_modbus_command(modbus_server.CMD_HOOK, mode=modbus_server.MODE_AUTO)
+    controller._modbus_exec_thread.join(timeout=1.0)
+
+    assert calls == ["runner"]
+    assert controller._modbus_status_override == modbus_server.STATUS_RUNNING
+
+
+def test_hook_background_prepare_does_not_block_command_callback():
+    modbus_server, robot_controller = _real_modules()
+    controller = robot_controller.DobotController("192.168.1.50")
+    controller.modbus_server = _FakeStatusServer()
+    controller.is_connected = True
+    release = threading.Event()
+
+    def slow_prepare(auto_enable=True):
+        release.wait(1.0)
+        return True
+
+    controller.ensure_robot_ready_for_motion = slow_prepare
+    controller.set_modbus_program_runner(
+        lambda: True,
+        readiness_checker=lambda: True,
+    )
+
+    started_at = time.monotonic()
+    controller._on_modbus_command(modbus_server.CMD_HOOK, mode=modbus_server.MODE_AUTO)
+    elapsed = time.monotonic() - started_at
+    release.set()
+    controller._modbus_exec_thread.join(timeout=1.0)
+
+    assert elapsed < 0.2
 
 
 def test_ensure_robot_ready_auto_enables_with_fresh_feedback():

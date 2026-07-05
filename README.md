@@ -162,7 +162,7 @@ python -m dobot_move
 python -m dobot_move.runtime_agent
 ```
 
-生产环境应同时运行 `dobot_move.runtime_agent` 和 `dobot_move.runtime_watchdog`。GUI 与后台都会先启动 Modbus，再立即并发连接机器人和主流程需要的相机；默认 5 秒未就绪时发布 `111/112`。根目录同名脚本只保留为旧命令兼容入口。开机自启动、异常恢复、`40001` 状态协议和状态排查见 [docs/runtime_agent.md](docs/runtime_agent.md)。
+生产环境应同时运行 `dobot_move.runtime_agent` 和 `dobot_move.runtime_watchdog`。GUI 与后台都会先启动 Modbus，再立即在后台并发连接机器人和主流程需要的相机；5 秒观察窗口结束后不阻塞、不报码，后台继续低频重连。运行流程前使用缓存状态快速检查，缺少设备时 Modbus 写 `110` 并拒绝本次启动。根目录同名脚本只保留为旧命令兼容入口。开机自启动、异常恢复、`40001` 状态协议和状态排查见 [docs/runtime_agent.md](docs/runtime_agent.md)。
 
 ### 首次设置
 

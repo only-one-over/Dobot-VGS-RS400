@@ -25,15 +25,28 @@ RealSense 工作还需要在 Python 之外安装 Intel RealSense SDK 2.0。原�
 python -m dobot_move
 ```
 
-应用期望运行时配置位于 `dobot_move/config.json`。D435i、D405 可在主控制页分别选择 ONNX 模型，路径保存到 `camera.models`；缺少该配置时使用 `dobot_move/best.onnx`。模型文件不提交到 Git，部署时需单独复制到工控机。
+应用期望运行时配置位于 `user_data/config.json`（首次升级时从 `dobot_move/config.json` 自动迁移）。D435i、D405 可在主控制页分别选择 ONNX 模型，路径保存到 `camera.models`；缺少该配置时使用 `dobot_move/best.onnx`。模型文件不提交到 Git，部署时需单独复制到工控机。
 
 ## 运行测试和检查
 
 当前测试覆盖率有限。使用定向检查：
 
 ```powershell
-python -m py_compile dobot_move\gui_app.py dobot_move\workers.py dobot_move\vision_system.py
-python test_yolo26_bbox.py
+# 语法检查关键模块
+python -m py_compile dobot_move\flow\flow_executor.py dobot_move\flow\qt_workers.py dobot_move\flow\camera_test_worker.py dobot_move\runtime\runtime_agent.py
+
+# 运行测试套件（排除依赖硬件的测试）
+python -m pytest tests\ --ignore=tests\test_feedback_cache.py -q
+```
+
+Runtime 去 Qt 化验证：
+
+```powershell
+# 验证 FlowExecutor 回调接口
+python -m pytest tests\test_flow_executor_callbacks.py -v
+
+# 验证 runtime_agent 不依赖 Qt（AST 级 + 运行时导入检查）
+python -m pytest tests\test_runtime_no_qt_import.py -v
 ```
 
 仅在确认所需模型/输入假设后使用 `test_yolo26_bbox.py`。TODO：将测试脚本移至 `tests/` 并记录测试夹具。

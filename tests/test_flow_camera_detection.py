@@ -1,4 +1,5 @@
-﻿import sys
+import sys
+import threading
 import time
 import types
 import inspect
@@ -51,14 +52,15 @@ simulator.SimData = getattr(simulator, "SimData", SimData)
 simulator.SimDevice = getattr(simulator, "SimDevice", SimDevice)
 simulator.DataType = getattr(simulator, "DataType", DataType)
 
-from dobot_move.vision_system import FramePacket
-from dobot_move.workers import (
+from dobot_move.vision.vision_system import FramePacket
+from dobot_move.flow.workers import (
     FlowRunContext,
     FlowThread,
     coerce_float_vector,
     validate_grasp_flow_modules,
 )
-from dobot_move.gui_mixins.grasp_flow_mixin import GraspFlowMixin
+from dobot_move.flow.flow_executor import FlowExecutor
+from dobot_move.ui.mixins.grasp_flow_mixin import GraspFlowMixin
 
 
 def test_relative_path_new_module_defaults_to_empty_segments():
@@ -160,9 +162,9 @@ def _make_flow_thread():
 
 
 def test_flow_camera_detection_uses_capture_thread_numpy_packets(monkeypatch):
-    import dobot_move.workers as workers
+    import dobot_move.flow.camera_test_worker as camera_test_worker
 
-    monkeypatch.setattr(workers, "CaptureThread", FakeCaptureThread)
+    monkeypatch.setattr(camera_test_worker, "CaptureThread", FakeCaptureThread)
     thread = _make_flow_thread()
     ctx = FlowRunContext(run_id="test", start_time=0.0)
     vision = FakeVision({
@@ -189,9 +191,9 @@ def test_flow_camera_detection_uses_capture_thread_numpy_packets(monkeypatch):
 
 
 def test_flow_camera_detection_reports_depth_position_failure(monkeypatch):
-    import dobot_move.workers as workers
+    import dobot_move.flow.camera_test_worker as camera_test_worker
 
-    monkeypatch.setattr(workers, "CaptureThread", FakeCaptureThread)
+    monkeypatch.setattr(camera_test_worker, "CaptureThread", FakeCaptureThread)
     thread = _make_flow_thread()
     ctx = FlowRunContext(run_id="test", start_time=0.0)
     vision = FakeVision(None)
@@ -209,9 +211,9 @@ def test_flow_camera_detection_reports_depth_position_failure(monkeypatch):
 
 
 def test_flow_camera_detection_reports_no_object(monkeypatch):
-    import dobot_move.workers as workers
+    import dobot_move.flow.camera_test_worker as camera_test_worker
 
-    monkeypatch.setattr(workers, "CaptureThread", FakeCaptureThread)
+    monkeypatch.setattr(camera_test_worker, "CaptureThread", FakeCaptureThread)
     thread = _make_flow_thread()
     ctx = FlowRunContext(run_id="test", start_time=0.0)
     vision = NoDetectionVision(packet_count=2)
@@ -264,13 +266,13 @@ class FakeCameraTestWorker:
 
 
 def test_flow_camera_detection_reuses_running_camera_test_worker(monkeypatch):
-    import dobot_move.workers as workers
+    import dobot_move.flow.camera_test_worker as camera_test_worker
 
     class ForbiddenCaptureThread:
         def __init__(self, vision):
             raise AssertionError("flow should reuse camera-test snapshots")
 
-    monkeypatch.setattr(workers, "CaptureThread", ForbiddenCaptureThread)
+    monkeypatch.setattr(camera_test_worker, "CaptureThread", ForbiddenCaptureThread)
     object_position = {
         "camera_coords": [1.0, 2.0, 3.0],
         "confidence": 0.93,
@@ -339,14 +341,14 @@ def test_flow_run_pauses_camera_test_detection_outside_camera_module():
 
 
 def test_flow_camera_module_does_not_reuse_cached_result(monkeypatch):
-    import dobot_move.workers as workers
+    import dobot_move.flow.flow_executor as flow_executor
 
     class CachedFlowContext:
         def __init__(self, run_id, start_time):
             self.run_id = run_id
             self.start_time = start_time
             self.current_module_index = -1
-            self.stop_event = workers.threading.Event()
+            self.stop_event = threading.Event()
             self.module_timings = []
             self.motion_generation = 0
             self._flow_detection_cache = {
@@ -393,12 +395,12 @@ def test_flow_camera_module_does_not_reuse_cached_result(monkeypatch):
     def fake_fail(self, ctx, module_index, module_name, reason):
         failures.append(reason)
 
-    monkeypatch.setattr(workers, "FlowRunContext", CachedFlowContext)
-    monkeypatch.setattr(FlowThread, "_detect_camera_object_for_flow", fake_detect)
-    monkeypatch.setattr(FlowThread, "_fail_module", fake_fail)
+    monkeypatch.setattr(flow_executor, "FlowRunContext", CachedFlowContext)
+    monkeypatch.setattr(FlowExecutor, "_detect_camera_object_for_flow", fake_detect)
+    monkeypatch.setattr(FlowExecutor, "_fail_module", fake_fail)
 
     controller = Controller()
-    thread = FlowThread(
+    thread = FlowExecutor(
         controller=controller,
         vision_d435i=FakeVision({"camera_coords": [1.0, 2.0, 3.0], "confidence": 0.9}),
         vision_d405=None,

@@ -1,11 +1,11 @@
 import inspect
 
-import dobot_move.gui_app as gui_app_module
-from dobot_move.gui_mixins.grasp_flow_mixin import GraspFlowMixin
-from dobot_move.gui_mixins.modbus_mixin import ModbusMixin
-from dobot_move.gui_mixins.point_management_mixin import PointManagementMixin
-from dobot_move.gui_mixins.robot_control_mixin import RobotControlMixin
-from dobot_move.gui_mixins.vision_mixin import VisionMixin
+import dobot_move.ui.gui_app as gui_app_module
+from dobot_move.ui.mixins.grasp_flow_mixin import GraspFlowMixin
+from dobot_move.ui.mixins.modbus_mixin import ModbusMixin
+from dobot_move.ui.mixins.point_management_mixin import PointManagementMixin
+from dobot_move.ui.mixins.robot_control_mixin import RobotControlMixin
+from dobot_move.ui.mixins.vision_mixin import VisionMixin
 
 
 FORBIDDEN_GUI_TOKENS = (

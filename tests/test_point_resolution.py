@@ -1,6 +1,6 @@
 """Tests for point resolution: parsing, circular refs, missing points."""
 import pytest
-from dobot_move.config_manager import resolve_point, get_points, set_points
+from dobot_move.config.config_manager import resolve_point, get_points, set_points
 
 
 class TestResolvePoint:
@@ -8,7 +8,7 @@ class TestResolvePoint:
 
     def setup_method(self):
         """Reset config cache."""
-        import dobot_move.config_manager as cm
+        import dobot_move.config.config_manager as cm
         cm._cache_valid = False
         cm._config_cache = None
 

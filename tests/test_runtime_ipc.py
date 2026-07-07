@@ -3,8 +3,8 @@ import socket
 import threading
 import time
 
-from dobot_move.gui_ipc_client import RuntimeIpcClient
-from dobot_move.runtime_ipc import RuntimeIpcServer, encode_json_line
+from dobot_move.ui.gui_ipc_client import RuntimeIpcClient
+from dobot_move.runtime.runtime_ipc import RuntimeIpcServer, encode_json_line
 
 
 def _read_json_lines(client, count):

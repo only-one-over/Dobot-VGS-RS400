@@ -1,7 +1,7 @@
 """Tests for motion safety validation."""
 import time
 import pytest
-from dobot_move.motion_safety import (
+from dobot_move.robot.motion_safety import (
     validate_absolute_pose, validate_relative_delta,
     validate_servo_p_params, validate_motion_target,
     MotionValidationResult, MotionSafetyConfig, MotionSafetyState,

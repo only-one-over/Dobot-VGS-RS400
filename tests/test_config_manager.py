@@ -6,7 +6,7 @@ import uuid
 import pytest
 
 # We test config_manager functions by importing them
-from dobot_move.config_manager import (
+from dobot_move.config.config_manager import (
     load_config, save_config, get_visual_servo_config,
     DEFAULT_VISUAL_SERVO_CONFIG, DEFAULT_CAMERA_MODEL_PATH,
     get_camera_model_path, resolve_camera_model_path, set_camera_model_path,
@@ -33,7 +33,7 @@ class TestAtomicWrite:
 
     def test_save_creates_file(self):
         """save_config should create the config file."""
-        import dobot_move.config_manager as cm
+        import dobot_move.config.config_manager as cm
         original_file = cm.CONFIG_FILE
         try:
             cm.CONFIG_FILE = self.config_file
@@ -52,7 +52,7 @@ class TestAtomicWrite:
 
     def test_save_creates_backup(self):
         """save_config should create .bak before overwriting."""
-        import dobot_move.config_manager as cm
+        import dobot_move.config.config_manager as cm
         original_file = cm.CONFIG_FILE
         try:
             cm.CONFIG_FILE = self.config_file
@@ -73,7 +73,7 @@ class TestAtomicWrite:
 
     def test_load_recovers_from_corrupt(self):
         """load_config should recover from .bak when main file is corrupt."""
-        import dobot_move.config_manager as cm
+        import dobot_move.config.config_manager as cm
         original_file = cm.CONFIG_FILE
         try:
             cm.CONFIG_FILE = self.config_file
@@ -97,7 +97,7 @@ class TestAtomicWrite:
             cm._config_cache = None
 
     def test_reload_config_invalidates_process_cache(self):
-        import dobot_move.config_manager as cm
+        import dobot_move.config.config_manager as cm
 
         original_file = cm.CONFIG_FILE
         try:
@@ -141,7 +141,7 @@ class TestVisualServoConfig:
 
 class TestCameraModelConfig:
     def setup_method(self):
-        import dobot_move.config_manager as cm
+        import dobot_move.config.config_manager as cm
 
         self.tmpdir = _make_test_directory("camera_model_test")
         self.original_config_file = cm.CONFIG_FILE
@@ -150,7 +150,7 @@ class TestCameraModelConfig:
         cm._config_cache = None
 
     def teardown_method(self):
-        import dobot_move.config_manager as cm
+        import dobot_move.config.config_manager as cm
 
         cm.CONFIG_FILE = self.original_config_file
         cm._cache_valid = False

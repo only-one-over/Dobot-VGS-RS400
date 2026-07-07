@@ -37,6 +37,10 @@
 - ✅ 后台自动连接：Modbus 优先启动，5 秒观察窗口不锁定，机器人/必需相机持续低频重连
 - ✅ 流程 readiness 快检：缺设备立即拒绝并写 `110`，恢复后可直接重新触发
 - ✅ 删除应用层点动页面、控制器方法和监控逻辑，保留底层 SDK `MoveJog`
+- ✅ 子包重构：dobot_move 拆分为 robot/vision/ui/runtime/flow/config/communication 7 个子包，用户数据集中到 user_data/，支持单文件夹覆盖升级
+- ✅ 视觉-机器人时间戳对齐：RobotPoseBuffer 环形缓冲+插值、变 dt 卡尔曼、Mahalanobis 协方差门控、预测年龄/缺失计数
+- ✅ GUI IPC 停止通道：双通道 IPC（常规 8765 + 高优先级停止 8766）、安全停止按钮、维护状态显示、run_step/move_point/camera_test 调试入口
+- ✅ Runtime 去 Qt 化：workers.py 拆分为 flow_executor（纯 Python）+ qt_workers（Qt 适配）+ camera_test_worker（GUI 专用），runtime_agent 不再依赖 QThread/QImage/pyqtSignal
 
 ## 短期任务
 
@@ -48,9 +52,9 @@
 
 ## 中期任务
 
-- 从 `gui_app.py` 中提取更多 UI 构建到专用控件/面板。
-- 将 `FlowThread` 行为拆分为可测试的抓取流程模块处理器。
-- 为 `dobot_move/config.json` 引入配置模式版本和迁移路径。
+- 从 `ui/gui_app.py` 中提取更多 UI 构建到专用控件/面板。
+- 将 `FlowExecutor` 不同模块类型拆分为可测试的独立处理器。
+- 为 `user_data/config.json` 引入配置模式版本和迁移路径。
 - 为点位解析、标定矩阵生成、位姿解析和 C++/Python 回退契约添加单元测试。
 - 添加日志和状态规范化，使 UI 状态颜色不依赖于精确的本地化字符串。
 - 确认 PyInstaller 打包并记录捆绑的模型/DLL/原生扩展要求。
@@ -65,20 +69,19 @@
 
 ## 技术债务
 
-- `gui_app.py` 仍然过大，拥有过多的 UI 构建细节。
-- 部分 Worker 逻辑在一个线程类中混合了编排、安全检查和业务规则。
+- `ui/gui_app.py` 仍然过大，拥有过多的 UI 构建细节。
+- `FlowExecutor` 仍在一个类中混合编排和安全检查，可进一步拆分为独立的模块处理器。
+- `flow/workers.py` shim 导入时会间接拉入 Qt，headless 代码应直接从 `flow_executor` 导入。
 - 运行时配置写入分散在 UI 和流程路径中。
 - 编码损坏使维护风险增加，降低了操作员可读性。
-- 测试尚未在 `tests/` 下组织。
 - 构建输出和本地环境产物存在于工作树中，应排除在正常源代码变更之外。
 - 30004 反馈字段提取方法重复代码多，可考虑统一提取框架。
-- FlowThread 行为仍在一个类中混合编排和安全检查。
 
 ## 优先级建议
 
 1. 编码恢复和 UTF-8 策略执行。
 2. 测试目录组织和基础非硬件回归检查。
 3. 配置写入集中化和模式版本化。
-4. 从 `gui_app.py` 提取 UI。
-5. 流程执行服务提取。
+4. 从 `ui/gui_app.py` 提取 UI。
+5. `FlowExecutor` 模块处理器进一步拆分。
 6. 打包和发布清单。

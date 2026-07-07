@@ -1,6 +1,6 @@
 """Tests for visual servo parameter computation."""
 import pytest
-from dobot_move.visual_servo_controller import ServoThread
+from dobot_move.robot.visual_servo_controller import ServoThread
 
 
 class TestAdaptiveMaxStep:

@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from .. import config_manager
-from ..flow_library import FlowLibrary
+from ..flow.flow_library import FlowLibrary
 
 
 def collect_preflight_errors() -> list[str]:

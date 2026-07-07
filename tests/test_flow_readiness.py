@@ -1,4 +1,4 @@
-from dobot_move.flow_readiness import check_flow_readiness
+from dobot_move.flow.flow_readiness import check_flow_readiness
 
 
 class _Controller:

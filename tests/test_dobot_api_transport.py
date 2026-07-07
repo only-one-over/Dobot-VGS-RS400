@@ -2,7 +2,7 @@ import socket
 
 import pytest
 
-import dobot_move.dobot_api as api_module
+import dobot_move.robot.dobot_api as api_module
 
 
 class _FakeSocket:

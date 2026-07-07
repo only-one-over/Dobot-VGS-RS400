@@ -45,16 +45,16 @@ def _install_pymodbus_stub():
 
 
 def _real_modules():
-    sys.modules.pop("dobot_move.modbus_server", None)
+    sys.modules.pop("dobot_move.communication.modbus_server", None)
     try:
-        modbus_server = importlib.import_module("dobot_move.modbus_server")
+        modbus_server = importlib.import_module("dobot_move.communication.modbus_server")
     except ImportError as exc:
         if "pymodbus" not in str(exc):
             raise
         _install_pymodbus_stub()
-        sys.modules.pop("dobot_move.modbus_server", None)
-        modbus_server = importlib.import_module("dobot_move.modbus_server")
-    robot_controller = importlib.import_module("dobot_move.robot_controller")
+        sys.modules.pop("dobot_move.communication.modbus_server", None)
+        modbus_server = importlib.import_module("dobot_move.communication.modbus_server")
+    robot_controller = importlib.import_module("dobot_move.robot.robot_controller")
     robot_controller = importlib.reload(robot_controller)
     return modbus_server, robot_controller
 
@@ -744,14 +744,14 @@ def test_build_relative_command_does_not_pass_r_to_joint_relative_motion():
 
 
 def test_queued_relative_path_does_not_treat_false_as_success():
-    with open("dobot_move/workers.py", encoding="utf-8") as f:
+    with open("dobot_move/flow/flow_executor.py", encoding="utf-8") as f:
         source = f.read()
 
     assert "if resp_code is not False and resp_code == 0:" in source
 
 
 def test_force_guard_relative_path_forces_stop_each_mode():
-    with open("dobot_move/workers.py", encoding="utf-8") as f:
+    with open("dobot_move/flow/flow_executor.py", encoding="utf-8") as f:
         source = f.read()
 
     assert 'if force_guard is not None and execution_mode == "queued":' in source
@@ -760,7 +760,7 @@ def test_force_guard_relative_path_forces_stop_each_mode():
 
 
 def test_relative_path_segment_log_does_not_use_percent_formatting():
-    with open("dobot_move/workers.py", encoding="utf-8") as f:
+    with open("dobot_move/flow/flow_executor.py", encoding="utf-8") as f:
         source = f.read()
 
     assert "%.3fs\" % seg_elapsed" not in source
@@ -768,9 +768,9 @@ def test_relative_path_segment_log_does_not_use_percent_formatting():
 
 
 def test_runtime_exclusively_registers_modbus_program_runner():
-    with open("dobot_move/gui_app.py", encoding="utf-8") as f:
+    with open("dobot_move/ui/gui_app.py", encoding="utf-8") as f:
         gui_source = f.read()
-    with open("dobot_move/runtime_agent.py", encoding="utf-8") as f:
+    with open("dobot_move/runtime/runtime_agent.py", encoding="utf-8") as f:
         runtime_source = f.read()
 
     assert "set_modbus_program_runner" not in gui_source

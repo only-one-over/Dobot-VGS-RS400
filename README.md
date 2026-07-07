@@ -46,6 +46,7 @@
 - 📦 **send_relative_command 封装** — queued 和单段相对移动复用统一命令发送、响应解析、command_id 追踪
 - 🛡️ **ServoP 队列保护** — TCP 往返超伺服周期时自动跳帧降频，连续失败暂停重试
 - 📝 **报警详情补全** — 异步获取 GetError 详情后自动追加到报警记录
+- 🧩 **Runtime 去 Qt 化** — 后台流程执行器纯 Python 实现，不依赖 QThread/QImage/pyqtSignal，可在无 Qt 环境运行
 
 ## 快速开始
 
@@ -84,6 +85,7 @@ python -c "import PySide6, numpy, cv2, pyrealsense2, onnxruntime; print('All dep
 
 # GPU 真实启用验证（必须用 best.onnx 创建 session 确认 provider）
 python -c "import onnxruntime as ort; s = ort.InferenceSession('dobot_move/best.onnx', providers=['CUDAExecutionProvider']); print('Active providers:', s.get_providers())"
+# 注：best.onnx 为兼容回退路径，实际模型路径在 user_data/config.json 中配置
 # 通过标准：输出包含 CUDAExecutionProvider
 
 # 可选：验证 C++ 模块
@@ -115,28 +117,67 @@ python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
 
 | 模块 | 文件 | 描述 |
 |------|------|------|
-| 主界面 | `gui_app.py` | PySide6 主窗口 + 7 个 Mixin |
-| 机器人控制器 | `robot_controller.py` | 运动控制、状态管理 |
-| 通信 | `dobot_api.py` | TCP/IP Dashboard (29999) + Feedback (30004) |
-| 视觉系统 | `vision_system.py` | YOLO 推理、目标检测、3D 定位 |
-| 目标跟踪 | `tracker.py` | ByteTrack 多目标跟踪 |
-| 3D 滤波 | `kalman_filter_3d.py` | 6 状态 3D Kalman 滤波器 |
-| 深度处理 | `depth_processor.py` | 4 级 RealSense 深度滤波链 |
-| 手眼标定 | `hand_eye_calib.py` | 标定矩阵管理 |
-| 坐标变换 | `transform_utils.py` | euler2rot / pose2matrix |
-| 视觉伺服 | `visual_servo_controller.py` | 多线程视觉伺服控制 |
-| 圆弧运动 | `arc_motion_controller.py` | 原生 Dobot Arc() 运动控制 | 力传感器监测线程 |
-| 圆弧规划 | `arc_trajectory_planner.py` | 圆弧航点生成 | CAN 总线电池监测 |
-| Modbus 服务器 | `modbus_server.py` | Modbus TCP 服务器 | Modbus TCP 客户端（小车） |
-| 配置管理 | `config_manager.py` | JSON 配置读写 |
-| 主控面板 | `main_control_panel.py` | 主控面板组件，基于信号通信 |
-| 流程步骤列表 | `flow_step_list.py` | 流程步骤列表，拖拽排序+状态图标 |
-| Qt 兼容层 | `qt_compat.py` | Qt 框架兼容层（PySide6） |
-| 工作线程 | `workers.py` | 流程执行、FlowRunContext、模块验证、运动互斥锁 |
-| 后台代理 | `dobot_move/runtime_agent.py` | 设备监督、流程看门狗、健康状态和崩溃恢复 |
-| 外部看门狗 | `dobot_move/runtime_watchdog.py` | 卡死检测、独立 Stop、进程重启和重启熔断 |
-| 韧性基础 | `runtime_resilience.py` | 状态持久化、单实例锁、资源指标和超时预算 |
+| 主界面 | `ui/gui_app.py` | PySide6 主窗口 + 7 个 Mixin |
+| 机器人控制器 | `robot/robot_controller.py` | 运动控制、状态管理 |
+| 通信 | `robot/dobot_api.py` | TCP/IP Dashboard (29999) + Feedback (30004) |
+| 视觉系统 | `vision/vision_system.py` | YOLO 推理、目标检测、3D 定位 |
+| 目标跟踪 | `vision/tracker.py` | ByteTrack 多目标跟踪 |
+| 3D 滤波 | `vision/kalman_filter_3d.py` | 6 状态 3D Kalman 滤波器 |
+| 深度处理 | `vision/depth_processor.py` | 4 级 RealSense 深度滤波链 |
+| 手眼标定 | `robot/hand_eye_calib.py` | 标定矩阵管理 |
+| 坐标变换 | `robot/transform_utils.py` | euler2rot / pose2matrix |
+| 视觉伺服 | `robot/visual_servo_controller.py` | 多线程视觉伺服控制 |
+| 圆弧运动 | `robot/arc_motion_controller.py` | 原生 Dobot Arc() 运动控制 | 力传感器监测线程 |
+| 圆弧规划 | `robot/arc_trajectory_planner.py` | 圆弧航点生成 | CAN 总线电池监测 |
+| Modbus 服务器 | `communication/modbus_server.py` | Modbus TCP 服务器 | Modbus TCP 客户端（小车） |
+| 配置管理 | `config/config_manager.py` | JSON 配置读写 |
+| 主控面板 | `ui/main_control_panel.py` | 主控面板组件，基于信号通信 |
+| 流程步骤列表 | `flow/flow_step_list.py` | 流程步骤列表，拖拽排序+状态图标 |
+| Qt 兼容层 | `ui/qt_compat.py` | Qt 框架兼容层（PySide6） |
+| 工作线程 | `flow/flow_executor.py` | 纯 Python 流程执行器、FlowRunContext、模块验证、运动互斥锁（无 Qt 依赖） |
+| Qt 适配 | `flow/qt_workers.py` | FlowThread 包装 FlowExecutor，回调桥接到 pyqtSignal |
+| 相机测试 | `flow/camera_test_worker.py` | GUI 专用相机测试 Worker（QImage/QThread） |
+| 兼容入口 | `flow/workers.py` | 向后兼容 shim，re-export 上述三个模块的公开符号 |
+| 后台代理 | `runtime/runtime_agent.py` | 设备监督、流程看门狗、健康状态和崩溃恢复（无 Qt 依赖） |
+| 外部看门狗 | `runtime/runtime_watchdog.py` | 卡死检测、独立 Stop、进程重启和重启熔断 |
+| 韧性基础 | `runtime/runtime_resilience.py` | 状态持久化、单实例锁、资源指标和超时预算 |
 | C++ 核心 | `cpp_core/` | pybind11 加速模块 |
+
+### 项目结构
+
+```
+dobot_move_python/
+├── user_data/                    # 用户数据（替换包时保留）
+│   ├── config.json               # 现场配置（标定/点位/IP）
+│   ├── grasp_flow_modules.json   # 用户编辑的流程库
+│   ├── alarm_history.json        # 运行时报警记录
+│   ├── runtime_*.json            # Runtime 运行时状态
+│   └── logs/                     # 运行时日志
+├── dobot_move/                   # 主代码包（用户只需更新此文件夹）
+│   ├── robot/                    # 机械臂控制
+│   ├── vision/                   # 视觉感知
+│   ├── ui/                       # 界面层 + mixins/
+│   ├── runtime/                  # 生产后端
+│   ├── flow/                     # 流程编排
+│   ├── config/                   # 配置管理 + 报警码
+│   ├── communication/            # Modbus 通信
+│   └── windows_service/          # Windows 服务封装
+├── cpp_core/                     # C++ 加速模块源码
+├── run.py                        # GUI 入口
+├── runtime_agent.py              # Runtime 入口
+├── runtime_watchdog.py           # Watchdog 入口
+└── requirements.txt
+```
+
+### 升级更新
+
+用户升级只需用新版 `dobot_move/` 文件夹覆盖旧版即可，`user_data/` 中的配置和数据完全保留：
+
+1. 备份 `user_data/`（可选）
+2. 用新版 `dobot_move/` 覆盖旧版
+3. 重启应用
+
+首次升级时，`config_manager.py` 会自动检测旧位置的数据（`dobot_move/config.json`、`dobot_move/gui_mixins/grasp_flow_modules.json` 等）并迁移到 `user_data/`，用户无感知。
 
 ### 硬件要求
 
@@ -224,9 +265,9 @@ Windows 10/11 生产部署推荐使用 WinSW 双服务：Runtime 服务独占硬
 
 ### config.json
 
-将 `dobot_move/config.example.json` 复制为 `dobot_move/config.json`，并根据实际环境修改配置值。
+将 `dobot_move/config/config.example.json` 复制为 `user_data/config.json`，并根据实际环境修改配置值。
 
-配置文件位于 `dobot_move/config.json`：
+配置文件位于 `user_data/config.json`：
 
 | 字段 | 类型 | 描述 | 示例 |
 |------|------|------|------|
@@ -362,7 +403,7 @@ pip install opencv-python
 
 ### 机器人连接失败
 - 确认机器人与 PC 在同一网段
-- 检查 `config.json` 中的 `robot_ip`
+- 检查 `user_data/config.json` 中的 `robot_ip`
 - 确认机器人已开机且网络可达（`ping 192.168.1.50`）
 
 ### C++ 模块构建失败
@@ -380,6 +421,7 @@ nvidia-smi
 
 # 验证 GPU 真实启用
 python -c "import onnxruntime as ort; s = ort.InferenceSession('dobot_move/best.onnx', providers=['CUDAExecutionProvider']); print('Active providers:', s.get_providers())"
+# 注：best.onnx 为兼容回退路径，实际模型路径在 user_data/config.json 中配置
 ```
 
 | 模式 | YOLO 推理耗时 | 视觉伺服闭环频率 | 安装要求 | 支持状态 |
@@ -391,7 +433,7 @@ python -c "import onnxruntime as ort; s = ort.InferenceSession('dobot_move/best.
 
 ### YOLO 模型检测效果差
 - 在主控制页确认 D435i、D405 各自选择了正确的 `.onnx` 模型；相机连接期间需先断开才能更换
-- 未配置相机模型时，程序兼容使用 `dobot_move/best.onnx`
+- 未配置相机模型时，程序兼容使用包内 `best.onnx`（位于 `dobot_move/` 目录）
 - 检查光照条件，避免强烈反光
 - 新模型必须使用固定 NCHW 输入尺寸，并输出当前后处理支持的 YOLO 检测或实例分割张量
 - GUI、抓取流程和后台运行统一按相机类型读取模型配置；模型文件丢失或不兼容时会拒绝连接，不会静默使用其他模型

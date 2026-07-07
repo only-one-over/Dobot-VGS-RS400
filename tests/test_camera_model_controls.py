@@ -5,8 +5,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from dobot_move.main_control_panel import MainControlPanel
-from dobot_move.qt_compat import QApplication
+from dobot_move.ui.main_control_panel import MainControlPanel
+from dobot_move.ui.qt_compat import QApplication
 
 
 @pytest.fixture(scope="module")

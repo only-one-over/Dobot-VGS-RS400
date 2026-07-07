@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from dobot_move.runtime_vision_debug import capture_vision_snapshot
+from dobot_move.runtime.runtime_vision_debug import capture_vision_snapshot
 
 
 class _Vision:

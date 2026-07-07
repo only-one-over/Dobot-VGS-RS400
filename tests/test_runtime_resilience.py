@@ -4,9 +4,9 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from dobot_move.alarm_history import AlarmHistory
-import dobot_move.runtime_watchdog as watchdog_module
-from dobot_move.runtime_resilience import (
+from dobot_move.config.alarm_history import AlarmHistory
+import dobot_move.runtime.runtime_watchdog as watchdog_module
+from dobot_move.runtime.runtime_resilience import (
     RestartWindow,
     RuntimeState,
     RuntimeStateStore,
@@ -14,7 +14,7 @@ from dobot_move.runtime_resilience import (
     flow_timeout_seconds,
     module_timeout_seconds,
 )
-from dobot_move.runtime_watchdog import RuntimeWatchdog
+from dobot_move.runtime.runtime_watchdog import RuntimeWatchdog
 
 
 @contextmanager

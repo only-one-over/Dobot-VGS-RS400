@@ -34,10 +34,10 @@ def _install_modbus_stub():
 
 _install_modbus_stub()
 
-from dobot_move.dobot_api import MyType  # noqa: E402
-import dobot_move.robot_controller as controller_module  # noqa: E402
-from dobot_move.robot_controller import DobotController  # noqa: E402
-from dobot_move.motion_safety import MotionSafetyState  # noqa: E402
+from dobot_move.robot.dobot_api import MyType  # noqa: E402
+import dobot_move.robot.robot_controller as controller_module  # noqa: E402
+from dobot_move.robot.robot_controller import DobotController  # noqa: E402
+from dobot_move.robot.motion_safety import MotionSafetyState  # noqa: E402
 
 
 def _make_feedback_packet():

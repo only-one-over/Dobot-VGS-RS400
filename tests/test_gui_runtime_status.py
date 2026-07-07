@@ -4,7 +4,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from dobot_move.gui_runtime_status import RuntimeHealthReader
+from dobot_move.ui.gui_runtime_status import RuntimeHealthReader
 
 
 @contextmanager

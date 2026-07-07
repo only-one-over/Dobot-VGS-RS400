@@ -6,7 +6,7 @@ import pytest
 # Skip entire module if pymodbus is not available or incompatible
 try:
     from pymodbus import ModbusDeviceIdentification
-    from dobot_move.modbus_server import DobotModbusServer
+    from dobot_move.communication.modbus_server import DobotModbusServer
     HAS_MODBUS = True
 except ImportError:
     HAS_MODBUS = False

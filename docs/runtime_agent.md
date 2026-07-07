@@ -1,8 +1,12 @@
 # 后台 Runtime 与开机自启动
 
-`dobot_move/runtime_agent.py` 是生产现场使用的无界面后台模块，通过 `python -m dobot_move.runtime_agent` 启动。
+`dobot_move/runtime/runtime_agent.py` 是生产现场使用的无界面后台模块，通过 `python -m dobot_move.runtime_agent` 启动。
 项目根目录的 `runtime_agent.py` 只保留为旧命令兼容入口。
 它不会打开 PyQt 界面，会自动启动 Modbus TCP 从站、持续连接机器人，并按主站写入 `40001` 的命令运行对应程序。
+
+## 无 Qt 依赖
+
+Runtime 后端不依赖 `QThread`、`QImage`、`pyqtSignal` 等 Qt 组件，可在无 PyQt6/PySide6 环境运行。流程执行由纯 Python 的 `FlowExecutor`（`dobot_move/flow/flow_executor.py`）驱动，通过回调接口（`on_log`、`on_finished`、`on_progress`）通知 Runtime，而非 Qt 信号。Qt 适配层（`flow/qt_workers.py`）仅供 GUI 使用。
 
 ## 手动启动
 

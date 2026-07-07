@@ -41,17 +41,17 @@ def _install_modbus_stub():
 
 _install_modbus_stub()
 
-import dobot_move.runtime_agent as runtime_module  # noqa: E402
-from dobot_move.runtime_agent import (  # noqa: E402
+import dobot_move.runtime.runtime_agent as runtime_module  # noqa: E402
+from dobot_move.runtime.runtime_agent import (  # noqa: E402
     DobotRuntimeAgent,
     RobotConnectionState,
     RobotConnectionSupervisor,
     RuntimeProgramRunner,
 )
-from dobot_move.runtime_resilience import RuntimeState, RuntimeStateStore  # noqa: E402
-from dobot_move.runtime_ipc import IpcCommandError  # noqa: E402
-from dobot_move.runtime_ipc import RuntimeIpcServer  # noqa: E402
-from dobot_move.gui_ipc_client import RuntimeIpcClient  # noqa: E402
+from dobot_move.runtime.runtime_resilience import RuntimeState, RuntimeStateStore  # noqa: E402
+from dobot_move.runtime.runtime_ipc import IpcCommandError  # noqa: E402
+from dobot_move.runtime.runtime_ipc import RuntimeIpcServer  # noqa: E402
+from dobot_move.ui.gui_ipc_client import RuntimeIpcClient  # noqa: E402
 
 
 class _FakeDashboard:
@@ -208,12 +208,13 @@ def _runtime_agent_fixture():
 
 def test_runtime_defaults_stay_in_project_root_after_package_move():
     project_root = Path(__file__).resolve().parents[1]
+    user_data = project_root / "user_data"
 
     assert runtime_module.PROJECT_ROOT == project_root
-    assert runtime_module.DEFAULT_HEALTH_PATH == project_root / "runtime_health.json"
-    assert runtime_module.DEFAULT_STATE_PATH == project_root / "runtime_state.json"
-    assert runtime_module.DEFAULT_LOCK_PATH == project_root / "runtime_agent.lock"
-    assert runtime_module.DEFAULT_LOG_DIR == project_root / "logs"
+    assert runtime_module.DEFAULT_HEALTH_PATH == user_data / "runtime_health.json"
+    assert runtime_module.DEFAULT_STATE_PATH == user_data / "runtime_state.json"
+    assert runtime_module.DEFAULT_LOCK_PATH == user_data / "runtime_agent.lock"
+    assert runtime_module.DEFAULT_LOG_DIR == user_data / "logs"
 
 
 def test_ipc_maintenance_transitions_are_idempotent():
@@ -577,7 +578,7 @@ def test_runtime_runner_camera_failure_writes_flow_error(monkeypatch):
 
 
 def test_runtime_runner_passes_reused_cameras_to_flow(monkeypatch):
-    import dobot_move.workers as workers
+    import dobot_move.flow.flow_executor as flow_executor
 
     controller = _FakeController()
     controller.is_connected = True
@@ -585,33 +586,24 @@ def test_runtime_runner_passes_reused_cameras_to_flow(monkeypatch):
     runner.vision_d405 = object()
     captured = {}
 
-    class Signal:
-        def __init__(self):
-            self.callbacks = []
-
-        def connect(self, callback):
-            self.callbacks.append(callback)
-
-        def emit(self, value):
-            for callback in self.callbacks:
-                callback(value)
-
-    class FakeFlowThread:
-        def __init__(self, controller_arg, vision_d435i, vision_d405, modules, paused):
+    class FakeFlowExecutor:
+        def __init__(self, controller_arg, vision_d435i, vision_d405, modules, paused, camera_test_workers=None):
             captured["vision_d435i"] = vision_d435i
             captured["vision_d405"] = vision_d405
-            self.flow_log = Signal()
-            self.flow_finished = Signal()
+            self.on_log = None
+            self.on_finished = None
+            self.on_progress = None
 
         def run(self):
-            self.flow_finished.emit(True)
+            if self.on_finished:
+                self.on_finished(True)
 
     monkeypatch.setattr(
         runner,
         "_load_modules",
         lambda: [{"type": "camera", "params": {"camera_type": "D405"}}],
     )
-    monkeypatch.setattr(workers, "FlowThread", FakeFlowThread)
+    monkeypatch.setattr(flow_executor, "FlowExecutor", FakeFlowExecutor)
 
     runner._run_once()
 
@@ -621,32 +613,22 @@ def test_runtime_runner_passes_reused_cameras_to_flow(monkeypatch):
 
 
 def test_runtime_runner_timeout_requests_flow_and_robot_stop(monkeypatch):
-    import dobot_move.workers as workers
+    import dobot_move.flow.flow_executor as flow_executor
 
     controller = _FakeController()
     controller.is_connected = True
     runner = RuntimeProgramRunner(controller)
     stopped = threading.Event()
 
-    class Signal:
-        def __init__(self):
-            self.callbacks = []
-
-        def connect(self, callback):
-            self.callbacks.append(callback)
-
-        def emit(self, *values):
-            for callback in self.callbacks:
-                callback(*values)
-
-    class HangingFlowThread:
+    class HangingFlowExecutor:
         def __init__(self, *args):
-            self.flow_log = Signal()
-            self.flow_finished = Signal()
-            self.flow_module_progress = Signal()
+            self.on_log = None
+            self.on_finished = None
+            self.on_progress = None
 
         def run(self):
-            self.flow_module_progress.emit(1, 1, "卡死模块")
+            if self.on_progress:
+                self.on_progress(1, 1, "卡死模块")
             stopped.wait(1.0)
 
         def stop(self):
@@ -657,7 +639,7 @@ def test_runtime_runner_timeout_requests_flow_and_robot_stop(monkeypatch):
         "_load_modules",
         lambda: [{"type": "delay", "params": {"duration_s": 1}}],
     )
-    monkeypatch.setattr(workers, "FlowThread", HangingFlowThread)
+    monkeypatch.setattr(flow_executor, "FlowExecutor", HangingFlowExecutor)
     monkeypatch.setattr(runtime_module, "module_timeout_seconds", lambda module: 0.03)
     monkeypatch.setattr(runtime_module, "flow_timeout_seconds", lambda modules: 0.03)
 

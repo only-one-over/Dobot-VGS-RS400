@@ -1,6 +1,6 @@
 import time
 
-from dobot_move.startup_connection import StartupConnectionState
+from dobot_move.runtime.startup_connection import StartupConnectionState
 
 
 def test_ready_devices_have_no_missing_entries():

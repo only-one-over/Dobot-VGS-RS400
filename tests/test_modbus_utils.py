@@ -1,7 +1,7 @@
 """Tests for Modbus F32 encode/decode."""
 import pytest
 import struct
-from dobot_move.modbus_utils import float_to_regs, regs_to_float
+from dobot_move.communication.modbus_utils import float_to_regs, regs_to_float
 
 
 class TestFloatToRegs:

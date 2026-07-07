@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-import dobot_move.config_manager as config_manager
-from dobot_move.config_manager import load_config, use_config_snapshot
-from dobot_move.runtime_publication import PublicationError, RuntimePublicationStore
+import dobot_move.config.config_manager as config_manager
+from dobot_move.config.config_manager import load_config, use_config_snapshot
+from dobot_move.runtime.runtime_publication import PublicationError, RuntimePublicationStore
 
 
 @contextmanager

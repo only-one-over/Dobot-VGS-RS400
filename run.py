@@ -5,7 +5,7 @@
     python run.py
     # 等同于: python -m dobot_move
 """
-from dobot_move.gui_app import main
+from dobot_move.ui.gui_app import main
 
 if __name__ == "__main__":
     main()

@@ -56,6 +56,16 @@
 - 相机快照只允许在维护模式且流程空闲时采集，使用相机级互斥锁，不创建第二条 RealSense pipeline。
 - 视觉伺服暴露只读 XYZ/总误差、迭代次数、目标/位姿年龄、循环频率、采集/推理/深度/ServoP/总周期耗时；GUI 保留最近 100 个采样点并显示 error-time 与 error-iteration 曲线。
 
+## 阶段 7 Runtime 去 Qt 化
+
+- `flow/workers.py` 拆分为三个职责清晰的模块，原文件降为向后兼容 shim：
+  - `flow/flow_executor.py`：纯 Python，无 Qt 依赖。包含 `FlowExecutor`、`FlowRunContext` 和全部流程辅助函数。用 `Optional[Callable]` 回调（`on_log`、`on_finished`、`on_progress`）替代 `pyqtSignal`，`self.msleep(100)` 替换为 `time.sleep(0.1)`。`CaptureThread` 在方法体内延迟导入以隔离 Qt 依赖。
+  - `flow/qt_workers.py`：Qt 适配层。`FlowThread(QThread)` 持有 `FlowExecutor`，将回调桥接到 `pyqtSignal.emit`，并通过 `__getattr__` 透传属性访问。`RobotCmdThread` 原样保留。
+  - `flow/camera_test_worker.py`：GUI 专用。`CaptureThread` 和 `CameraTestWorker` 原样迁移，保留 `QImage`/`QThread`/`pyqtSignal` 依赖，因为实时预览需要 Qt 图像管线。
+- `runtime/runtime_agent.py` 改用 `FlowExecutor` 直接驱动流程：`FlowThread(...)` 替换为 `FlowExecutor(...)`，`signal.connect(...)` 替换为回调赋值，移除 `hasattr(flow, "flow_module_progress")` 检查。
+- Runtime 后端不再直接或间接依赖 `QThread`、`QImage`、`pyqtSignal`，可在无 Qt 环境运行。
+- `workers.py` shim 从三个新模块 re-export 全部公开符号，现有 `from dobot_move.flow.workers import X` 导入无需改动；新代码应按场景从对应模块直接导入（headless 用 `flow_executor`，GUI 用 `qt_workers`/`camera_test_worker`）。
+
 ## Windows Service 部署
 
 - `DobotRuntimeService` 由 WinSW 2.12.0 包装，使用专用本地账户运行并独占全部硬件；服务停止通过 Ctrl+C 进入 Runtime 现有安全清理路径。
@@ -69,40 +79,47 @@
 ```text
 .
 ├── dobot_move/                  # 主 Python 包和 PyQt6 应用
-│   ├── gui_app.py               # 工程GUI、编辑页面和只读Runtime状态
-│   ├── gui_runtime_status.py    # runtime_health.json只读适配
-│   ├── main_control_panel.py    # 提取的主控制面板控件
-│   ├── gui_mixins/              # 按功能区域划分的 UI 行为 mixin
-│   ├── workers.py               # 用于初始化、监控、流程和相机测试的 QThread Worker
-│   ├── robot_controller.py      # Dobot 运动/状态编排
-│   ├── dobot_api.py             # Dobot Dashboard/Feedback Socket API 封装
-│   ├── vision_system.py         # RealSense、ONNX 推理、跟踪、3D 定位
-│   ├── config_manager.py        # 运行时 JSON 配置服务和点位/标定访问
-│   ├── runtime_agent.py         # 无界面生产后台
-│   ├── runtime_watchdog.py      # 进程外健康看门狗
-│   ├── runtime_resilience.py    # 后台状态、锁和恢复基础设施
-│   ├── ui_theme.py              # 共享的 PyQt 调色板和样式表辅助工具
-│   └── config.json              # 运行时配置、标定、点位、性能参数
+│   ├── ui/                      # UI 层（gui_app、mixins、qt_compat、主题）
+│   ├── robot/                   # 机器人控制（controller、api、运动、标定）
+│   ├── vision/                  # 视觉感知（vision_system、tracker、kalman、depth）
+│   ├── flow/                    # 流程编排
+│   │   ├── flow_executor.py     # 纯 Python 流程执行器（无 Qt）
+│   │   ├── qt_workers.py        # Qt 适配层（FlowThread 包装 FlowExecutor）
+│   │   ├── camera_test_worker.py # GUI 专用相机测试 Worker
+│   │   ├── workers.py           # 向后兼容 shim，re-export 上述三个模块
+│   │   ├── flow_library.py      # 流程库管理
+│   │   └── flow_step_list.py    # 流程步骤列表控件
+│   ├── runtime/                 # 生产后端（runtime_agent、watchdog、resilience、ipc）
+│   ├── config/                  # 配置管理 + 报警码
+│   ├── communication/           # Modbus 通信
+│   └── windows_service/         # Windows 服务封装
+├── user_data/                   # 用户数据（config.json、流程库、日志、运行时状态）
 ├── cpp_core/                    # 可选的 C++17 pybind11 加速模块
 ├── docs/                        # 项目文档
+├── tests/                       # 回归测试
 ├── build_cpp.py                 # 原生扩展构建辅助脚本
 ├── requirements.txt             # Python 依赖
-├── test_yolo26_bbox.py          # 当前根目录下的视觉回归测试/脚本
+├── run.py                       # GUI 入口
+├── runtime_agent.py             # Runtime 入口（薄兼容层）
+├── runtime_watchdog.py          # Watchdog 入口（薄兼容层）
 └── DobotControl.spec            # PyInstaller 打包规范
 ```
 
 ## 模块职责
 
-- `gui_app.py`：拥有 `QApplication` 入口、`DobotMainWindow`、标签页组合、GUI 生命周期和只读状态刷新。
-- `main_control_panel.py`：提供机器人连接、相机连接、抓取执行、碰撞等级、暂停/恢复和错误清除的主控制控件。
-- `gui_mixins/`：按功能分离编辑行为；硬件相关入口在 IPC 接入前只返回明确拒绝。
-- `workers.py`：在 UI 线程之外运行慢速或重复工作，包括流程执行、相机测试显示、机器人命令 Worker 和 D435i 低帧率识别。
-- `robot_controller.py`：协调 Dobot Dashboard/Feedback API、运动命令、安全状态、Modbus 从站集成、运动所有权、安全状态和位姿解析。
-- `vision_system.py`：拥有相机启动、RealSense 帧捕获、ONNX 模型加载、YOLO 后处理、跟踪、深度处理、平滑和坐标转换。
-- `config_manager.py`：集中管理 `dobot_move/config.json` 的读写，包括机器人 IP、Modbus 从站端口、标定、点位和手眼矩阵。
-- `runtime_agent.py`：生产环境无界面入口，负责设备监督、流程执行、健康状态和崩溃恢复锁。
-- `runtime_watchdog.py`：独立进程外看门狗，检测后台卡死，必要时先独立 Stop 再重启任务。
-- `runtime_resilience.py`：运行状态持久化、单实例锁、重启窗口、资源指标和动态超时预算。
+- `ui/gui_app.py`：拥有 `QApplication` 入口、`DobotMainWindow`、标签页组合、GUI 生命周期和只读状态刷新。
+- `ui/main_control_panel.py`：提供机器人连接、相机连接、抓取执行、碰撞等级、暂停/恢复和错误清除的主控制控件。
+- `ui/mixins/`：按功能分离编辑行为；硬件相关入口在 IPC 接入前只返回明确拒绝。
+- `flow/flow_executor.py`：纯 Python 流程执行器，包含 `FlowExecutor`、`FlowRunContext` 和全部流程辅助函数。通过 `on_log`/`on_finished`/`on_progress` 回调通知调用方，无 Qt 依赖。
+- `flow/qt_workers.py`：Qt 适配层，`FlowThread(QThread)` 持有 `FlowExecutor` 并将回调桥接到 `pyqtSignal.emit`；`RobotCmdThread` 后台指令执行。
+- `flow/camera_test_worker.py`：GUI 专用相机测试 Worker，保留 `QImage`/`QThread`/`pyqtSignal` 依赖以驱动实时预览。
+- `flow/workers.py`：向后兼容 shim，从 `flow_executor`、`qt_workers`、`camera_test_worker` re-export 全部公开符号，现有导入无需改动。
+- `robot/robot_controller.py`：协调 Dobot Dashboard/Feedback API、运动命令、安全状态、Modbus 从站集成、运动所有权、安全状态和位姿解析。
+- `vision/vision_system.py`：拥有相机启动、RealSense 帧捕获、ONNX 模型加载、YOLO 后处理、跟踪、深度处理、平滑和坐标转换。
+- `config/config_manager.py`：集中管理 `user_data/config.json` 的读写，包括机器人 IP、Modbus 从站端口、标定、点位和手眼矩阵。
+- `runtime/runtime_agent.py`：生产环境无界面入口，负责设备监督、流程执行、健康状态和崩溃恢复锁。直接使用 `FlowExecutor` 驱动流程，不依赖 Qt。
+- `runtime/runtime_watchdog.py`：独立进程外看门狗，检测后台卡死，必要时先独立 Stop 再重启任务。
+- `runtime/runtime_resilience.py`：运行状态持久化、单实例锁、重启窗口、资源指标和动态超时预算。
 - 根目录 `runtime_agent.py`、`runtime_watchdog.py`：仅为旧启动命令保留的薄兼容入口，不包含业务实现。
 - `cpp_core/`：在原生代码中镜像部分 Python 视觉数学运算以提升性能。必须保留 `vision_system.py` 使用的输入/输出契约。
 
@@ -247,26 +264,27 @@ Runtime通过 `robot_control.lock` 持有控制租约，并使用 `runtime_agent
 
 ## 扩展点
 
-- 在 `workers.FlowThread` 中添加新的抓取流程模块类型，并在抓取流程 mixin 中添加相应的 UI 编辑行为。
-- 通过 `config_manager.py` 添加新的点位/配置字段，并处理迁移/默认值。
-- 通过扩展 `VisionSystem` 添加特定相机的检测行为，同时保留 D435i/D405 角色分离。
+- 在 `flow_executor.FlowExecutor` 中添加新的抓取流程模块类型，并在抓取流程 mixin 中添加相应的 UI 编辑行为。
+- 通过 `config/config_manager.py` 添加新的点位/配置字段，并处理迁移/默认值。
+- 通过扩展 `vision/vision_system.py` 添加特定相机的检测行为，同时保留 D435i/D405 角色分离。
 - 通过暴露兼容的 pybind11 函数并使用 Python 回退行为保护调用来添加 C++ 加速。
-- 将更多 UI 面板从 `gui_app.py` 提取为 `dobot_move/` 或未来 UI 目录下的专用控件。
+- 将更多 UI 面板从 `ui/gui_app.py` 提取为 `dobot_move/ui/` 下的专用控件。
 
 ## 风险点
 
 - 机器人运动是安全关键的。错误的坐标转换、标定、单位或点位解析可能导致不安全的运动。
 - 多个文件中的现有中文文本出现乱码损坏。编辑这些文件时如果不谨慎处理编码，可能使恢复更加困难。
-- `gui_app.py` 仍然很大，仍然混合了 UI 组合、生命周期、状态和部分功能连接。
-- `config.json` 既是运行时状态又是持久化配置；来自 UI/Worker 路径的并发写入可能导致过期或丢失更新。
+- `ui/gui_app.py` 仍然很大，仍然混合了 UI 组合、生命周期、状态和部分功能连接。
+- `user_data/config.json` 既是运行时状态又是持久化配置；来自 UI/Worker 路径的并发写入可能导致过期或丢失更新。
 - RealSense、ONNX Runtime、CUDA provider 可用性、Dobot 网络状态和 C++ 扩展 ABI 都对环境敏感。
 - 根目录下的生成/构建产物（如 `build/`、`Release/` 和 `.pyd` 文件）可能掩盖纯源代码变更。
+- `flow/workers.py` shim 导入时会通过 `qt_workers` 和 `camera_test_worker` 间接拉入 Qt；headless 代码路径应直接从 `flow_executor` 导入以避免 Qt 依赖。
 
 ## 重构建议
 
-- 将剩余的标签页构建从 `gui_app.py` 移至专用控件，保持 `DobotMainWindow` 作为组装器。
-- 将流程执行逻辑从 `workers.FlowThread` 移至具有可测试模块处理器的服务。
+- 将剩余的标签页构建从 `ui/gui_app.py` 移至专用控件，保持 `DobotMainWindow` 作为组装器。
+- 为 `FlowExecutor` 的不同模块类型添加可测试的独立处理器，进一步降低单类复杂度。
 - 添加配置写入防抖或单一保存服务，避免多个 UI 路径直接写入。
 - 在确认预期的测试夹具和硬件/模型假设后，将根目录下的 `test_yolo26_bbox.py` 移至 `tests/`。
 - 添加 PyInstaller 和原生扩展兼容性的打包/构建文档。
-- TODO：为 `config.json` 定义稳定的模式版本和迁移规则。
+- TODO：为 `user_data/config.json` 定义稳定的模式版本和迁移规则。

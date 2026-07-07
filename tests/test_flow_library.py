@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from dobot_move.flow_library import FlowLibrary, required_camera_types
+from dobot_move.flow.flow_library import FlowLibrary, required_camera_types
 
 
 @pytest.fixture

@@ -6,10 +6,10 @@ import numpy as np
 if "pyrealsense2" not in sys.modules:
     sys.modules["pyrealsense2"] = types.ModuleType("pyrealsense2")
 
-from dobot_move.tracker import BYTETracker, STrack, iou_distance
-from dobot_move.kalman_filter_3d import KalmanFilter3D
-import dobot_move.vision_system as vision_module
-from dobot_move.vision_system import VisionSystem
+from dobot_move.vision.tracker import BYTETracker, STrack, iou_distance
+from dobot_move.vision.kalman_filter_3d import KalmanFilter3D
+import dobot_move.vision.vision_system as vision_module
+from dobot_move.vision.vision_system import VisionSystem
 
 
 def _track(bbox, score=0.9):
@@ -215,7 +215,7 @@ def test_camera_z_over_500_is_filtered_kalman_smoothed():
     class FakeKalman:
         initialized = True
 
-        def update(self, observed):
+        def update(self, observed, dt=None):
             return np.array([1.0, 2.0, 500.1])
 
         def get_confidence(self):

@@ -6,7 +6,7 @@ import types
 if "pyrealsense2" not in sys.modules:
     sys.modules["pyrealsense2"] = types.ModuleType("pyrealsense2")
 
-from dobot_move.workers import (
+from dobot_move.flow.workers import (
     FlowThread,
     validate_grasp_flow_modules,
     wait_for_flow_delay,

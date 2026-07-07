@@ -7,8 +7,8 @@ import pytest
 if "pyrealsense2" not in sys.modules:
     sys.modules["pyrealsense2"] = types.ModuleType("pyrealsense2")
 
-import dobot_move.vision_system as vision_module
-from dobot_move.vision_system import VisionSystem
+import dobot_move.vision.vision_system as vision_module
+from dobot_move.vision.vision_system import VisionSystem
 
 
 class _ModelInfo:

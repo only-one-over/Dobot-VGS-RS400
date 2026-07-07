@@ -38,6 +38,30 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# TargetObservation — 视觉目标观测数据结构
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TargetObservation:
+    """视觉目标观测 — 记录一次目标检测/预测/降级的完整上下文。
+
+    字段:
+        measurement_time: 采集时刻 (perf_counter)，对应 FramePacket.capture_time
+        published_time:   发布到 TargetCache 的时刻 (perf_counter)
+        source:           来源标识 ("detection" / "prediction" / "fallback")
+        confidence:       置信度 [0, 1]
+        prediction_age:   距上次成功更新的秒数（detection 路径为 0.0）
+        covariance:       可选 3×3 位置协方差矩阵
+    """
+    measurement_time: float
+    published_time: float
+    source: str
+    confidence: float
+    prediction_age: float
+    covariance: Optional[np.ndarray] = None
+
+
+# ---------------------------------------------------------------------------
 # 线程安全缓存
 # ---------------------------------------------------------------------------
 
@@ -48,12 +72,16 @@ class TargetCache:
     VisionThread 在检测时刻用按采集时间插值的 pose 预计算 target_base (主路径)，
     同时缓存 target_end；pose_at_capture 不可用时仅写 target_end (退化兼容)。
     ServoThread 主路径直接读 target_base；fallback 用 target_end + 最新 pose 转换。
+
+    内部以 TargetObservation 作为目标观测的权威记录，散落的 target_base /
+    target_capture_time / confidence 字段保留以兼容既有调用方，由 observation 派生。
     """
     target_end: Optional[np.ndarray] = None    # 末端坐标系 [X,Y,Z] (fallback 路径)
     target_base: Optional[np.ndarray] = None   # 基座坐标系 [X,Y,Z,...] (主路径, 检测时刻预计算)
     confidence: float = 0.0
     timestamp: float = 0.0
     target_capture_time: float = 0.0           # 预计算 target_base 时刻 (perf_counter)
+    _observation: Optional[TargetObservation] = None  # 权威观测记录
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def clear(self):
@@ -64,6 +92,7 @@ class TargetCache:
             self.confidence = 0.0
             self.timestamp = 0.0
             self.target_capture_time = 0.0
+            self._observation = None
 
     def update_end(self, target_end, confidence):
         """VisionThread 主路径：缓存末端坐标"""
@@ -79,23 +108,94 @@ class TargetCache:
             self.confidence = confidence
             self.timestamp = time.monotonic()
 
-    def update_from_detection(self, target_end, pose_at_capture, confidence, vision):
+    def update_from_detection(self, target_end, pose_at_capture, confidence, vision,
+                              measurement_time=None):
         """VisionThread 主路径：缓存末端坐标 + 按采集时刻位姿预计算 base 坐标
 
-        - pose_at_capture 为 None 时：仅更新 target_end（退化兼容，ServoThread 走 fallback）
-        - pose_at_capture 有效时：预计算 target_base，ServoThread 主路径直接使用
+        - pose_at_capture 为 None 时：仅更新 target_end（退化兼容，ServoThread 走 fallback），
+          生成 TargetObservation(source="fallback")
+        - pose_at_capture 有效时：预计算 target_base，ServoThread 主路径直接使用，
+          生成 TargetObservation(source="detection")
+        - measurement_time 为采集时刻 (perf_counter)，未提供时用当前 perf_counter 近似
         """
+        published_time = time.perf_counter()
+        if measurement_time is None or measurement_time <= 0.0:
+            measurement_time = published_time
+
         if pose_at_capture is None:
             logger.warning("pose_at_capture is None, target_base not updated")
-            self.update_end(target_end, confidence)
+            with self._lock:
+                self.target_end = target_end
+                self.target_base = None
+                self.confidence = confidence
+                self.timestamp = time.monotonic()
+                self.target_capture_time = 0.0
+                self._observation = TargetObservation(
+                    measurement_time=float(measurement_time),
+                    published_time=published_time,
+                    source="fallback",
+                    confidence=float(confidence),
+                    prediction_age=0.0,
+                    covariance=None,
+                )
             return
+
         base_coords = vision.convert_to_base_coords(target_end, pose_at_capture)
         with self._lock:
             self.target_base = base_coords
             self.target_end = target_end
             self.confidence = confidence
             self.timestamp = time.perf_counter()
-            self.target_capture_time = time.perf_counter()
+            self.target_capture_time = published_time
+            self._observation = TargetObservation(
+                measurement_time=float(measurement_time),
+                published_time=published_time,
+                source="detection",
+                confidence=float(confidence),
+                prediction_age=0.0,
+                covariance=None,
+            )
+
+    def update_from_prediction(self, target_base, confidence, prediction_age,
+                               covariance=None, measurement_time=None):
+        """预测路径：用 Kalman 预测值更新 target_base。
+
+        生成 TargetObservation(source="prediction", prediction_age>0)。
+        用于后续无新检测时以 Kalman 预测值驱动伺服闭环。
+        """
+        published_time = time.perf_counter()
+        if measurement_time is None or measurement_time <= 0.0:
+            measurement_time = published_time
+        with self._lock:
+            self.target_base = target_base
+            self.confidence = confidence
+            self.timestamp = time.monotonic()
+            self.target_capture_time = published_time
+            self._observation = TargetObservation(
+                measurement_time=float(measurement_time),
+                published_time=published_time,
+                source="prediction",
+                confidence=float(confidence),
+                prediction_age=max(0.0, float(prediction_age)),
+                covariance=covariance,
+            )
+
+    def read_observation(self):
+        """读取当前 TargetObservation（线程安全拷贝）。无观测时返回 None。"""
+        with self._lock:
+            if self._observation is None:
+                return None
+            return TargetObservation(
+                measurement_time=self._observation.measurement_time,
+                published_time=self._observation.published_time,
+                source=self._observation.source,
+                confidence=self._observation.confidence,
+                prediction_age=self._observation.prediction_age,
+                covariance=(
+                    None if self._observation.covariance is None
+                    else self._observation.covariance.copy()
+                ),
+            )
 
     def read_end(self, max_age: float = 0.3):
         """读取末端坐标缓存，超过 max_age 返回 None"""
@@ -108,14 +208,20 @@ class TargetCache:
             return self.target_end.copy(), self.confidence, age
 
     def read_base(self, max_age: float = 0.3):
-        """读取基座坐标缓存 (fallback)，超过 max_age 返回 None"""
+        """读取基座坐标缓存，超过 max_age 返回 None。
+
+        返回签名保持 (target_base, confidence, age) 兼容；内部从 observation 提取置信度。
+        """
         with self._lock:
             if self.target_base is None:
                 return None, 0.0, float('inf')
             age = time.monotonic() - self.timestamp
             if age > max_age:
                 return None, 0.0, age
-            return self.target_base.copy(), self.confidence, age
+            conf = self.confidence
+            if self._observation is not None:
+                conf = self._observation.confidence
+            return self.target_base.copy(), conf, age
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +263,8 @@ class VisionThread:
         self.last_depth_ms = 0.0
         self.last_end_convert_ms = 0.0
         self.last_total_ms = 0.0
-        # Task 4: 由 FlowThread 注入的机器人位姿缓冲区，Task 5 消费（默认 None 向后兼容）
+        # pose_buffer 由 controller 拥有，_loop 通过 self.controller.pose_buffer 查询；
+        # 保留此字段仅为向后兼容，不再由 FlowExecutor 注入。
         self.pose_buffer = None
 
     def start(self):
@@ -275,18 +382,25 @@ class VisionThread:
             self._last_confidence = confidence
 
             target_end = np.array(end_coords[:3], dtype=np.float64)
-            # Task 5: 用采集时刻位姿预计算 target_base（主路径）；
-            # pose_buffer 不可用或插值失败时 pose_at_capture=None，退化兼容
+            # 通过 controller.pose_buffer 查询采集时刻位姿（主路径）；
+            # pose_at 返回 (None, False) 时降级为 fallback，记 warning
             pose_at_capture = None
-            if self.pose_buffer is not None and capture_time > 0:
-                pose_at_capture, ok = self.pose_buffer.pose_at(capture_time)
+            pose_buffer = getattr(self.controller, "pose_buffer", None)
+            if pose_buffer is not None and capture_time > 0:
+                pose_at_capture, ok = pose_buffer.pose_at(capture_time)
                 if not ok:
+                    logger.warning(
+                        "pose_buffer.pose_at(capture_time=%.4f) 返回 (None, False)，"
+                        "降级为 fallback 路径",
+                        capture_time,
+                    )
                     pose_at_capture = None
             self.target_cache.update_from_detection(
                 target_end=target_end,
                 pose_at_capture=pose_at_capture,
                 confidence=confidence,
                 vision=self.vision,
+                measurement_time=capture_time,
             )
             self.last_end_convert_ms = (time.monotonic() - t0) * 1000
 
@@ -384,7 +498,7 @@ class ServoThread:
         self.avg_servo_ms = 0.0
         self.skip_frame_count = 0
         self._servo_ms_history = []  # sliding window for avg_servo_ms
-        # Task 4: 由 FlowThread 注入的机器人位姿缓冲区，Task 6 消费（默认 None 向后兼容）
+        # pose_buffer 由 controller 拥有；保留此字段仅为向后兼容，不再由 FlowExecutor 注入。
         self.pose_buffer = None
 
     def start(self):

@@ -141,7 +141,10 @@ class GraspFlowMixin:
                     params.pop(legacy_key, None)
 
     def run_grasping_task(self):
-        return self._show_runtime_ipc_required("运行主流程")
+        main_flow_id = getattr(self.flow_library, "main_flow_id", None)
+        success, msg = self._runtime_facade.run_flow(main_flow_id)
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def check_main_flow_readiness(self):
         return False
@@ -152,7 +155,9 @@ class GraspFlowMixin:
 
     def _handle_flow_readiness_failure(self, result, modbus_triggered):
         del result, modbus_triggered
-        return self._show_runtime_ipc_required("运行流程")
+        success, msg = self._runtime_facade.run_flow()
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def _stop_camera_test_before_flow(self, modbus_triggered=False):
         del modbus_triggered
@@ -593,8 +598,10 @@ class GraspFlowMixin:
             QMessageBox.critical(self, "错误", f"加载抓取流程时出错: {e}")
 
     def run_grasp_flow(self, modbus_triggered=False, flow_id=None):
-        del modbus_triggered, flow_id
-        return self._show_runtime_ipc_required("运行流程")
+        del modbus_triggered
+        success, msg = self._runtime_facade.run_flow(flow_id)
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def _start_grasp_flow_snapshot(
         self,
@@ -603,8 +610,10 @@ class GraspFlowMixin:
         modules,
         modbus_triggered,
     ):
-        del selected_flow_id, selected_flow_name, modules, modbus_triggered
-        return self._show_runtime_ipc_required("运行流程")
+        del selected_flow_name, modules, modbus_triggered
+        success, msg = self._runtime_facade.run_flow(selected_flow_id)
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def _on_flow_log(self, msg):
         self.statusBar().showMessage(msg)

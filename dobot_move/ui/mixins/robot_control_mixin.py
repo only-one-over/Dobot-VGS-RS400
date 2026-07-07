@@ -1,38 +1,45 @@
-from ...ui.qt_compat import QMessageBox
-
-
 class RobotControlMixin:
-    """GUI hardware commands remain disabled until Runtime IPC is available."""
-
-    def _show_runtime_ipc_required(self, action):
-        message = f"{action}暂不可用：硬件由 Runtime 独占，等待调试 IPC 接入"
-        self.statusBar().showMessage(message)
-        QMessageBox.information(self, "Runtime 只读模式", message)
-        return False
+    """GUI hardware commands delegated to Runtime via ``RuntimeFacade`` IPC."""
 
     def enable_robot(self):
-        return self._show_runtime_ipc_required("使能机器人")
+        success, msg = self._runtime_facade.enable_robot()
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def disable_robot(self):
-        return self._show_runtime_ipc_required("下使能机器人")
+        success, msg = self._runtime_facade.disable_robot()
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def on_clear_error(self):
-        return self._show_runtime_ipc_required("清除故障")
+        success, msg = self._runtime_facade.clear_alarms()
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def move_to_initial_position(self):
-        return self._show_runtime_ipc_required("回到初始位置")
+        success, msg = self._runtime_facade.move_to_initial_position()
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def on_pause(self):
-        return self._show_runtime_ipc_required("暂停流程")
+        success, msg = self._runtime_facade.pause_flow()
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def on_continue(self):
-        return self._show_runtime_ipc_required("继续流程")
+        success, msg = self._runtime_facade.resume_flow()
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def connect_robot(self):
-        return self._show_runtime_ipc_required("连接机器人")
+        success, msg = self._runtime_facade.connect_robot()
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def set_collision_level(self):
-        return self._show_runtime_ipc_required("设置碰撞等级")
+        success, msg = self._runtime_facade.set_collision_level()
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def _run_cmd_thread(
         self,
@@ -43,10 +50,14 @@ class RobotControlMixin:
         show_result=True,
     ):
         del cmd_func, on_success, show_result
-        return self._show_runtime_ipc_required(cmd_name)
+        success, msg = self._runtime_facade._send(cmd_name, action_name=cmd_name)
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def _on_cmd_finished(self, cmd_name, success):
         del cmd_name, success
 
     def get_current_position(self):
-        return self._show_runtime_ipc_required("获取当前位置")
+        success, msg = self._runtime_facade.get_current_pose()
+        self.statusBar().showMessage(msg, 3000)
+        return success

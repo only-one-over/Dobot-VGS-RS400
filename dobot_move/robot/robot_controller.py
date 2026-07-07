@@ -21,6 +21,7 @@ from ..robot.motion_safety import (
     validate_motion_target, validate_servo_p_params,
     MotionValidationResult, MotionSafetyState,
 )
+from ..robot.robot_pose_buffer import RobotPoseBuffer
 from ..config.alarm_history import AlarmHistory
 from ..runtime.runtime_resilience import SingleInstanceLock
 
@@ -131,6 +132,8 @@ class DobotController:
         self._last_motion_completion_reason = None
         self._last_force_guard_event = None
         self._feed_packet_drops = 0
+        # 视觉时间对齐：位姿环形缓冲区，在 _store_feedback_packet 中每个 30004 Pose push
+        self.pose_buffer = RobotPoseBuffer()
 
         _cfg = get_config()
         self._user_index = _cfg.get("user_index", 0)
@@ -506,6 +509,8 @@ class DobotController:
                 old_feedback,
                 old_feed_thread,
             )
+            # 重连清空 pose_buffer，避免旧位姿污染视觉时间对齐
+            self.pose_buffer.clear()
             logger.info(
                 "===== [%s] 机器人连接成功 generation=%d =====",
                 time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -670,6 +675,8 @@ class DobotController:
                 logger.warning("反馈线程未能在1秒内退出")
         with self.feed_lock:
             self._reset_feedback_cache_locked()
+        # 断开连接时清空 pose_buffer，避免旧位姿污染下次重连后的视觉时间对齐
+        self.pose_buffer.clear()
 
     def release_control_lease(self):
         if self._control_lease is not None:
@@ -2329,6 +2336,9 @@ class DobotController:
             if pose is not None:
                 self.latest_pose = pose
                 self.latest_pose_time = now
+                # 视觉时间对齐：每个有效 30004 Pose 都 push 到 pose_buffer
+                # 使用 perf_counter 单调时钟，与 VisionThread capture_time 对齐
+                self.pose_buffer.push(time.perf_counter(), pose)
             if robot_mode is not None:
                 self.latest_robot_mode = robot_mode
                 self.latest_robot_mode_time = now

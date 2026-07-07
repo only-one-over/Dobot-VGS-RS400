@@ -14,9 +14,13 @@ class StartupConnectionMixin:
 
     def _request_device_connection(self, device_name, manual=False):
         del manual
-        if hasattr(self, "_show_runtime_ipc_required"):
-            return self._show_runtime_ipc_required(f"连接 {device_name}")
-        return False
+        success, msg = self._runtime_facade._send(
+            "connect_device",
+            {"device": device_name},
+            f"连接 {device_name}",
+        )
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def _request_missing_devices_background(self, missing_devices):
         del missing_devices

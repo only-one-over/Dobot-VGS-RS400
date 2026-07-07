@@ -37,6 +37,7 @@ from ..ui.gui_runtime_status import (
     runtime_state_color,
 )
 from ..ui.gui_ipc_client import RuntimeIpcClient, RuntimeIpcRequestThread
+from ..ui.runtime_facade import RuntimeFacade
 from ..runtime.runtime_ipc import DEFAULT_IPC_TOKEN_PATH
 from .mixins import (
     RobotControlMixin,
@@ -123,6 +124,12 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             ),
         )
         self._runtime_status = RuntimeHealthSnapshot()
+        self._runtime_facade = RuntimeFacade(
+            ipc_client=self._runtime_ipc_client,
+            send_ipc_func=self._send_runtime_ipc,
+            is_online_func=lambda: bool(self._runtime_status.online),
+            send_stop_func=self._send_runtime_ipc_stop,
+        )
         self._ipc_request_threads = set()
         self._ipc_pending_commands = set()
         self._alarm_history = AlarmHistory()
@@ -1851,7 +1858,9 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
                 self.alarm_table.setItem(row, col, QTableWidgetItem(str(record.get(field, ""))))
 
     def _clear_alarm_history(self):
-        return self._show_runtime_ipc_required("清空报警历史")
+        success, msg = self._runtime_facade.clear_alarm_history()
+        self.statusBar().showMessage(msg, 3000)
+        return success
     
     def _on_calib_camera_changed(self, camera_type):
         self._load_calib_matrix(camera_type)

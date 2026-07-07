@@ -137,3 +137,47 @@ def _ensure_mock_modules():
     simulator.SimData = getattr(simulator, "SimData", _SimData)
     simulator.SimDevice = getattr(simulator, "SimDevice", _SimDevice)
     simulator.DataType = getattr(simulator, "DataType", _DataType)
+
+
+# --- PR 2: capture_worker 提取后的额外 AST 检查 -----------------------------
+
+def _check_no_camera_test_worker_imports(module_path, module_name):
+    """Assert that a module's source does not import from camera_test_worker.
+
+    ``camera_test_worker`` (flow shim) pulls in Qt via ui.camera_test_worker,
+    so headless modules must not import from it.
+    """
+    with open(module_path, encoding="utf-8") as f:
+        source = f.read()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            assert "camera_test_worker" not in module, (
+                f"{module_name} imports from {module} at line {node.lineno} "
+                f"(should use vision.capture_worker instead)"
+            )
+
+
+def test_flow_executor_source_has_no_camera_test_worker_imports():
+    """flow_executor.py must not import from camera_test_worker (pulls in Qt)."""
+    _ensure_mock_modules()
+    from dobot_move.flow import flow_executor
+    source_path = inspect.getsourcefile(flow_executor)
+    _check_no_camera_test_worker_imports(source_path, "flow_executor")
+
+
+def test_capture_worker_source_has_no_qt_imports():
+    """vision/capture_worker.py must not contain any Qt import statements."""
+    _ensure_mock_modules()
+    import dobot_move.vision.capture_worker as cw
+    source_path = inspect.getsourcefile(cw)
+    _check_no_qt_imports(source_path, "capture_worker")
+
+
+def test_capture_worker_source_has_no_camera_test_worker_imports():
+    """vision/capture_worker.py must not import from camera_test_worker."""
+    _ensure_mock_modules()
+    import dobot_move.vision.capture_worker as cw
+    source_path = inspect.getsourcefile(cw)
+    _check_no_camera_test_worker_imports(source_path, "capture_worker")

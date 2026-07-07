@@ -30,7 +30,6 @@ from ..config.config_manager import (
 from ..vision.vision_system import FramePacket
 from ..robot.arc_motion_controller import ArcMotionController
 from ..robot.visual_servo_controller import VisualServoController
-from ..robot.robot_pose_buffer import RobotPoseBuffer
 
 try:
     import cv2
@@ -272,10 +271,6 @@ class FlowExecutor:
         self.performance_config = get_performance_config()
         self.active_visual_servo = None
         self.last_visual_servo_telemetry = {}
-        # Task 4: 机器人位姿环形缓冲区，供 VisionThread/ServoThread 按时间索引位姿。
-        # feedback 线程在 DobotController 内部，FlowExecutor 无法直接拦截，采用退化方案
-        # 在读取 current_pose 时同步 push（见 run() 中 TODO 标记位置）。
-        self.pose_buffer = RobotPoseBuffer()
         # Callback hooks (None = silent)
         self.on_log: Optional[Callable[[str], None]] = None
         self.on_finished: Optional[Callable[[bool], None]] = None
@@ -475,11 +470,11 @@ class FlowExecutor:
                 early_confidence,
             )
 
-        # Lazy import to avoid pulling Qt module at module load time.
-        from .camera_test_worker import CaptureThread
+        # Lazy import: 纯 Python 采集线程，无 Qt 依赖。
+        from ..vision.capture_worker import CaptureWorker
 
         vision.reset_tracking()
-        capture_thread = CaptureThread(vision)
+        capture_thread = CaptureWorker(vision)
         capture_thread.start()
 
         best_result = None
@@ -751,10 +746,9 @@ class FlowExecutor:
                             if not current_pose or len(current_pose) < 6:
                                 self._fail_module(ctx, i, name, "无法获取当前机器人位姿，无法生成圆弧")
                                 return
-                            # TODO(Task 4): 理想方案是在 DobotController feedback 回调
-                            # (_store_feedback_packet) 中对每个 30004 位姿帧 push；
-                            # 当前退化方案仅在 FlowExecutor 读取 current_pose 时同步 push。
-                            self.pose_buffer.push(time.perf_counter(), current_pose)
+                            # 位姿缓冲区由 RobotController 拥有，在 _store_feedback_packet 中 push；
+                            # 此处补充 push 当前位姿作为退化兜底（feedback 线程可能尚未 push 最新帧）。
+                            self.controller.pose_buffer.push(time.perf_counter(), current_pose)
 
                             center_offset_z = float(p.get('center_offset_z', p.get('radius', 50)))
                             sweep_angle = float(p.get('sweep_angle', abs(float(p.get('end_angle', 90)) - float(p.get('start_angle', 0)))))
@@ -1139,9 +1133,9 @@ class FlowExecutor:
                         except ValueError as e:
                             self._fail_module(ctx, i, name, str(e))
                             return
-                        # TODO(Task 4): 退化方案——仅在 FlowExecutor 读取 current_pose 时 push，
-                        # 理想方案见 arc_motion 模块中相同 TODO 说明。
-                        self.pose_buffer.push(time.perf_counter(), current_pose)
+                        # 位姿缓冲区由 RobotController 拥有（_store_feedback_packet 中 push）；
+                        # 此处补充 push 作为退化兜底，确保后续视觉伺服能查到当前时刻位姿。
+                        self.controller.pose_buffer.push(time.perf_counter(), current_pose)
                         try:
                             base_coords = coerce_float_vector(
                                 vision_to_use.convert_to_base_coords(end_coords, current_pose),
@@ -1196,9 +1190,8 @@ class FlowExecutor:
                             max_step_fine=float(p.get('max_step_fine', _vs_cfg.get('max_step_fine', 2.0))),
                         )
                         self.active_visual_servo = servo_ctrl
-                        # Task 4: 将 pose_buffer 注入 VisionThread/ServoThread，供 Task 5/6 消费
-                        servo_ctrl.vision_thread.pose_buffer = self.pose_buffer
-                        servo_ctrl.servo_thread.pose_buffer = self.pose_buffer
+                        # pose_buffer 由 RobotController 拥有，VisionThread 通过
+                        # controller.pose_buffer 直接查询，无需 FlowExecutor 注入。
 
                         def servo_log(msg):
                             if self.on_log:

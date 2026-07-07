@@ -162,9 +162,9 @@ def _make_flow_thread():
 
 
 def test_flow_camera_detection_uses_capture_thread_numpy_packets(monkeypatch):
-    import dobot_move.flow.camera_test_worker as camera_test_worker
+    import dobot_move.vision.capture_worker as capture_worker
 
-    monkeypatch.setattr(camera_test_worker, "CaptureThread", FakeCaptureThread)
+    monkeypatch.setattr(capture_worker, "CaptureWorker", FakeCaptureThread)
     thread = _make_flow_thread()
     ctx = FlowRunContext(run_id="test", start_time=0.0)
     vision = FakeVision({
@@ -191,9 +191,9 @@ def test_flow_camera_detection_uses_capture_thread_numpy_packets(monkeypatch):
 
 
 def test_flow_camera_detection_reports_depth_position_failure(monkeypatch):
-    import dobot_move.flow.camera_test_worker as camera_test_worker
+    import dobot_move.vision.capture_worker as capture_worker
 
-    monkeypatch.setattr(camera_test_worker, "CaptureThread", FakeCaptureThread)
+    monkeypatch.setattr(capture_worker, "CaptureWorker", FakeCaptureThread)
     thread = _make_flow_thread()
     ctx = FlowRunContext(run_id="test", start_time=0.0)
     vision = FakeVision(None)
@@ -211,9 +211,9 @@ def test_flow_camera_detection_reports_depth_position_failure(monkeypatch):
 
 
 def test_flow_camera_detection_reports_no_object(monkeypatch):
-    import dobot_move.flow.camera_test_worker as camera_test_worker
+    import dobot_move.vision.capture_worker as capture_worker
 
-    monkeypatch.setattr(camera_test_worker, "CaptureThread", FakeCaptureThread)
+    monkeypatch.setattr(capture_worker, "CaptureWorker", FakeCaptureThread)
     thread = _make_flow_thread()
     ctx = FlowRunContext(run_id="test", start_time=0.0)
     vision = NoDetectionVision(packet_count=2)
@@ -266,13 +266,13 @@ class FakeCameraTestWorker:
 
 
 def test_flow_camera_detection_reuses_running_camera_test_worker(monkeypatch):
-    import dobot_move.flow.camera_test_worker as camera_test_worker
+    import dobot_move.vision.capture_worker as capture_worker
 
     class ForbiddenCaptureThread:
         def __init__(self, vision):
             raise AssertionError("flow should reuse camera-test snapshots")
 
-    monkeypatch.setattr(camera_test_worker, "CaptureThread", ForbiddenCaptureThread)
+    monkeypatch.setattr(capture_worker, "CaptureWorker", ForbiddenCaptureThread)
     object_position = {
         "camera_coords": [1.0, 2.0, 3.0],
         "confidence": 0.93,

@@ -167,7 +167,13 @@ class PointManagementMixin:
         self.refresh_points_table()
 
     def _on_read_current_for_selected_point(self):
-        return self._show_runtime_ipc_required("读取当前点位")
+        name = getattr(self, "_editing_point_name", None)
+        if name:
+            success, msg = self._runtime_facade.get_point(name)
+        else:
+            success, msg = self._runtime_facade.get_current_pose()
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def _on_point_selection_changed(self):
         """Toggle the 'move_to_point' button based on table selection."""
@@ -248,4 +254,6 @@ class PointManagementMixin:
         return ""
 
     def _on_read_current_for_linear(self):
-        return self._show_runtime_ipc_required("读取当前位置")
+        success, msg = self._runtime_facade.get_current_pose()
+        self.statusBar().showMessage(msg, 3000)
+        return success

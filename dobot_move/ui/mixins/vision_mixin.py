@@ -69,27 +69,40 @@ class VisionMixin:
         apply_status_visual(label, status)
 
     def connect_d435i(self):
-        return self._show_runtime_ipc_required("连接 D435i")
+        success, msg = self._runtime_facade.connect_camera("D435i")
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def disconnect_d435i(self):
-        return self._show_runtime_ipc_required("断开 D435i")
+        success, msg = self._runtime_facade.disconnect_camera("D435i")
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def connect_d405(self):
-        return self._show_runtime_ipc_required("连接 D405")
+        success, msg = self._runtime_facade.connect_camera("D405")
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def disconnect_d405(self):
-        return self._show_runtime_ipc_required("断开 D405")
+        success, msg = self._runtime_facade.disconnect_camera("D405")
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def open_realtime_feedback(self):
-        return self._show_runtime_ipc_required("实时反馈")
+        success, msg = self._runtime_facade.open_realtime_feedback()
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def _start_camera_test(self):
-        return self._show_runtime_ipc_required("相机测试")
+        cam_type = self.cam_test_combo.currentText() or "D435i"
+        success, msg = self._runtime_facade.camera_test(cam_type)
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def _stop_camera_test(self):
         self.cam_test_start_btn.setEnabled(False)
         self.cam_test_stop_btn.setEnabled(False)
-        self.cam_test_status_label.setText("状态: Runtime 只读模式")
+        self.cam_test_status_label.setText("状态: 命令已发送")
         return False
 
     def _run_camera_self_test(self):

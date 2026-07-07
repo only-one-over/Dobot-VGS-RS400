@@ -2,10 +2,14 @@ class ModbusMixin:
     """Read-only Modbus status rendered from Runtime health."""
 
     def start_modbus_server(self):
-        return self._show_runtime_ipc_required("启动 Modbus 服务")
+        success, msg = self._runtime_facade.start_modbus()
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def stop_modbus_server(self):
-        return self._show_runtime_ipc_required("停止 Modbus 服务")
+        success, msg = self._runtime_facade.stop_modbus()
+        self.statusBar().showMessage(msg, 3000)
+        return success
 
     def _init_modbus_table(self):
         self.modbus_table.setRowCount(0)

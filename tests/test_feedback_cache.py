@@ -1,5 +1,6 @@
 """Regression tests for Dobot 30004 feedback cache parsing."""
 import sys
+import threading
 import time
 import types
 
@@ -34,6 +35,7 @@ def _install_modbus_stub():
 _install_modbus_stub()
 
 from dobot_move.dobot_api import MyType  # noqa: E402
+import dobot_move.robot_controller as controller_module  # noqa: E402
 from dobot_move.robot_controller import DobotController  # noqa: E402
 from dobot_move.motion_safety import MotionSafetyState  # noqa: E402
 
@@ -52,6 +54,84 @@ def _make_feedback_packet():
     packet["RunQueuedCmd"][0] = 0
     packet["CurrentCommandId"][0] = 1234
     return packet
+
+
+class _FakeTransportSocket:
+    def __init__(self):
+        self.timeout = 1.0
+
+    def gettimeout(self):
+        return self.timeout
+
+    def settimeout(self, value):
+        self.timeout = value
+
+
+class _AtomicDashboard:
+    instances = []
+
+    def __init__(self, ip, port, **kwargs):
+        self.ip = ip
+        self.port = port
+        self.kwargs = kwargs
+        self.socket_dobot = _FakeTransportSocket()
+        self.closed = False
+        self.__class__.instances.append(self)
+
+    def RobotMode(self):
+        return "0,{5},RobotMode();"
+
+    def GetAngle(self):
+        return "0,{1,2,3,4,5,6},GetAngle();"
+
+    def close(self):
+        self.closed = True
+
+
+class _AtomicFeedback:
+    instances = []
+    packet = None
+    entered = None
+    release = None
+
+    def __init__(self, ip, port, **kwargs):
+        self.ip = ip
+        self.port = port
+        self.kwargs = kwargs
+        self.socket_dobot = _FakeTransportSocket()
+        self.closed = False
+        self.__class__.instances.append(self)
+
+    def feedBackData(self):
+        if self.entered is not None:
+            self.entered.set()
+        if self.release is not None:
+            self.release.wait(1.0)
+        if self.closed:
+            raise OSError("feedback closed")
+        time.sleep(0.005)
+        return self.packet
+
+    def close(self):
+        self.closed = True
+
+
+def _install_atomic_transports(monkeypatch, packet):
+    _AtomicDashboard.instances = []
+    _AtomicFeedback.instances = []
+    _AtomicFeedback.packet = packet
+    _AtomicFeedback.entered = None
+    _AtomicFeedback.release = None
+    monkeypatch.setattr(
+        controller_module,
+        "DobotApiDashboard",
+        _AtomicDashboard,
+    )
+    monkeypatch.setattr(
+        controller_module,
+        "DobotApiFeedBack",
+        _AtomicFeedback,
+    )
 
 
 def _make_controller():
@@ -390,3 +470,93 @@ def test_stop_feedback_clears_cached_packet(monkeypatch):
     assert controller.latest_feed_time == 0.0
     assert controller.latest_pose is None
     assert controller.latest_actual_tcp_force is None
+
+
+def test_robot_connect_atomically_publishes_valid_transports(monkeypatch):
+    packet = _make_feedback_packet()
+    _install_atomic_transports(monkeypatch, packet)
+    controller = DobotController("192.168.1.50")
+
+    assert controller.connect() is True
+    assert controller.dashboard is _AtomicDashboard.instances[0]
+    assert controller.feed_four is _AtomicFeedback.instances[0]
+    assert controller.is_connected is True
+    assert controller.get_feedback_health()["health"] == "ok"
+    assert _AtomicDashboard.instances[0].kwargs["connect_timeout"] <= 2.0
+
+    controller.close_robot_transport()
+
+
+def test_robot_connect_failure_does_not_publish_partial_transport(monkeypatch):
+    packet = _make_feedback_packet()
+    packet["TestValue"][0] = 0
+    _install_atomic_transports(monkeypatch, packet)
+    controller = DobotController("192.168.1.50")
+    controller._robot_connect_deadline_s = 0.05
+    existing_dashboard = _FakeStopDashboard()
+    controller.dashboard = existing_dashboard
+
+    assert controller.connect() is False
+    assert controller.dashboard is existing_dashboard
+    assert controller.feed_four is None
+    assert controller.is_connected is False
+    assert _AtomicDashboard.instances[0].closed is True
+    assert _AtomicFeedback.instances[0].closed is True
+
+
+def test_robot_connect_discards_result_after_generation_changes(monkeypatch):
+    packet = _make_feedback_packet()
+    _install_atomic_transports(monkeypatch, packet)
+    entered = threading.Event()
+    release = threading.Event()
+    _AtomicFeedback.entered = entered
+    _AtomicFeedback.release = release
+    controller = DobotController("192.168.1.50")
+    controller._robot_connect_deadline_s = 1.0
+    results = []
+
+    worker = threading.Thread(target=lambda: results.append(controller.connect()))
+    worker.start()
+    assert entered.wait(1.0)
+
+    controller.close_robot_transport()
+    release.set()
+    worker.join(timeout=2.0)
+
+    assert results == [False]
+    assert controller.dashboard is None
+    assert controller.feed_four is None
+    assert controller.is_connected is False
+    assert _AtomicDashboard.instances[0].closed is True
+    assert _AtomicFeedback.instances[0].closed is True
+
+
+def test_maintenance_mode_blocks_modbus_motion_commands(monkeypatch):
+    controller = DobotController("192.168.1.50")
+    run_calls = []
+    monkeypatch.setattr(
+        controller,
+        "_modbus_run_edited_program",
+        lambda mode=0: run_calls.append(mode),
+    )
+    controller.set_runtime_maintenance(True)
+
+    controller._on_modbus_command(3, mode=0)
+
+    assert run_calls == []
+    assert controller._modbus_status_override == 0
+
+
+def test_maintenance_stop_does_not_auto_enable_robot(monkeypatch):
+    controller = DobotController("192.168.1.50")
+    auto_enable_values = []
+    monkeypatch.setattr(
+        controller,
+        "_clear_faults_for_modbus_zero",
+        lambda auto_enable=True: auto_enable_values.append(auto_enable),
+    )
+    controller.set_runtime_maintenance(True)
+
+    controller._on_modbus_command(0, mode=0)
+
+    assert auto_enable_values == [False]

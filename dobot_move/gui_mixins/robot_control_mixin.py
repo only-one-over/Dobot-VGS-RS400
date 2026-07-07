@@ -1,149 +1,52 @@
-import logging
-
 from ..qt_compat import QMessageBox
-
-from ..workers import RobotCmdThread
-
-logger = logging.getLogger(__name__)
 
 
 class RobotControlMixin:
+    """GUI hardware commands remain disabled until Runtime IPC is available."""
+
+    def _show_runtime_ipc_required(self, action):
+        message = f"{action}暂不可用：硬件由 Runtime 独占，等待调试 IPC 接入"
+        self.statusBar().showMessage(message)
+        QMessageBox.information(self, "Runtime 只读模式", message)
+        return False
 
     def enable_robot(self):
-        if not self.controller.is_connected:
-            QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
-            return
-
-        if self.controller.is_enabled:
-            QMessageBox.information(self, "提示", "机器人已使能")
-            return
-
-        self._run_cmd_thread("使能", self.controller.enable_robot)
+        return self._show_runtime_ipc_required("使能机器人")
 
     def disable_robot(self):
-        if not self.controller.is_connected:
-            QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
-            return
-
-        if not self.controller.is_enabled:
-            QMessageBox.information(self, "提示", "机器人已下使能")
-            return
-
-        self._run_cmd_thread("下使能", self.controller.disable_robot)
+        return self._show_runtime_ipc_required("下使能机器人")
 
     def on_clear_error(self):
-        if not self.controller.is_connected:
-            QMessageBox.warning(self, "提示", "请先连接机器人")
-            return
-        self._run_cmd_thread("清除故障", self.controller.clear_error)
+        return self._show_runtime_ipc_required("清除故障")
 
     def move_to_initial_position(self):
-        if not self.controller.is_connected:
-            QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
-            return
-
-        def _move_home():
-            if not getattr(self.controller, "is_enabled", False):
-                if not self.controller.enable_robot():
-                    return False
-            return self.controller.move_to_initial_position(
-                verify_start_pose=False,
-                verify_end_pose=True,
-            )
-
-        self._run_cmd_thread("回到初始位置", _move_home)
+        return self._show_runtime_ipc_required("回到初始位置")
 
     def on_pause(self):
-        if not self._flow_running:
-            self.statusBar().showMessage("当前没有运行中的任务")
-            return
-        self.is_paused = True
-        self._is_paused_ref[0] = True
-        self.controller.pause()
-        self.statusBar().showMessage("流程已暂停")
-        if hasattr(self, "_refresh_action_states"):
-            self._refresh_action_states()
+        return self._show_runtime_ipc_required("暂停流程")
 
     def on_continue(self):
-        if not self._flow_running:
-            self.statusBar().showMessage("当前没有运行中的任务")
-            return
-        self.is_paused = False
-        self._is_paused_ref[0] = False
-        self.controller.continue_motion()
-        self.statusBar().showMessage("流程已继续")
-        if hasattr(self, "_refresh_action_states"):
-            self._refresh_action_states()
+        return self._show_runtime_ipc_required("继续流程")
 
     def connect_robot(self):
-        if self.controller.is_connected:
-            QMessageBox.information(self, "提示", "机器人已连接")
-            return
-        self._request_device_connection("robot", manual=True)
+        return self._show_runtime_ipc_required("连接机器人")
 
     def set_collision_level(self):
-        if not self.controller.is_connected:
-            QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
-            return
-
-        level = self.collision_combo.currentIndex()
-        self._run_cmd_thread("设置碰撞等级", lambda: self.controller.set_collision_level(level))
+        return self._show_runtime_ipc_required("设置碰撞等级")
 
     def _run_cmd_thread(
         self,
         cmd_name,
-        cmd_func,
+        cmd_func=None,
         *,
         on_success=None,
         show_result=True,
     ):
-        if getattr(self, "_cmd_running", False):
-            self.statusBar().showMessage("已有机器人命令正在执行，请稍候")
-            return False
-        self._cmd_running = True
-        if hasattr(self, "_refresh_action_states"):
-            self._refresh_action_states()
-        self.statusBar().showMessage(f"正在{cmd_name}...")
-        self._cmd_on_success = on_success
-        self._cmd_show_result = bool(show_result)
-        self._cmd_thread = RobotCmdThread(cmd_name, cmd_func, self)
-        self._cmd_thread.cmd_finished.connect(self._on_cmd_finished)
-        self._cmd_thread.finished.connect(self._cmd_thread.deleteLater)
-        self._cmd_thread.start()
-        return True
+        del cmd_func, on_success, show_result
+        return self._show_runtime_ipc_required(cmd_name)
 
     def _on_cmd_finished(self, cmd_name, success):
-        on_success = getattr(self, "_cmd_on_success", None)
-        show_result = getattr(self, "_cmd_show_result", True)
-        self._cmd_on_success = None
-        self._cmd_show_result = True
-        self._cmd_running = False
-        self._cmd_thread = None
-        if success:
-            if show_result:
-                QMessageBox.information(self, "成功", f"{cmd_name}成功")
-        else:
-            error_msg = self.controller.last_error if hasattr(self.controller, 'last_error') else ""
-            if error_msg and show_result:
-                QMessageBox.critical(self, "错误", f"{cmd_name}失败\n\n原因: {error_msg}\n\n建议检查:\n1. 机器人IP地址是否正确\n2. 电脑和机器人是否在同一网段\n3. 机器人是否已启用TCP/IP控制模式\n4. 防火墙是否阻止了端口29999")
-            elif show_result:
-                QMessageBox.critical(self, "错误", f"{cmd_name}失败")
-        self.statusBar().showMessage(f"{cmd_name}{'成功' if success else '失败'}")
-        if hasattr(self, "_refresh_action_states"):
-            self._refresh_action_states()
-        if success and on_success is not None:
-            try:
-                on_success()
-            except Exception:
-                logger.exception("%s成功后的回调执行失败", cmd_name)
+        del cmd_name, success
 
     def get_current_position(self):
-        if not self.controller.is_connected:
-            QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
-            return
-
-        current_pose = self.controller.get_current_pose_fast()
-        if current_pose:
-            QMessageBox.information(self, "当前位置", f"当前位置:\n{current_pose}")
-        else:
-            QMessageBox.critical(self, "错误", "获取位置失败")
+        return self._show_runtime_ipc_required("获取当前位置")

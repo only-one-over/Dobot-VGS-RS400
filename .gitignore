@@ -27,8 +27,17 @@ PORTING_GUIDE.md
 dobot_move/alarm_history.json
 figma_thumbnail.png
 vendor/
+!dobot_move/windows_service/vendor/
+!dobot_move/windows_service/vendor/LICENSE-WinSW.txt
+!dobot_move/windows_service/vendor/VERSION
+!dobot_move/windows_service/vendor/WinSW-x64.sha256
+dobot_move/windows_service/vendor/WinSW-x64.exe
 docs/code_wiki.md
 logs/
 runtime_health.json
 runtime_state.json
+runtime_publication.json
+runtime_publication.json.bak
+runtime_ipc.token
+runtime_service_stopped.json
 *.lock

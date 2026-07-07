@@ -119,21 +119,39 @@ def alarmAlarmJsonFile():
 
 
 class DobotApi:
-    def __init__(self, ip, port, *args):
+    def __init__(
+        self,
+        ip,
+        port,
+        *args,
+        connect_timeout=2.0,
+        io_timeout=3.0,
+    ):
         self.ip = ip
         self.port = port
         self.socket_dobot = 0
         self.__globalLock = threading.Lock()
-        if args:
-            self.text_log = args[0]
+        self.text_log = args[0] if args else None
+        self.connect_timeout = max(0.1, float(connect_timeout))
+        self.io_timeout = (
+            None if io_timeout is None else max(0.1, float(io_timeout))
+        )
 
         if self.port == 29999 or self.port == 30004 or self.port == 30005:
+            socket_dobot = socket.socket()
             try:
-                self.socket_dobot = socket.socket()
-                self.socket_dobot.connect((self.ip, self.port))
-                self.socket_dobot.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 144000)
-            except socket.error:
-                print(socket.error)
+                socket_dobot.settimeout(self.connect_timeout)
+                socket_dobot.connect((self.ip, self.port))
+                socket_dobot.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_RCVBUF,
+                    144000,
+                )
+                socket_dobot.settimeout(self.io_timeout)
+                self.socket_dobot = socket_dobot
+            except OSError:
+                socket_dobot.close()
+                raise
 
         else:
             print(f"Connect to dashboard server need use port {self.port} !")
@@ -144,47 +162,36 @@ class DobotApi:
 
     def send_data(self, string):
        # self.log(f"Send to {self.ip}:{self.port}: {string}")
-        try:
-            self.socket_dobot.send(str.encode(string, 'utf-8'))
-        except Exception as e:
-            print(e)
-            while True:
-                try:
-                    self.socket_dobot = self.reConnect(self.ip, self.port)
-                    self.socket_dobot.send(str.encode(string, 'utf-8'))
-                    break
-                except Exception:
-                    sleep(1)
+        if self.socket_dobot == 0:
+            raise ConnectionError("Dobot socket is not connected")
+        self.socket_dobot.sendall(str.encode(string, 'utf-8'))
 
     def wait_reply(self):
         """
         Read the return value
         """
-        data = ""
-        try:
-            data = self.socket_dobot.recv(1024)
-        except Exception as e:
-            print(e)
-            self.socket_dobot = self.reConnect(self.ip, self.port)
-
-        finally:
-            if len(data) == 0:
-                data_str = data
-            else:
-                data_str = str(data, encoding="utf-8")
-            # self.log(f'Receive from {self.ip}:{self.port}: {data_str}')
-            return data_str
+        if self.socket_dobot == 0:
+            raise ConnectionError("Dobot socket is not connected")
+        data = self.socket_dobot.recv(1024)
+        if not data:
+            raise ConnectionError("Dobot socket closed by peer")
+        return str(data, encoding="utf-8")
 
     def close(self):
         """
         Close the port
         """
-        if (self.socket_dobot != 0):
+        socket_dobot = self.socket_dobot
+        self.socket_dobot = 0
+        if socket_dobot != 0:
             try:
-                self.socket_dobot.shutdown(socket.SHUT_RDWR)
-                self.socket_dobot.close()
-            except socket.error as e:
-                print(f"Error while closing socket: {e}")
+                socket_dobot.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                socket_dobot.close()
+            except OSError:
+                pass
 
     def sendRecvMsg(self, string):
         """
@@ -199,14 +206,16 @@ class DobotApi:
         self.close()
 
     def reConnect(self, ip, port):
-        while True:
-            try:
-                socket_dobot = socket.socket()
-                socket_dobot.connect((ip, port))
-                break
-            except Exception:
-                sleep(1)
-        return socket_dobot
+        """Perform one bounded compatibility reconnect attempt."""
+        socket_dobot = socket.socket()
+        try:
+            socket_dobot.settimeout(self.connect_timeout)
+            socket_dobot.connect((ip, port))
+            socket_dobot.settimeout(self.io_timeout)
+            return socket_dobot
+        except OSError:
+            socket_dobot.close()
+            raise
 
 # 控制及运动指令接口类
 # Control and motion command interface
@@ -214,8 +223,8 @@ class DobotApi:
 
 class DobotApiDashboard(DobotApi):
 
-    def __init__(self, ip, port, *args):
-        super().__init__(ip, port, *args)
+    def __init__(self, ip, port, *args, **kwargs):
+        super().__init__(ip, port, *args, **kwargs)
 
     def _fmt(self, v):
         if isinstance(v, (list, tuple)):
@@ -3490,8 +3499,8 @@ class DobotApiDashboard(DobotApi):
 
 
 class DobotApiFeedBack(DobotApi):
-    def __init__(self, ip, port, *args):
-        super().__init__(ip, port, *args)
+    def __init__(self, ip, port, *args, **kwargs):
+        super().__init__(ip, port, *args, **kwargs)
         self.__MyType = []
         self.last_recv_time = time.perf_counter()
         
@@ -3501,35 +3510,37 @@ class DobotApiFeedBack(DobotApi):
         返回机械臂状态
         Return the robot status
         """
-        self.socket_dobot.setblocking(True)  # 设置为阻塞模式
-        data = bytes()
-        current_recv_time = time.perf_counter() #计时，获取当前时间
-        temp = self.socket_dobot.recv(144000) #缓冲区
-        if len(temp) > 1440:    
-            temp = self.socket_dobot.recv(144000)
-        #print("get:",len(temp))
-        i=0
-        if len(temp) < 1440:
-            while i < 5 :
-                #print("重新接收")
-                temp = self.socket_dobot.recv(144000)
-                if len(temp) > 1440:
-                    break
-                i+=1
-            if i >= 5:
-                raise Exception("接收数据包缺失，请检查网络环境")
-        
-        interval = (current_recv_time - self.last_recv_time) * 1000  # 转换为毫秒
-        self.last_recv_time = current_recv_time
-        #print(f"Time interval since last receive: {interval:.3f} ms")
-        
-        data = temp[0:1440] #截取1440字节
-        #print(len(data))
-        #print(f"Single element size of MyType: {MyType.itemsize} bytes")
-        self.__MyType = None   
+        socket_dobot = self.socket_dobot
+        old_timeout = (
+            socket_dobot.gettimeout()
+            if hasattr(socket_dobot, "gettimeout")
+            else self.io_timeout
+        )
+        read_timeout = (
+            float(old_timeout)
+            if old_timeout is not None
+            else float(self.io_timeout or 3.0)
+        )
+        deadline = time.monotonic() + max(0.1, read_timeout)
+        data = bytearray()
+        try:
+            while len(data) < 1440:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("30004 feedback packet timed out")
+                socket_dobot.settimeout(remaining)
+                chunk = socket_dobot.recv(1440 - len(data))
+                if not chunk:
+                    raise ConnectionError("30004 feedback socket closed")
+                data.extend(chunk)
+        finally:
+            socket_dobot.settimeout(old_timeout)
+
+        self.last_recv_time = time.perf_counter()
+        self.__MyType = None
 
         if len(data) == 1440:        
-            self.__MyType = np.frombuffer(data, dtype=MyType)
+            self.__MyType = np.frombuffer(bytes(data), dtype=MyType)
 
         return self.__MyType
         

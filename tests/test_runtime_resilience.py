@@ -177,3 +177,76 @@ def test_watchdog_restart_storm_creates_lockout():
         assert watchdog.check_once(now=10) == "restarted"
         assert watchdog.check_once(now=11) == "locked_out"
         assert (tmp_path / "runtime_watchdog_lockout.json").exists()
+
+
+def test_watchdog_service_mode_restarts_through_scm_callback():
+    with _workspace_temp_dir() as tmp_path:
+        health_path = tmp_path / "health.json"
+        health_path.write_text(
+            json.dumps(
+                {
+                    "timestamp": 1,
+                    "runtime": {"state": RuntimeState.RUNNING.value},
+                    "flow": {"running": True},
+                    "process": {"pid": 321},
+                }
+            ),
+            encoding="utf-8",
+        )
+        calls = []
+        watchdog = RuntimeWatchdog(
+            health_path,
+            state_dir=tmp_path,
+            restart_mode="service",
+            query_service_state=lambda: "RUNNING",
+            stop_robot=lambda: calls.append("stop"),
+            restart_service=lambda pid: calls.append(("restart_service", pid)),
+        )
+
+        assert watchdog.check_once(now=30) == "restarted"
+        assert calls == ["stop", ("restart_service", 321)]
+
+
+def test_watchdog_does_not_restart_intentionally_stopped_service():
+    with _workspace_temp_dir() as tmp_path:
+        marker = tmp_path / "runtime_service_stopped.json"
+        marker.write_text("{}", encoding="utf-8")
+        health_path = tmp_path / "health.json"
+        health_path.write_text(
+            json.dumps(
+                {
+                    "timestamp": 1,
+                    "runtime": {
+                        "state": RuntimeState.STOPPING.value,
+                        "stop_marker_path": str(marker),
+                    },
+                    "flow": {"running": False},
+                    "process": {"pid": 0},
+                }
+            ),
+            encoding="utf-8",
+        )
+        calls = []
+        watchdog = RuntimeWatchdog(
+            health_path,
+            state_dir=tmp_path,
+            restart_mode="service",
+            query_service_state=lambda: "STOPPED",
+            restart_service=lambda pid: calls.append(pid),
+        )
+
+        assert watchdog.check_once(now=30) == "intentionally_stopped"
+        assert calls == []
+
+
+def test_watchdog_waits_during_service_transition():
+    with _workspace_temp_dir() as tmp_path:
+        watchdog = RuntimeWatchdog(
+            tmp_path / "missing-health.json",
+            state_dir=tmp_path,
+            restart_mode="service",
+            query_service_state=lambda: "START_PENDING",
+            restart_service=lambda pid: None,
+        )
+
+        assert watchdog.check_once(now=30) == "service_transition"

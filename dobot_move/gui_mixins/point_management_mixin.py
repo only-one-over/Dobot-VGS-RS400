@@ -154,8 +154,7 @@ class PointManagementMixin:
         if name == "initial_point":
             resolved = resolve_point("initial_point")
             if resolved and len(resolved) >= 6:
-                self.controller.initial_pose = resolved[:6]
-                self.update_status("photo_position", self.controller.initial_pose)
+                self.update_status("photo_position", resolved[:6])
 
         self._editing_point_row = -1
         self._editing_point_name = None
@@ -168,21 +167,7 @@ class PointManagementMixin:
         self.refresh_points_table()
 
     def _on_read_current_for_selected_point(self):
-        row = getattr(self, "_editing_point_row", -1)
-        if row < 0:
-            QMessageBox.warning(self, "警告", "请先点击修改点位")
-            return
-        if not self.controller.is_connected:
-            QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
-            return
-        current_pose = self.controller.get_current_pose_fast()
-        if not current_pose or len(current_pose) < 6:
-            QMessageBox.critical(self, "错误", "获取当前点位失败")
-            return
-        for col_idx, value in enumerate(current_pose[:6]):
-            spin = self.points_table.cellWidget(row, col_idx + 1)
-            if spin:
-                spin.setValue(float(value))
+        return self._show_runtime_ipc_required("读取当前点位")
 
     def _refresh_point_combos(self):
         point_names = self._get_point_combo_names()
@@ -228,20 +213,4 @@ class PointManagementMixin:
         return ""
 
     def _on_read_current_for_linear(self):
-        if not self.controller.is_connected:
-            QMessageBox.warning(self, "警告", "机器人未连接，请先连接")
-            return
-        current_pose = self.controller.get_current_pose_fast()
-        if current_pose and len(current_pose) >= 6:
-            point_data = get_point("current_pos")
-            if point_data is None:
-                add_point("current_pos")
-                point_data = get_point("current_pos")
-            point_data["coords"] = list(current_pose[:6])
-            ConfigService.instance().set_point("current_pos", point_data)
-            self.refresh_points_table()
-            idx = self.linear_point_combo.findText("current_pos")
-            if idx >= 0:
-                self.linear_point_combo.setCurrentIndex(idx)
-        else:
-            QMessageBox.critical(self, "错误", "获取当前位置失败")
+        return self._show_runtime_ipc_required("读取当前位置")

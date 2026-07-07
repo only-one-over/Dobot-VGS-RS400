@@ -10,6 +10,9 @@ import os
 import re
 import shutil
 import uuid
+import copy
+import contextvars
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -22,6 +25,10 @@ DEFAULT_CAMERA_MODEL_PATH = os.path.join(_MODULE_DIR, "best.onnx")
 SUPPORTED_CAMERA_TYPES = ("D435i", "D405")
 _config_cache = None
 _cache_valid = False
+_execution_config_snapshot = contextvars.ContextVar(
+    "execution_config_snapshot",
+    default=None,
+)
 
 DEFAULT_PERFORMANCE_CONFIG = {
     "flow_wait_poll_interval": 0.05,
@@ -46,6 +53,9 @@ DEFAULT_PERFORMANCE_CONFIG = {
 DEFAULT_RUNTIME_CONFIG = {
     "startup_connect_timeout_s": 5.0,
     "camera_retry_interval_s": 10.0,
+    "ipc_host": "127.0.0.1",
+    "ipc_port": 8765,
+    "ipc_command_timeout_s": 5.0,
 }
 
 
@@ -76,6 +86,9 @@ def get_visual_servo_config():
 def load_config():
     """加载配置文件（支持备份恢复）"""
     global _config_cache, _cache_valid
+    execution_snapshot = _execution_config_snapshot.get()
+    if execution_snapshot is not None:
+        return execution_snapshot
     if _cache_valid and _config_cache is not None:
         return _config_cache
     if os.path.exists(CONFIG_FILE):
@@ -106,9 +119,40 @@ def load_config():
         return {}
 
 
+def invalidate_config_cache():
+    """Invalidate this process's config cache without changing the file."""
+    global _config_cache, _cache_valid
+    _config_cache = None
+    _cache_valid = False
+
+
+def reload_config():
+    """Reload config.json into this process and return the new snapshot."""
+    invalidate_config_cache()
+    return load_config()
+
+
+@contextmanager
+def use_config_snapshot(config):
+    """Pin config reads in the current execution context to one snapshot."""
+    if not isinstance(config, dict):
+        raise TypeError("config snapshot must be a dict")
+    token = _execution_config_snapshot.set(copy.deepcopy(config))
+    try:
+        yield
+    finally:
+        _execution_config_snapshot.reset(token)
+
+
 def save_config(config):
     """保存配置文件（原子写入 + 备份）"""
     global _config_cache, _cache_valid
+    execution_snapshot = _execution_config_snapshot.get()
+    if execution_snapshot is not None:
+        updated = copy.deepcopy(config)
+        execution_snapshot.clear()
+        execution_snapshot.update(updated)
+        return True
     try:
         # 写入前备份旧文件
         if os.path.exists(CONFIG_FILE):

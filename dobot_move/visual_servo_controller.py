@@ -337,6 +337,7 @@ class ServoThread:
         self.last_target_age = 0.0
         self.last_pose_age = 0.0
         self.last_error_mm = 0.0
+        self.last_error_xyz = [0.0, 0.0, 0.0]
         self.last_read_cache_ms = 0.0
         self.last_read_pose_ms = 0.0
         self.last_base_convert_ms = 0.0
@@ -481,6 +482,7 @@ class ServoThread:
             e = np.array(target_base[:3]) - np.array(current_pose[:3])
             error_mm = np.linalg.norm(e)
             self.last_error_mm = error_mm
+            self.last_error_xyz = [float(value) for value in e[:3]]
 
             # ── 4. 安全检查 ──
             if error_mm > self.max_error_mm:

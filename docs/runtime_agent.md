@@ -115,7 +115,11 @@ Get-Content .\logs\runtime_watchdog.log -Tail 100
 }
 ```
 
-## 安装开机自启动
+## Windows Service（推荐）
+
+生产环境推荐使用 WinSW 双服务，Runtime 与 Watchdog 都由 Windows SCM 管理，GUI 保持独立。安装、验证、卸载和回滚命令见 [windows_service.md](windows_service.md)。
+
+## 旧任务计划方式（兼容回滚）
 
 以管理员身份打开 PowerShell，在项目根目录执行：
 

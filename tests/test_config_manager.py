@@ -96,6 +96,26 @@ class TestAtomicWrite:
             cm._cache_valid = False
             cm._config_cache = None
 
+    def test_reload_config_invalidates_process_cache(self):
+        import dobot_move.config_manager as cm
+
+        original_file = cm.CONFIG_FILE
+        try:
+            cm.CONFIG_FILE = self.config_file
+            cm._cache_valid = False
+            cm._config_cache = None
+            save_config({"version": 1})
+            assert load_config()["version"] == 1
+            with open(self.config_file, "w", encoding="utf-8") as handle:
+                json.dump({"version": 2}, handle)
+
+            assert load_config()["version"] == 1
+            assert cm.reload_config()["version"] == 2
+        finally:
+            cm.CONFIG_FILE = original_file
+            cm._cache_valid = False
+            cm._config_cache = None
+
 
 class TestVisualServoConfig:
     """Test visual servo config retrieval."""

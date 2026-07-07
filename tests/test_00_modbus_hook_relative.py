@@ -767,14 +767,12 @@ def test_relative_path_segment_log_does_not_use_percent_formatting():
     assert "speed={seg_speed}% cp={seg_cp} r={seg_r} elapsed={seg_elapsed:.3f}s" in source
 
 
-def test_gui_modbus_program_uses_signal_and_resets_after_success():
+def test_runtime_exclusively_registers_modbus_program_runner():
     with open("dobot_move/gui_app.py", encoding="utf-8") as f:
         gui_source = f.read()
-    with open("dobot_move/gui_mixins/grasp_flow_mixin.py", encoding="utf-8") as f:
-        flow_source = f.read()
+    with open("dobot_move/runtime_agent.py", encoding="utf-8") as f:
+        runtime_source = f.read()
 
-    assert "_modbus_program_requested = pyqtSignal()" in gui_source
-    assert "set_modbus_program_runner" in gui_source
-    assert "flow_id=self.flow_library.main_flow_id" in gui_source
-    assert "mark_modbus_program_finished(True)" in flow_source
-    assert "reset_modbus_status_to_idle" not in flow_source
+    assert "set_modbus_program_runner" not in gui_source
+    assert "DobotController(" not in gui_source
+    assert "self.controller.set_modbus_program_runner(" in runtime_source

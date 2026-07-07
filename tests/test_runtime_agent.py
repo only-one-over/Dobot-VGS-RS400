@@ -1,9 +1,12 @@
 """Regression tests for the unattended runtime agent."""
 import json
+import shutil
 import sys
 import threading
 import time
 import types
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 if "pyrealsense2" not in sys.modules:
@@ -46,6 +49,9 @@ from dobot_move.runtime_agent import (  # noqa: E402
     RuntimeProgramRunner,
 )
 from dobot_move.runtime_resilience import RuntimeState, RuntimeStateStore  # noqa: E402
+from dobot_move.runtime_ipc import IpcCommandError  # noqa: E402
+from dobot_move.runtime_ipc import RuntimeIpcServer  # noqa: E402
+from dobot_move.gui_ipc_client import RuntimeIpcClient  # noqa: E402
 
 
 class _FakeDashboard:
@@ -85,6 +91,7 @@ class _FakeController:
         self.alarms = []
         self._active_flow_thread = None
         self.runtime_recovery_required = None
+        self.runtime_maintenance = False
 
     def connect(self):
         self.connect_calls += 1
@@ -145,6 +152,59 @@ class _FakeController:
     def set_runtime_recovery_required(self, required=True, on_cleared=None):
         self.runtime_recovery_required = bool(required)
 
+    def set_runtime_maintenance(self, active=True):
+        self.runtime_maintenance = bool(active)
+
+    @contextmanager
+    def _temp_timeout(self, seconds):
+        del seconds
+        yield
+
+
+class _FakeIpcServer:
+    def __init__(self):
+        self.started = False
+        self.stopped = False
+        self.last_error = ""
+
+    def start(self):
+        self.started = True
+        return True
+
+    def stop(self):
+        self.stopped = True
+
+    def snapshot(self):
+        return {
+            "running": self.started and not self.stopped,
+            "host": "127.0.0.1",
+            "port": 8765,
+            "clients": 0,
+            "queue_depth": 0,
+            "last_error": self.last_error,
+        }
+
+
+@contextmanager
+def _runtime_agent_fixture():
+    temp_dir = Path.cwd() / f"_runtime_ipc_agent_test_{uuid.uuid4().hex}"
+    temp_dir.mkdir()
+    try:
+        controller = _FakeController()
+        agent = DobotRuntimeAgent(
+            controller=controller,
+            health_path=temp_dir / "health.json",
+            state_path=temp_dir / "state.json",
+            startup_delay=0,
+            poll_interval=0.1,
+            ipc_server=_FakeIpcServer(),
+        )
+        agent.state_store.begin_boot()
+        agent._state_initialized = True
+        yield agent, controller
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 def test_runtime_defaults_stay_in_project_root_after_package_move():
     project_root = Path(__file__).resolve().parents[1]
@@ -154,6 +214,182 @@ def test_runtime_defaults_stay_in_project_root_after_package_move():
     assert runtime_module.DEFAULT_STATE_PATH == project_root / "runtime_state.json"
     assert runtime_module.DEFAULT_LOCK_PATH == project_root / "runtime_agent.lock"
     assert runtime_module.DEFAULT_LOG_DIR == project_root / "logs"
+
+
+def test_ipc_maintenance_transitions_are_idempotent():
+    with _runtime_agent_fixture() as (agent, controller):
+        controller.is_connected = True
+        agent.state_store.transition(RuntimeState.READY)
+
+        entered = agent._handle_ipc_command("enter_maintenance", {})
+        entered_again = agent._handle_ipc_command("enter_maintenance", {})
+        exited = agent._handle_ipc_command("exit_maintenance", {})
+
+        assert entered["runtime_state"] == RuntimeState.MAINTENANCE.value
+        assert entered["already_active"] is False
+        assert entered_again["already_active"] is True
+        assert controller.runtime_maintenance is False
+        assert exited["runtime_state"] == RuntimeState.READY.value
+        assert exited["auto_resumed"] is False
+
+
+def test_ipc_enter_maintenance_rejects_running_flow(monkeypatch):
+    with _runtime_agent_fixture() as (agent, _controller):
+        monkeypatch.setattr(
+            agent.program_runner,
+            "snapshot",
+            lambda: {"running": True},
+        )
+
+        try:
+            agent._handle_ipc_command("enter_maintenance", {})
+        except IpcCommandError as exc:
+            assert exc.code == "RUNTIME_BUSY"
+        else:
+            raise AssertionError("running flow must block maintenance")
+
+        assert agent.maintenance_mode is False
+
+
+def test_ipc_maintenance_race_restores_previous_state(monkeypatch):
+    with _runtime_agent_fixture() as (agent, controller):
+        agent.state_store.transition(RuntimeState.READY)
+        checks = iter([False, True])
+        monkeypatch.setattr(
+            agent,
+            "_runtime_motion_busy",
+            lambda: next(checks),
+        )
+
+        try:
+            agent._handle_ipc_command("enter_maintenance", {})
+        except IpcCommandError as exc:
+            assert exc.code == "RUNTIME_BUSY"
+        else:
+            raise AssertionError("maintenance race must fail")
+
+        assert agent.maintenance_mode is False
+        assert controller.runtime_maintenance is False
+        assert agent.state_store.snapshot()["state"] == RuntimeState.READY.value
+
+
+def test_ipc_stop_current_task_sets_stop_and_sends_robot_stop():
+    with _runtime_agent_fixture() as (agent, controller):
+        stop_event = threading.Event()
+
+        class Flow:
+            def __init__(self):
+                self._ctx = types.SimpleNamespace(stop_event=stop_event)
+                self.stop_calls = 0
+
+            def stop(self):
+                self.stop_calls += 1
+
+        flow = Flow()
+        controller._active_flow_thread = flow
+
+        result = agent._handle_ipc_command("stop_current_task", {})
+
+        assert result["stop_requested"] is True
+        assert result["stop_sent"] is True
+        assert stop_event.is_set()
+        assert flow.stop_calls == 1
+        assert controller.dashboard.stop_calls == 1
+
+
+def test_ipc_reload_config_refreshes_next_task_only(monkeypatch):
+    with _runtime_agent_fixture() as (agent, controller):
+        monkeypatch.setattr(
+            runtime_module,
+            "reload_config",
+            lambda: {"user_index": 2, "tool_index": 3},
+        )
+        monkeypatch.setattr(agent, "validate_startup_inputs", lambda: [])
+        monkeypatch.setattr(
+            agent,
+            "_refresh_startup_requirements",
+            lambda force=False: None,
+        )
+        agent._startup_main_flow_id = "flow-1"
+        agent._startup_main_flow_name = "流程 1"
+
+        result = agent._handle_ipc_command("reload_config", {})
+
+        assert result["reloaded"] is True
+        assert result["applies_to_running_task"] is False
+        assert controller._user_index == 2
+        assert controller._tool_index == 3
+
+
+def test_ipc_reload_config_rejects_running_flow(monkeypatch):
+    with _runtime_agent_fixture() as (agent, _controller):
+        monkeypatch.setattr(
+            agent.program_runner,
+            "snapshot",
+            lambda: {"running": True},
+        )
+
+        try:
+            agent._handle_ipc_command("reload_config", {})
+        except IpcCommandError as exc:
+            assert exc.code == "RUNTIME_BUSY"
+        else:
+            raise AssertionError("running flow must block config reload")
+
+
+def test_ipc_unknown_command_has_stable_error_code():
+    with _runtime_agent_fixture() as (agent, _controller):
+        try:
+            agent._handle_ipc_command("does_not_exist", {})
+        except IpcCommandError as exc:
+            assert exc.code == "UNKNOWN_COMMAND"
+        else:
+            raise AssertionError("unknown command must fail")
+
+
+def test_debug_flow_requires_maintenance_mode():
+    with _runtime_agent_fixture() as (agent, controller):
+        controller.is_connected = True
+        controller.is_enabled = True
+        try:
+            agent._handle_ipc_command("start_debug_flow", {})
+        except IpcCommandError as exc:
+            assert exc.code == "NOT_IN_MAINTENANCE"
+        else:
+            raise AssertionError("debug flow must require maintenance mode")
+
+
+def test_validate_flow_reports_published_dependencies():
+    with _runtime_agent_fixture() as (agent, _controller):
+        result = agent._handle_ipc_command("validate_flow", {})
+
+        assert result["flow_id"]
+        assert result["module_count"] >= 0
+        assert isinstance(result["required_cameras"], list)
+        assert result["revision"]
+
+
+def test_gui_client_reaches_runtime_agent_through_command_queue():
+    with _runtime_agent_fixture() as (agent, controller):
+        controller.is_connected = True
+        agent.state_store.transition(RuntimeState.READY)
+        server = RuntimeIpcServer(agent._handle_ipc_command, port=0)
+        agent.ipc_server = server
+        assert server.start() is True
+        try:
+            client = RuntimeIpcClient(port=server.port)
+
+            ping = client.ping()
+            entered = client.request("enter_maintenance")
+            status = client.request("get_status")
+            exited = client.request("exit_maintenance")
+
+            assert ping["data"]["pong"] is True
+            assert entered["data"]["runtime_state"] == "MAINTENANCE"
+            assert status["data"]["maintenance"] is True
+            assert exited["data"]["auto_resumed"] is False
+        finally:
+            server.stop()
 
 
 def test_supervisor_reconnects_with_backoff():
@@ -211,6 +447,28 @@ def test_supervisor_step_stays_responsive_while_connect_blocks():
     assert supervisor.state == RobotConnectionState.CONNECTING
     release.set()
     supervisor._connect_thread.join(timeout=1.0)
+
+
+def test_supervisor_discards_late_connect_result_after_shutdown():
+    controller = _FakeController()
+    release = threading.Event()
+
+    def blocking_connect():
+        controller.connect_calls += 1
+        release.wait(1.0)
+        controller.is_connected = True
+        return True
+
+    controller.connect = blocking_connect
+    supervisor = RobotConnectionSupervisor(controller, reconnect_delays=(1.0,))
+
+    supervisor.request_connect(now=260.0)
+    supervisor.shutdown()
+    release.set()
+    supervisor._connect_thread.join(timeout=1.0)
+
+    assert supervisor._connect_result is None
+    assert controller.is_connected is False
 
 
 def test_supervisor_closes_robot_connection_when_feedback_disconnected():

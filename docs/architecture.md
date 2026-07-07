@@ -2,16 +2,75 @@
 
 ## 项目概述
 
-本项目是一个 Dobot 视觉引导机器人控制应用。它提供 PyQt6 桌面 UI，用于连接 Dobot 机器人、操作双 RealSense 相机、使用 YOLO/ONNX Runtime 检测目标、将相机检测结果转换为机器人坐标、编辑抓取流程模块，以及执行运动、原生圆弧、相对移动和视觉伺服工作流。
+本项目是一个 Dobot 视觉引导机器人控制应用。生产硬件由无界面的 Runtime Agent 控制，PyQt6 桌面 UI 作为工程师编辑和只读监控工具。
 
 该仓库还包含一个可选的 C++/pybind11 模块 `dobot_core`，用于加速视觉热路径，如 YOLO 后处理、深度定位计算、非极大值抑制和坐标变换。当原生模块未构建时，Python 应用应继续正常工作。
+
+## 阶段 2A 资源所有权
+
+- Runtime 是 Dobot Dashboard 29999、Feedback 30004、D405、D435i、Modbus TCP 502 和生产流程执行器的唯一应用层拥有者。
+- GUI 不创建 `DobotController`、Feedback、`VisionSystem`、RealSense pipeline 或 Modbus Server，也不会在关闭时释放这些资源。
+- GUI 每秒只读 `runtime_health.json`。文件缺失、损坏或超过 3 秒未更新时显示 Runtime 离线。
+- GUI 保留流程、参数、点位、模型路径和标定参数编辑。生产控制仍由 Runtime 独占；工程调试通过 localhost IPC 和维护模式执行。
+
+## 阶段 2B 机器人连接事务
+
+- `dobot_api.py` 在TCP连接前设置2秒级Socket超时，Dashboard收发和30004读取均使用有限I/O；SDK异常后直接上抛，不再执行无限自动重连。
+- 单次机器人连接使用约5秒业务截止时间。`DobotController`依次创建局部Dashboard、验证 `RobotMode/GetAngle`、创建局部Feedback并验证完整1440字节反馈包。
+- Dashboard和Feedback全部验证成功后才一次性替换正式字段。失败、停止或代次过期只关闭候选对象，不留下半连接状态。
+- 30004读取在一个总截止时间内拼接完整反馈包，不会因多次 `recv()` 将单次超时成倍放大。
+- Controller连接和Runtime连接Worker均携带generation；过期Worker的迟到结果被丢弃，不能覆盖当前正式连接。
+- 自动重连只由Runtime监督器负责，退避序列保持 `1s、2s、5s、10s、30s`，连接稳定10秒后重置退避。
+
+## 阶段 3 localhost IPC
+
+- Runtime在 `127.0.0.1:8765` 提供JSON Lines服务，每条UTF-8 JSON以换行符结束；不对局域网开放。
+- 网络线程负责连接、缓冲、半包/粘包拆分和请求校验。命令通过队列交给单独的 `RuntimeIpcCommandWorker`，网络线程不执行机器人动作。
+- 请求统一为 `{"id":"...","cmd":"...","data":{}}`，响应统一包含 `id、ok、data、error`；错误对象提供稳定的 `code` 和 `message`。
+- 基础命令包含 `ping、get_status、enter_maintenance、exit_maintenance、reload_config、stop_current_task`；配置发布、工程调试和视觉诊断命令在后续阶段扩展。
+- `enter_maintenance` 在生产流程或Modbus运动活跃时返回 `RUNTIME_BUSY`。进入后Controller拒绝PLC新运动命令；PLC的0仍可Stop，但不会自动重新使能。
+- `exit_maintenance` 只回到READY或DEGRADED，不恢复进入维护前的流程。`reload_config`在流程运行时拒绝，并且只影响下一任务。
+- GUI 的 IPC 请求由短生命周期 `RuntimeIpcRequestThread` 执行，不阻塞 Qt 主线程；健康文件监控继续作为只读状态回退。
+- 可选配置为 `runtime.ipc_host`、`runtime.ipc_port` 和 `runtime.ipc_command_timeout_s`，默认分别为 `127.0.0.1`、`8765` 和 `5s`。
+
+## 阶段 4 配置发布
+
+- `config.json` 和流程库是 GUI 可编辑草稿；Runtime 只执行 `runtime_publication.json` 中最后一次校验成功的发布快照。
+- `publish_config` 原子写入带 revision 和发布时间的发布包。发布失败不替换当前版本，并返回 `INVALID_CONFIG`。
+- Runtime 启动时若尚无发布包，以现有草稿建立内存兼容快照；首次发布后改用持久化发布包。
+- `FlowThread` 启动时复制配置和流程模块，并通过线程级配置上下文固定版本。运行期间再次发布只更新 next-task revision，不改变当前任务。
+- 健康文件和 IPC 状态同时给出当前任务版本与下一任务版本，便于现场确认参数何时生效。
+
+## 阶段 5 维护调试 IPC
+
+- `validate_flow`、`get_current_pose` 和 `get_runtime_logs` 为只读工程命令。
+- `start_debug_flow`、`run_step`、`move_to_point`、暂停、继续和停止只在 `MAINTENANCE` 状态接受；生产流程与调试流程共用 `RuntimeProgramRunner` 和 `FlowThread`。
+- 运动调试命令先返回 task ID，再由 Runtime 后台执行，IPC 命令线程不会等待运动完成。
+- 单步执行会校验步骤索引和依赖。依赖前序视觉结果的 `camera_detected` 步骤不允许脱离流程上下文单独执行。
+- 稳定错误码包括 `RUNTIME_BUSY`、`NOT_IN_MAINTENANCE`、`ROBOT_NOT_CONNECTED`、`ROBOT_NOT_ENABLED`、`CAMERA_NOT_READY`、`FLOW_NOT_FOUND`、`INVALID_CONFIG`、`TASK_ALREADY_RUNNING`、`TIMEOUT` 和 `INTERNAL_ERROR`。
+
+## 阶段 6 视觉诊断
+
+- `get_vision_snapshot` 复用 Runtime 已持有的 D405/D435i 实例，返回标注图、原始深度 PNG、伪彩深度预览、掩码 PNG、bbox、ByteTrack ID、置信度和深度统计。GUI 以单请求在途方式低频轮询形成实时图，不建立第二条视频连接。
+- 诊断结果包含原始/卡尔曼相机坐标、末端坐标、基座坐标、机器人位姿和手眼矩阵，并分别记录采集、推理、三维定位和坐标变换耗时。
+- 相机快照只允许在维护模式且流程空闲时采集，使用相机级互斥锁，不创建第二条 RealSense pipeline。
+- 视觉伺服暴露只读 XYZ/总误差、迭代次数、目标/位姿年龄、循环频率、采集/推理/深度/ServoP/总周期耗时；GUI 保留最近 100 个采样点并显示 error-time 与 error-iteration 曲线。
+
+## Windows Service 部署
+
+- `DobotRuntimeService` 由 WinSW 2.12.0 包装，使用专用本地账户运行并独占全部硬件；服务停止通过 Ctrl+C 进入 Runtime 现有安全清理路径。
+- `DobotRuntimeWatchdog` 是独立 WinSW 服务，以 LocalSystem 运行。健康超时后先独立发送机器人 Stop，再通过 SCM 停止和启动 Runtime 服务。
+- Runtime 正常服务停止会写 `runtime_service_stopped.json`；Watchdog 将其视为人工停机，不重新启动。Runtime下次启动立即清除此标记。
+- 服务模式强制 localhost IPC token。认证在命令入队前完成，未授权请求不能进入Runtime命令线程。
+- 旧任务计划在服务安装成功前备份并禁用，不自动删除；服务安装或验证失败时恢复任务状态。
 
 ## 目录结构
 
 ```text
 .
 ├── dobot_move/                  # 主 Python 包和 PyQt6 应用
-│   ├── gui_app.py               # 主窗口、标签页、生命周期、Worker 连接
+│   ├── gui_app.py               # 工程GUI、编辑页面和只读Runtime状态
+│   ├── gui_runtime_status.py    # runtime_health.json只读适配
 │   ├── main_control_panel.py    # 提取的主控制面板控件
 │   ├── gui_mixins/              # 按功能区域划分的 UI 行为 mixin
 │   ├── workers.py               # 用于初始化、监控、流程和相机测试的 QThread Worker
@@ -34,9 +93,9 @@
 
 ## 模块职责
 
-- `gui_app.py`：拥有 `QApplication` 入口、`DobotMainWindow`、标签页组合、UI 生命周期、状态刷新和信号连接。
+- `gui_app.py`：拥有 `QApplication` 入口、`DobotMainWindow`、标签页组合、GUI 生命周期和只读状态刷新。
 - `main_control_panel.py`：提供机器人连接、相机连接、抓取执行、碰撞等级、暂停/恢复和错误清除的主控制控件。
-- `gui_mixins/`：按功能分离的行为 mixin，包括机器人控制、视觉、Modbus 从站服务、点位管理、多流程编辑和启动连接协调。
+- `gui_mixins/`：按功能分离编辑行为；硬件相关入口在 IPC 接入前只返回明确拒绝。
 - `workers.py`：在 UI 线程之外运行慢速或重复工作，包括流程执行、相机测试显示、机器人命令 Worker 和 D435i 低帧率识别。
 - `robot_controller.py`：协调 Dobot Dashboard/Feedback API、运动命令、安全状态、Modbus 从站集成、运动所有权、安全状态和位姿解析。
 - `vision_system.py`：拥有相机启动、RealSense 帧捕获、ONNX 模型加载、YOLO 后处理、跟踪、深度处理、平滑和坐标转换。
@@ -49,16 +108,15 @@
 
 ## 数据流
 
-1. 用户在 `DobotMainWindow` 中操作 PyQt6 UI。
-2. UI 事件调用功能 mixin 或 `MainControlPanel` 信号。
-3. 机器人操作通过 `DobotController` 流转，然后进入 `DobotApiDashboard` 和 `DobotApiFeedBack`。
-4. 相机操作为 D435i 和/或 D405 创建 `VisionSystem` 实例，并从 `camera.models` 读取该相机的模型路径。
-5. `VisionSystem` 先校验并加载对应 ONNX 模型，再打开 RealSense 管线、捕获帧、运行推理、跟踪目标、估算深度，并通过手眼标定转换相机坐标。
+1. PLC通过Runtime的Modbus Server请求生产流程。
+2. Runtime通过 `DobotController` 控制 Dashboard 和 Feedback，并按主流程需要创建D405/D435i `VisionSystem`。
+3. `VisionSystem` 校验对应ONNX模型，再打开RealSense管线并完成检测、跟踪、深度和坐标转换。
+4. 工程师GUI编辑配置和流程文件，并只读Runtime健康状态；当前阶段不向Runtime发送控制命令。
+5. `FlowLibrary` 管理 `schema_version=2` 的流程集合、当前编辑流程和主流程；Runtime中的 `FlowThread` 接收流程快照并协调运动与视觉模块。
 6. 检测到的基座坐标通过 `config_manager.py` 更新默认点位，如 `d435i` 和 `d405`。
-7. `FlowLibrary` 管理 `schema_version=2` 的流程集合、当前编辑流程和主流程；`FlowThread` 接收流程快照，解析点位并协调机器人运动、视觉检测、视觉伺服、相对移动和原生圆弧操作。
-8. UI 更新通过 Qt 信号返回，保持主线程响应。
+7. Runtime原子更新健康文件，GUI定时读取并刷新状态控件。
 
-GUI 和后台启动时均先启动 Modbus，再并发连接机器人及主流程引用的 D435i/D405。设备清理、连接和反馈重建全部由后台线程执行；5 秒仅为启动观察窗口，结束后不发布错误，迟到成功只更新设备状态，不会自动运行流程。
+只有Runtime启动Modbus并并发连接机器人及主流程引用的D435i/D405。5秒仅为启动观察窗口，结束后不发布错误，迟到成功只更新设备状态，不会自动运行流程。
 
 所有流程入口使用共享的只读 readiness 快检：根据流程快照检查机器人连接、反馈缓存及所需相机 `is_available`，不查询设备、不抓帧。Modbus 启动缺设备立即写 `110`；设备恢复后可直接再次写 `3`。运行中检测到断线时停止当前流程并写 `110`，后台重连成功后也不会续跑旧流程。
 
@@ -172,7 +230,7 @@ FlowThread 在 `run()` 开始时注册为 `controller._active_flow_thread`，在
 
 `runtime_state.json` 只保存诊断检查点。若上次退出不干净，后台进入 `RECOVERY_REQUIRED` 并保持 `40001=110`，不会恢复或重放运动；PLC 必须重新执行 `0→1→2→3`。
 
-GUI 和后台通过 `robot_control.lock` 竞争控制租约，后台自身另用 `runtime_agent.lock` 防止重复实例。反馈断流且流程正在运动时，顺序固定为：设置流程停止事件、发送 Dashboard `Stop()`、写机器人故障状态、关闭连接并退避重连。
+Runtime通过 `robot_control.lock` 持有控制租约，并使用 `runtime_agent.lock` 防止重复后台实例。GUI不再申请控制租约。反馈断流且流程正在运动时，顺序固定为：设置流程停止事件、发送 Dashboard `Stop()`、写机器人故障状态、关闭连接并退避重连。
 
 流程看门狗按模块类型计算截止时间。延时模块使用配置时长加余量，相机和视觉伺服按采集/迭代预算，运动模块使用保守上限；超时后停止流程并写 `40001=110`。
 
@@ -182,7 +240,7 @@ GUI 和后台通过 `robot_control.lock` 竞争控制租约，后台自身另用
 - RealSense 操作需要 Intel RealSense SDK 和兼容的 D435i/D405 设备。
 - D435i 和 D405 可通过 `camera.models.D435i`、`camera.models.D405` 配置独立 ONNX 模型；未配置时回退到 `dobot_move/best.onnx`。
 - 模型必须具有固定正整数尺寸的 NCHW 输入，并输出当前后处理支持的三维 YOLO 检测张量；实例分割模型还需提供掩码输出。
-- GUI、流程线程和后台代理都通过 `VisionSystem(camera_type=...)` 使用同一份相机级配置。配置模型缺失或不兼容时初始化失败，不切换到其他相机模型。
+- Runtime通过 `VisionSystem(camera_type=...)` 使用相机级配置。GUI只编辑模型路径；配置模型缺失或不兼容时Runtime初始化失败，不切换到其他相机模型。
 - 机器人控制期望可达的 Dobot Dashboard 和 Feedback 端口；文档中的默认值提及 Dashboard `29999` 和 Feedback `30004`。
 - Modbus 默认值存储在 `config.json` 中，典型 TCP 端口为 `502`。
 - C++ 加速依赖 CMake、C++17 编译器、pybind11 和 Python ABI 兼容性。

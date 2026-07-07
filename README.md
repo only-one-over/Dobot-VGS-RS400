@@ -162,6 +162,8 @@ python -m dobot_move
 python -m dobot_move.runtime_agent
 ```
 
+Windows 10/11 生产部署推荐使用 WinSW 双服务：Runtime 服务独占硬件，Watchdog 服务负责卡死恢复，GUI 由登录用户独立启动。安装、校验和回滚步骤见 [docs/windows_service.md](docs/windows_service.md)。
+
 生产环境应同时运行 `dobot_move.runtime_agent` 和 `dobot_move.runtime_watchdog`。GUI 与后台都会先启动 Modbus，再立即在后台并发连接机器人和主流程需要的相机；5 秒观察窗口结束后不阻塞、不报码，后台继续低频重连。运行流程前使用缓存状态快速检查，缺少设备时 Modbus 写 `110` 并拒绝本次启动。根目录同名脚本只保留为旧命令兼容入口。开机自启动、异常恢复、`40001` 状态协议和状态排查见 [docs/runtime_agent.md](docs/runtime_agent.md)。
 
 ### 首次设置
@@ -404,3 +406,41 @@ python -c "import onnxruntime as ort; s = ort.InferenceSession('dobot_move/best.
 ## 许可证
 
 本项目基于 MIT 许可证授权——详见 [LICENSE](LICENSE) 文件。
+
+## 生产部署速查
+
+当前推荐的现场部署方式是 **WinSW 双服务 + 独立 Runtime + localhost TCP IPC + 独立 GUI**。
+
+- `DobotRuntimeService`：后台生产服务，独占机器人、D405/D435i、Modbus 502、流程执行和 IPC。
+- `DobotRuntimeWatchdog`：独立看门狗服务，检测 Runtime 卡死后先尝试安全 `Stop()`，再通过 Windows Service Control Manager 重启 Runtime。
+- GUI 只作为工程调试和参数编辑工具，由登录用户手动启动；打开或关闭 GUI 不会占用硬件，也不会停止后台服务。
+- Runtime 服务异常重启后不会自动续跑旧流程；PLC 或人工必须重新触发流程。
+
+管理员 PowerShell 安装示例：
+
+```powershell
+powershell -ExecutionPolicy Bypass `
+  -File .\scripts\install_windows_services.ps1 `
+  -ProjectRoot C:\DobotRuntime `
+  -CreateServiceUser
+```
+
+当前源码目录直接安装示例：
+
+```powershell
+powershell -ExecutionPolicy Bypass `
+  -File .\scripts\install_windows_services.ps1 `
+  -ProjectRoot D:\桌面\dobot_move_python `
+  -PythonExe D:\桌面\dobot_move_python\.venv\Scripts\python.exe `
+  -CreateServiceUser
+```
+
+安装后检查：
+
+```powershell
+powershell -ExecutionPolicy Bypass `
+  -File .\scripts\test_windows_services.ps1 `
+  -ProjectRoot C:\DobotRuntime
+```
+
+完整服务部署、卸载和回滚说明见 [docs/windows_service.md](docs/windows_service.md)。

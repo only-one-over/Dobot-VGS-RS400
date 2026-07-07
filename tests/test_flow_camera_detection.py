@@ -488,14 +488,14 @@ class FakeFlowWindow(GraspFlowMixin):
         return self.status
 
 
-def test_flow_start_reuses_camera_test_worker():
+def test_gui_flow_does_not_reuse_local_camera_test_worker():
     window = FakeFlowWindow()
 
-    assert window._stop_camera_test_before_flow() is True
+    assert window._stop_camera_test_before_flow() is False
 
     assert window.stop_called is False
     assert window.cam_test_worker is not None
-    assert window.status.messages
+    assert window.status.messages == []
 
 
 def test_camera_detected_point_must_match_previous_camera_type():

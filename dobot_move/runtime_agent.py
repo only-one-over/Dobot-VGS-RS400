@@ -29,9 +29,12 @@ from .config_manager import (
     get_performance_config,
     get_robot_ip,
     get_runtime_config,
+    reload_config,
+    resolve_point,
+    use_config_snapshot,
 )
 from .flow_library import FlowLibrary, required_camera_types
-from .flow_readiness import check_flow_readiness
+from .flow_readiness import FlowReadinessResult, check_flow_readiness
 from .modbus_server import STATUS_HOOK_ERR, STATUS_ROBOT_ERR
 from .robot_controller import DobotController
 from .runtime_resilience import (
@@ -44,6 +47,16 @@ from .runtime_resilience import (
     module_timeout_seconds,
 )
 from .startup_connection import StartupConnectionState
+from .runtime_ipc import (
+    DEFAULT_IPC_TOKEN_PATH,
+    IpcCommandError,
+    RuntimeIpcServer,
+    load_ipc_token,
+)
+from .runtime_publication import (
+    PublicationError,
+    RuntimePublicationStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +65,7 @@ DEFAULT_HEALTH_PATH = PROJECT_ROOT / "runtime_health.json"
 DEFAULT_STATE_PATH = PROJECT_ROOT / "runtime_state.json"
 DEFAULT_LOCK_PATH = PROJECT_ROOT / "runtime_agent.lock"
 DEFAULT_LOG_DIR = PROJECT_ROOT / "logs"
+DEFAULT_PUBLICATION_PATH = PROJECT_ROOT / "runtime_publication.json"
 
 
 class RobotConnectionState:
@@ -59,6 +73,17 @@ class RobotConnectionState:
     CONNECTING = "CONNECTING"
     CONNECTED = "CONNECTED"
     DEGRADED = "DEGRADED"
+
+
+@dataclass
+class RuntimeExecutionRequest:
+    mode: str
+    flow_id: str
+    flow_name: str
+    modules: list[dict[str, Any]]
+    config: dict[str, Any]
+    revision: str
+    task_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 class RepeatedLogFilter(logging.Filter):
@@ -142,8 +167,9 @@ class RobotConnectionSupervisor:
     _delay_index: int = 0
     _motion_abort_issued: bool = False
     _connect_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
-    _connect_result: Optional[tuple[bool, str]] = field(default=None, init=False, repr=False)
+    _connect_result: Optional[tuple[int, bool, str]] = field(default=None, init=False, repr=False)
     _connect_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _connect_generation: int = field(default=0, init=False, repr=False)
     _shutting_down: bool = field(default=False, init=False, repr=False)
 
     def _set_state(self, state: str) -> None:
@@ -184,7 +210,7 @@ class RobotConnectionSupervisor:
         except Exception as e:
             logger.warning("close robot transport failed: %s", e)
 
-    def _connect_worker(self) -> None:
+    def _connect_worker(self, generation: int) -> None:
         ok = False
         error = ""
         try:
@@ -201,7 +227,14 @@ class RobotConnectionSupervisor:
             ok = False
             error = "runtime stopping"
         with self._connect_lock:
-            self._connect_result = (ok, error)
+            if generation != self._connect_generation:
+                logger.info(
+                    "discarding stale robot connect result generation=%d current=%d",
+                    generation,
+                    self._connect_generation,
+                )
+                return
+            self._connect_result = (generation, ok, error)
 
     def _consume_connect_result(self, now: float) -> bool:
         with self._connect_lock:
@@ -209,7 +242,9 @@ class RobotConnectionSupervisor:
             self._connect_result = None
         if result is None:
             return False
-        ok, error = result
+        generation, ok, error = result
+        if generation != self._connect_generation:
+            return False
         if ok and self.controller.is_connected:
             self.next_attempt_at = 0.0
             self.last_error = ""
@@ -229,8 +264,13 @@ class RobotConnectionSupervisor:
         if self.controller.is_connected or now < self.next_attempt_at or self._shutting_down:
             return self.state
         self._set_state(RobotConnectionState.CONNECTING)
+        with self._connect_lock:
+            self._connect_generation += 1
+            generation = self._connect_generation
+            self._connect_result = None
         self._connect_thread = threading.Thread(
             target=self._connect_worker,
+            args=(generation,),
             name="RuntimeRobotConnect",
             daemon=True,
         )
@@ -277,6 +317,9 @@ class RobotConnectionSupervisor:
 
     def shutdown(self) -> None:
         self._shutting_down = True
+        with self._connect_lock:
+            self._connect_generation += 1
+            self._connect_result = None
         self.close_robot_connection()
 
 
@@ -288,10 +331,12 @@ class RuntimeProgramRunner:
         controller: DobotController,
         state_store: Optional[RuntimeStateStore] = None,
         camera_preflight_attempts: int = 3,
+        publication_provider=None,
     ):
         self.controller = controller
         self.state_store = state_store
         self.camera_preflight_attempts = max(1, int(camera_preflight_attempts))
+        self.publication_provider = publication_provider
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self.vision_d435i = None
@@ -311,8 +356,62 @@ class RuntimeProgramRunner:
         self.failure_latched = False
         self._closing = False
         self.active_required_cameras: set[str] = set()
+        self.current_revision: Optional[str] = None
+        self.next_revision: Optional[str] = None
+        self._active_flow = None
+        self._pause_ref: Optional[list[bool]] = None
+        self.task_id: Optional[str] = None
+        self.task_mode: Optional[str] = None
+        self.last_task_result: Optional[bool] = None
+        self.last_task_error = ""
 
     def __call__(self) -> bool:
+        request = self.build_request(mode="production")
+        return self.start_request(request)
+
+    def build_request(
+        self,
+        *,
+        mode: str,
+        flow_id: str | None = None,
+        step_index: int | None = None,
+        modules: list[dict[str, Any]] | None = None,
+        flow_name: str | None = None,
+    ) -> RuntimeExecutionRequest:
+        config, library, revision = self._load_execution_snapshot(flow_id)
+        if modules is None:
+            flow = library.get_flow(flow_id) if flow_id else library.get_main_flow()
+            selected_modules = library.snapshot_modules(flow["id"])
+            selected_flow_id = flow["id"]
+            selected_flow_name = flow["name"]
+            if step_index is not None:
+                if step_index < 0 or step_index >= len(selected_modules):
+                    raise ValueError("step_index is out of range")
+                module = selected_modules[step_index]
+                params = module.get("params") or {}
+                if (
+                    module.get("type") == "move"
+                    and params.get("target") == "camera_detected"
+                ):
+                    raise ValueError(
+                        "camera_detected step requires prior flow context"
+                    )
+                selected_modules = [module]
+                selected_flow_name = f"{selected_flow_name} / step {step_index + 1}"
+        else:
+            selected_modules = list(modules)
+            selected_flow_id = flow_id or "adhoc-debug"
+            selected_flow_name = flow_name or "Ad-hoc debug"
+        return RuntimeExecutionRequest(
+            mode=str(mode),
+            flow_id=selected_flow_id,
+            flow_name=selected_flow_name,
+            modules=selected_modules,
+            config=config,
+            revision=revision,
+        )
+
+    def start_request(self, request: RuntimeExecutionRequest) -> bool:
         with self._lock:
             if self.orphaned_flow:
                 logger.error("runtime flow runner locked: previous timed-out flow did not exit")
@@ -321,16 +420,67 @@ class RuntimeProgramRunner:
                 logger.warning("runtime flow runner rejected: previous flow still running")
                 return False
             self.failure_latched = False
-            self._thread = threading.Thread(target=self._run_once, name="RuntimeFlowRunner", daemon=True)
+            self.task_id = request.task_id
+            self.task_mode = request.mode
+            self.last_task_result = None
+            self.last_task_error = ""
+            self._thread = threading.Thread(
+                target=self._run_once,
+                args=(request,),
+                name="RuntimeFlowRunner",
+                daemon=True,
+            )
             self._thread.start()
             return True
 
+    def pause(self) -> bool:
+        if self._pause_ref is None or self._active_flow is None:
+            return False
+        self._pause_ref[0] = True
+        self.controller.pause()
+        return True
+
+    def resume(self) -> bool:
+        if self._pause_ref is None or self._active_flow is None:
+            return False
+        self.controller.continue_motion()
+        self._pause_ref[0] = False
+        return True
+
+    def stop(self) -> bool:
+        flow = self._active_flow
+        if flow is None:
+            return False
+        flow.stop()
+        return True
+
     def _load_modules(self) -> list[dict[str, Any]]:
-        library = FlowLibrary.load(get_grasp_flow_file())
+        _config, library, revision = self._load_execution_snapshot()
+        self.next_revision = revision
         main_flow = library.get_main_flow()
         self.main_flow_id = main_flow["id"]
         self.main_flow_name = main_flow["name"]
         return library.snapshot_modules(main_flow["id"])
+
+    def _load_execution_snapshot(
+        self,
+        flow_id: str | None = None,
+    ) -> tuple[dict[str, Any], FlowLibrary, str]:
+        if self.publication_provider is None:
+            config = get_config()
+            library = FlowLibrary.load(get_grasp_flow_file())
+            revision = "legacy-draft"
+        else:
+            publication = self.publication_provider()
+            config = publication["config"]
+            library = FlowLibrary(
+                publication["flow_library"],
+                path="published-flow.json",
+            )
+            revision = str(publication["revision"])
+        if flow_id is not None:
+            library.get_flow(flow_id)
+        return config, library, revision
 
     def _required_camera_types(self, modules: list[dict[str, Any]]) -> set[str]:
         return required_camera_types(modules)
@@ -400,7 +550,16 @@ class RuntimeProgramRunner:
                     attempt,
                     f" serial={serial}" if serial else "",
                 )
-                vision = VisionSystem(camera_type=camera_type, serial_number=serial)
+                camera_config = (
+                    self.publication_provider()["config"]
+                    if self.publication_provider is not None
+                    else get_config()
+                )
+                with use_config_snapshot(camera_config):
+                    vision = VisionSystem(
+                        camera_type=camera_type,
+                        serial_number=serial,
+                    )
                 if self._camera_preflight_ok(vision):
                     if self._closing:
                         vision.close()
@@ -437,15 +596,27 @@ class RuntimeProgramRunner:
 
     def close_cameras(self) -> None:
         self._closing = True
-        for attr in ("vision_d435i", "vision_d405"):
-            vision = getattr(self, attr)
-            if vision is None:
-                continue
-            try:
-                vision.close()
-            except Exception:
-                logger.exception("runtime failed to close %s", attr)
-            setattr(self, attr, None)
+        self._close_camera_instances()
+
+    def reload_cameras(self) -> None:
+        self._close_camera_instances()
+        self._closing = False
+        self._camera_serials = None
+
+    def _close_camera_instances(self) -> None:
+        for camera_type, attr in (
+            ("D435i", "vision_d435i"),
+            ("D405", "vision_d405"),
+        ):
+            with self._camera_locks[camera_type]:
+                vision = getattr(self, attr)
+                if vision is None:
+                    continue
+                try:
+                    vision.close()
+                except Exception:
+                    logger.exception("runtime failed to close %s", attr)
+                setattr(self, attr, None)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -460,6 +631,13 @@ class RuntimeProgramRunner:
             "last_progress_time": self.last_progress_time,
             "orphaned_flow": self.orphaned_flow,
             "failure_latched": self.failure_latched,
+            "current_revision": self.current_revision,
+            "next_revision": self.next_revision,
+            "task_id": self.task_id,
+            "task_mode": self.task_mode,
+            "paused": bool(self._pause_ref and self._pause_ref[0]),
+            "last_task_result": self.last_task_result,
+            "last_task_error": self.last_task_error,
             "cameras": {
                 "D435i": self.vision_d435i is not None,
                 "D405": self.vision_d405 is not None,
@@ -488,15 +666,38 @@ class RuntimeProgramRunner:
             "检查阻塞模块和设备通信，执行复位后再启动",
         )
 
-    def _run_once(self) -> None:
+    def _run_once(self, request: RuntimeExecutionRequest | None = None) -> None:
         success = False
         failure_status = STATUS_HOOK_ERR
+        task_mode = request.mode if request is not None else "production"
         flow_worker = None
         flow = None
         try:
             from .workers import FlowThread, validate_grasp_flow_modules
 
-            modules = self._load_modules()
+            if request is not None:
+                config_snapshot = request.config
+                modules = request.modules
+                revision = request.revision
+                self.main_flow_id = request.flow_id
+                self.main_flow_name = request.flow_name
+                task_mode = request.mode
+                self.task_id = request.task_id
+                self.task_mode = task_mode
+            elif self.publication_provider is None:
+                config_snapshot = get_config()
+                modules = self._load_modules()
+                revision = "legacy-draft"
+                task_mode = "production"
+            else:
+                config_snapshot, library, revision = self._load_execution_snapshot()
+                main_flow = library.get_main_flow()
+                self.main_flow_id = main_flow["id"]
+                self.main_flow_name = main_flow["name"]
+                modules = library.snapshot_modules(main_flow["id"])
+                task_mode = "production"
+            self.current_revision = revision
+            self.next_revision = revision
             errors = validate_grasp_flow_modules(modules)
             if errors:
                 message = "; ".join(errors)
@@ -525,7 +726,9 @@ class RuntimeProgramRunner:
             self.current_module_name = None
             self.last_progress_time = time.monotonic()
             self._transition(
-                RuntimeState.RUNNING,
+                RuntimeState.MAINTENANCE
+                if task_mode == "debug"
+                else RuntimeState.RUNNING,
                 flow_id=self.current_flow_id,
                 module_index=None,
                 module_name=None,
@@ -533,7 +736,17 @@ class RuntimeProgramRunner:
             )
 
             finished: list[bool] = []
-            flow = FlowThread(self.controller, self.vision_d435i, self.vision_d405, modules, [False])
+            self.controller._user_index = int(config_snapshot.get("user_index", 0))
+            self.controller._tool_index = int(config_snapshot.get("tool_index", 0))
+            self._pause_ref = [False]
+            flow = FlowThread(
+                self.controller,
+                self.vision_d435i,
+                self.vision_d405,
+                modules,
+                self._pause_ref,
+            )
+            self._active_flow = flow
             flow.flow_log.connect(lambda msg: logger.info("runtime flow: %s", msg))
             flow.flow_finished.connect(lambda ok: finished.append(bool(ok)))
             module_deadline = [time.monotonic() + module_timeout_seconds(modules[0])] if modules else [float("inf")]
@@ -552,6 +765,8 @@ class RuntimeProgramRunner:
                         and params.get("wait_mode") == "modbus_or_timeout"
                         else RuntimeState.RUNNING
                     )
+                    if task_mode == "debug":
+                        state = RuntimeState.MAINTENANCE
                     self._transition(
                         state,
                         flow_id=self.current_flow_id,
@@ -561,8 +776,12 @@ class RuntimeProgramRunner:
 
             if hasattr(flow, "flow_module_progress"):
                 flow.flow_module_progress.connect(on_progress)
+            def run_flow_with_snapshot():
+                with use_config_snapshot(config_snapshot):
+                    flow.run()
+
             flow_worker = threading.Thread(
-                target=flow.run,
+                target=run_flow_with_snapshot,
                 name=f"FlowExecution-{self.current_flow_id[:8]}",
                 daemon=True,
             )
@@ -592,12 +811,25 @@ class RuntimeProgramRunner:
                 return
 
             success = bool(finished[-1]) if finished else False
+            self.last_task_result = success
         except Exception as e:
+            self.last_task_error = str(e)
             logger.exception("runtime flow runner failed")
             self.controller.record_alarm("Runtime流程", "EXCEPTION", "故障", "后台流程执行异常", raw=e)
         finally:
+            self._active_flow = None
+            self._pause_ref = None
             self.active_required_cameras = set()
-            if success:
+            if task_mode == "debug":
+                self.failure_latched = False
+                self._transition(
+                    RuntimeState.MAINTENANCE,
+                    flow_id=None,
+                    module_index=None,
+                    module_name=None,
+                    last_error="" if success else self.last_task_error,
+                )
+            elif success:
                 self.failure_latched = False
                 self._transition(
                     RuntimeState.READY,
@@ -615,7 +847,11 @@ class RuntimeProgramRunner:
                     module_name=None,
                     last_error="流程执行失败",
                 )
-            self.controller.mark_modbus_program_finished(success, failure_status=failure_status)
+            if task_mode != "debug":
+                self.controller.mark_modbus_program_finished(
+                    success,
+                    failure_status=failure_status,
+                )
 
 
 class DobotRuntimeAgent:
@@ -628,24 +864,42 @@ class DobotRuntimeAgent:
         state_path: Path = DEFAULT_STATE_PATH,
         startup_delay: float = 10.0,
         poll_interval: float = 1.0,
+        ipc_server: Optional[RuntimeIpcServer] = None,
     ):
-        config = get_config()
-        performance = get_performance_config()
-        runtime_config = get_runtime_config()
+        draft_config = get_config()
+        draft_runtime = get_runtime_config()
+        raw_draft_runtime = draft_config.get("runtime", {})
+        if isinstance(raw_draft_runtime, dict):
+            draft_runtime.update(raw_draft_runtime)
+        self.publication_path = Path(
+            draft_runtime.get("publication_path", str(DEFAULT_PUBLICATION_PATH))
+        )
+        self.publication_store = RuntimePublicationStore(self.publication_path)
+        config = self.publication_store.snapshot()["config"]
+        with use_config_snapshot(config):
+            performance = get_performance_config()
+            runtime_config = get_runtime_config()
         raw_runtime = config.get("runtime", {})
         if isinstance(raw_runtime, dict):
             runtime_config.update(raw_runtime)
 
         self.controller = controller or DobotController(
-            get_robot_ip(),
+            str(config.get("robot_ip", "192.168.5.1")),
             enforce_single_instance=True,
         )
         self.health_path = Path(runtime_config.get("health_path", str(health_path)))
         self.state_path = Path(runtime_config.get("state_path", str(state_path)))
         self.startup_delay = float(runtime_config.get("startup_delay", startup_delay))
         self.poll_interval = float(runtime_config.get("poll_interval", poll_interval))
-        self.modbus_port = int(runtime_config.get("modbus_port", get_modbus_port()))
-        self.modbus_slave_id = int(runtime_config.get("modbus_slave_id", get_modbus_slave_id()))
+        self.modbus_port = int(
+            runtime_config.get("modbus_port", config.get("modbus_port", 502))
+        )
+        self.modbus_slave_id = int(
+            runtime_config.get(
+                "modbus_slave_id",
+                config.get("modbus_slave_id", 5),
+            )
+        )
         self.disk_free_min_mb = float(runtime_config.get("disk_free_min_mb", 512))
         self.camera_preflight_attempts = int(runtime_config.get("camera_retry_count", 3))
         self.startup_connect_timeout_s = float(
@@ -653,6 +907,36 @@ class DobotRuntimeAgent:
         )
         self.camera_retry_interval_s = float(
             runtime_config.get("camera_retry_interval_s", 10.0)
+        )
+        self.ipc_host = str(runtime_config.get("ipc_host", "127.0.0.1"))
+        self.ipc_port = int(runtime_config.get("ipc_port", 8765))
+        self.ipc_command_timeout_s = float(
+            runtime_config.get("ipc_command_timeout_s", 5.0)
+        )
+        self.service_mode = str(
+            os.environ.get("DOBOT_SERVICE_MODE", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.service_name = str(
+            os.environ.get("DOBOT_SERVICE_NAME", "")
+        ).strip()
+        self.service_stop_marker_path = Path(
+            runtime_config.get(
+                "service_stop_marker_path",
+                PROJECT_ROOT / "runtime_service_stopped.json",
+            )
+        )
+        if self.service_mode:
+            self.service_stop_marker_path.unlink(missing_ok=True)
+        token_path_value = (
+            os.environ.get("DOBOT_IPC_TOKEN_FILE")
+            or runtime_config.get("ipc_token_path")
+            or DEFAULT_IPC_TOKEN_PATH
+        )
+        self.ipc_token_path = Path(token_path_value)
+        self.ipc_auth_token = load_ipc_token(
+            self.ipc_token_path,
+            required=self.service_mode
+            or bool(runtime_config.get("ipc_require_token", False)),
         )
         self.state_store = RuntimeStateStore(self.state_path)
         self.supervisor = RobotConnectionSupervisor(
@@ -665,9 +949,11 @@ class DobotRuntimeAgent:
             self.controller,
             state_store=self.state_store,
             camera_preflight_attempts=self.camera_preflight_attempts,
+            publication_provider=self.publication_store.snapshot,
         )
         self.stop_event = threading.Event()
         self.last_error = ""
+        self.stop_reason = ""
         self.recovery_required = False
         self._state_initialized = False
         self._stopped = False
@@ -680,9 +966,23 @@ class DobotRuntimeAgent:
         self._startup_camera_threads: dict[str, threading.Thread] = {}
         self._startup_camera_next_attempt: dict[str, float] = {}
         self._flow_device_abort_reported = False
+        self._pending_camera_reload_revision: Optional[str] = None
+        self._maintenance_lock = threading.RLock()
+        self.maintenance_mode = False
+        self.ipc_server = ipc_server or RuntimeIpcServer(
+            self._handle_ipc_command,
+            host=self.ipc_host,
+            port=self.ipc_port,
+            command_timeout_s=self.ipc_command_timeout_s,
+            auth_token=self.ipc_auth_token,
+        )
 
     def _refresh_startup_requirements(self, force=False) -> None:
-        library = FlowLibrary.load(get_grasp_flow_file())
+        publication = self.publication_store.snapshot()
+        library = FlowLibrary(
+            publication["flow_library"],
+            path="published-flow.json",
+        )
         main_flow = library.get_main_flow()
         flow_id = main_flow["id"]
         cameras = required_camera_types(main_flow.get("modules", []))
@@ -794,7 +1094,620 @@ class DobotRuntimeAgent:
             camera_connected=self._camera_connection_status(),
         )
 
+    def _handle_ipc_command(
+        self,
+        command: str,
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        handlers = {
+            "ping": self._ipc_ping,
+            "get_status": self._ipc_get_status,
+            "enter_maintenance": self._ipc_enter_maintenance,
+            "exit_maintenance": self._ipc_exit_maintenance,
+            "reload_config": self._ipc_reload_config,
+            "publish_config": self._ipc_publish_config,
+            "get_publication_status": self._ipc_get_publication_status,
+            "validate_flow": self._ipc_validate_flow,
+            "get_current_pose": self._ipc_get_current_pose,
+            "get_runtime_logs": self._ipc_get_runtime_logs,
+            "start_debug_flow": self._ipc_start_debug_flow,
+            "run_step": self._ipc_run_step,
+            "move_to_point": self._ipc_move_to_point,
+            "pause_debug_flow": self._ipc_pause_debug_flow,
+            "resume_debug_flow": self._ipc_resume_debug_flow,
+            "stop_debug_flow": self._ipc_stop_debug_flow,
+            "get_debug_task_status": self._ipc_get_debug_task_status,
+            "test_d405": self._ipc_test_d405,
+            "test_d435i": self._ipc_test_d435i,
+            "test_detection": self._ipc_test_detection,
+            "get_vision_snapshot": self._ipc_get_vision_snapshot,
+            "get_visual_servo_telemetry": self._ipc_get_visual_servo_telemetry,
+            "stop_current_task": self._ipc_stop_current_task,
+        }
+        handler = handlers.get(command)
+        if handler is None:
+            raise IpcCommandError(
+                "UNKNOWN_COMMAND",
+                f"不支持的命令: {command}",
+            )
+        return handler(data)
+
+    def _ipc_ping(self, _data=None) -> dict[str, Any]:
+        return {
+            "pong": True,
+            "runtime_state": self.state_store.snapshot().get(
+                "state",
+                RuntimeState.STARTING.value,
+            ),
+        }
+
+    def _ipc_get_status(self, _data=None) -> dict[str, Any]:
+        state = self.state_store.snapshot()
+        flow = self.program_runner.snapshot()
+        cameras = self._camera_connection_status()
+        try:
+            modbus_running = bool(
+                self.controller.get_modbus_stats().get("is_running")
+            )
+        except Exception:
+            modbus_running = False
+        flow_running = bool(flow.get("running"))
+        return {
+            "runtime_state": state.get(
+                "state",
+                RuntimeState.STARTING.value,
+            ),
+            "maintenance": self.maintenance_mode,
+            "recovery_required": self.recovery_required,
+            "robot_connected": bool(self.controller.is_connected),
+            "robot_enabled": bool(self.controller.is_enabled),
+            "d405_connected": cameras["D405"],
+            "d435i_connected": cameras["D435i"],
+            "modbus_running": modbus_running,
+            "current_flow": flow.get("main_flow_name") if flow_running else None,
+            "current_step": flow.get("module_name") if flow_running else None,
+            "flow_running": flow_running,
+            "last_error": self.last_error or self.supervisor.last_error,
+            "publication": self.publication_store.status(),
+            "current_task_revision": flow.get("current_revision"),
+            "next_task_revision": self.publication_store.status()["revision"],
+        }
+
+    def _ipc_enter_maintenance(self, _data=None) -> dict[str, Any]:
+        with self._maintenance_lock:
+            state = str(self.state_store.snapshot().get("state", ""))
+            if self.maintenance_mode:
+                return {
+                    "runtime_state": RuntimeState.MAINTENANCE.value,
+                    "already_active": True,
+                }
+            if self.recovery_required:
+                raise IpcCommandError(
+                    "RECOVERY_REQUIRED",
+                    "Runtime处于恢复锁状态，需先由PLC执行复位",
+                )
+            if state == RuntimeState.STOPPING.value:
+                raise IpcCommandError(
+                    "RUNTIME_BUSY",
+                    "Runtime正在停止",
+                )
+            if self._runtime_motion_busy():
+                raise IpcCommandError(
+                    "RUNTIME_BUSY",
+                    "生产流程或Modbus运动正在运行，请先停止当前任务",
+                )
+
+            self.maintenance_mode = True
+            self.state_store.transition(RuntimeState.MAINTENANCE_REQUESTED)
+            self.controller.set_runtime_maintenance(True)
+            if self._runtime_motion_busy():
+                self.controller.set_runtime_maintenance(False)
+                self.maintenance_mode = False
+                self.state_store.transition(state or RuntimeState.DEGRADED.value)
+                raise IpcCommandError(
+                    "RUNTIME_BUSY",
+                    "生产流程已在维护切换期间启动",
+                )
+            self.state_store.transition(
+                RuntimeState.MAINTENANCE,
+                flow_id=None,
+                module_index=None,
+                module_name=None,
+                last_error="",
+            )
+            return {
+                "runtime_state": RuntimeState.MAINTENANCE.value,
+                "already_active": False,
+            }
+
+    def _ipc_exit_maintenance(self, _data=None) -> dict[str, Any]:
+        with self._maintenance_lock:
+            if not self.maintenance_mode:
+                return {
+                    "runtime_state": self.state_store.snapshot().get(
+                        "state",
+                        RuntimeState.READY.value,
+                    ),
+                    "already_inactive": True,
+                }
+            self.controller.set_runtime_maintenance(False)
+            self.maintenance_mode = False
+            state = (
+                RuntimeState.READY
+                if self.controller.is_connected
+                else RuntimeState.DEGRADED
+            )
+            self.state_store.transition(
+                state,
+                flow_id=None,
+                module_index=None,
+                module_name=None,
+                last_error="",
+            )
+            return {
+                "runtime_state": state.value,
+                "already_inactive": False,
+                "auto_resumed": False,
+            }
+
+    def _ipc_reload_config(self, _data=None) -> dict[str, Any]:
+        if self.program_runner.snapshot().get("running"):
+            raise IpcCommandError(
+                "RUNTIME_BUSY",
+                "流程运行期间不允许重载配置",
+            )
+        if (
+            not self.publication_store.path.exists()
+            and self.publication_store.status()["revision"] == "legacy-draft"
+        ):
+            publication = self.publication_store.snapshot()
+        else:
+            try:
+                publication = self.publication_store.reload_published()
+            except PublicationError as exc:
+                raise IpcCommandError("INVALID_CONFIG", str(exc)) from exc
+        if publication["revision"] == "legacy-draft":
+            config = reload_config()
+            self.controller._user_index = int(config.get("user_index", 0))
+            self.controller._tool_index = int(config.get("tool_index", 0))
+        self.program_runner.next_revision = publication["revision"]
+        self.program_runner._camera_serials = None
+        self._pending_camera_reload_revision = publication["revision"]
+        self._refresh_startup_requirements(force=True)
+        return {
+            "reloaded": True,
+            "applies_to_running_task": False,
+            "main_flow_id": self._startup_main_flow_id,
+            "main_flow_name": self._startup_main_flow_name,
+            "revision": publication["revision"],
+        }
+
+    def _ipc_publish_config(self, _data=None) -> dict[str, Any]:
+        try:
+            publication = self.publication_store.publish_drafts(
+                self._validate_publication_inputs
+            )
+        except PublicationError as exc:
+            raise IpcCommandError("INVALID_CONFIG", str(exc)) from exc
+        self.program_runner.next_revision = publication["revision"]
+        self.program_runner._camera_serials = None
+        self._pending_camera_reload_revision = publication["revision"]
+        self._refresh_startup_requirements(force=True)
+        return {
+            **self.publication_store.status(),
+            "published": True,
+            "applies_to_running_task": False,
+        }
+
+    def _ipc_get_publication_status(self, _data=None) -> dict[str, Any]:
+        flow = self.program_runner.snapshot()
+        status = self.publication_store.status()
+        return {
+            **status,
+            "current_task_revision": flow.get("current_revision"),
+            "next_task_revision": status["revision"],
+            "publication_load_error": self.publication_store.load_error,
+        }
+
+    def _require_maintenance(self) -> None:
+        if not self.maintenance_mode:
+            raise IpcCommandError(
+                "NOT_IN_MAINTENANCE",
+                "Runtime is not in maintenance mode",
+            )
+
+    def _require_debug_robot(self) -> None:
+        if not self.controller.is_connected or self.controller.dashboard is None:
+            raise IpcCommandError(
+                "ROBOT_NOT_CONNECTED",
+                "Robot is not connected",
+            )
+        if not self.controller.is_enabled:
+            raise IpcCommandError(
+                "ROBOT_NOT_ENABLED",
+                "Robot is not enabled",
+            )
+
+    def _get_published_library(self) -> FlowLibrary:
+        publication = self.publication_store.snapshot()
+        return FlowLibrary(
+            publication["flow_library"],
+            path="published-flow.json",
+        )
+
+    def _ipc_validate_flow(self, data=None) -> dict[str, Any]:
+        from .workers import validate_grasp_flow_modules
+
+        data = data or {}
+        library = self._get_published_library()
+        flow_id = str(data.get("flow_id") or library.main_flow_id)
+        try:
+            flow = library.get_flow(flow_id)
+        except KeyError as exc:
+            raise IpcCommandError("FLOW_NOT_FOUND", str(exc)) from exc
+        errors = validate_grasp_flow_modules(flow["modules"])
+        return {
+            "valid": not errors,
+            "flow_id": flow["id"],
+            "flow_name": flow["name"],
+            "module_count": len(flow["modules"]),
+            "required_cameras": sorted(required_camera_types(flow["modules"])),
+            "errors": errors,
+            "revision": self.publication_store.status()["revision"],
+        }
+
+    def _ipc_get_current_pose(self, _data=None) -> dict[str, Any]:
+        if not self.controller.is_connected:
+            raise IpcCommandError(
+                "ROBOT_NOT_CONNECTED",
+                "Robot is not connected",
+            )
+        pose = self.controller.get_current_pose_fast(
+            max_age=1.0,
+            fallback=False,
+        )
+        if not pose:
+            raise IpcCommandError("TIMEOUT", "No fresh robot pose is available")
+        return {"pose": list(pose), "source": "feedback_cache"}
+
+    def _ipc_get_runtime_logs(self, data=None) -> dict[str, Any]:
+        data = data or {}
+        try:
+            limit = max(1, min(1000, int(data.get("limit", 200))))
+        except (TypeError, ValueError) as exc:
+            raise IpcCommandError("INVALID_CONFIG", "limit must be an integer") from exc
+        path = DEFAULT_LOG_DIR / "runtime.log"
+        if not path.exists():
+            return {"lines": [], "path": str(path)}
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()[-limit:]
+        return {"lines": [line.rstrip("\r\n") for line in lines], "path": str(path)}
+
+    def _start_debug_request(self, request: RuntimeExecutionRequest) -> dict[str, Any]:
+        self._require_maintenance()
+        self._require_debug_robot()
+        readiness = check_flow_readiness(
+            self.controller,
+            self.program_runner.vision_d435i,
+            self.program_runner.vision_d405,
+            request.modules,
+        )
+        if not readiness.ok:
+            if any(item in {"D405", "D435i"} for item in readiness.missing_devices):
+                raise IpcCommandError("CAMERA_NOT_READY", readiness.message)
+            raise IpcCommandError("ROBOT_NOT_CONNECTED", readiness.message)
+        if not self.program_runner.start_request(request):
+            raise IpcCommandError(
+                "TASK_ALREADY_RUNNING",
+                "Another Runtime task is already running",
+            )
+        return {
+            "accepted": True,
+            "task_id": request.task_id,
+            "flow_id": request.flow_id,
+            "flow_name": request.flow_name,
+            "revision": request.revision,
+        }
+
+    def _ipc_start_debug_flow(self, data=None) -> dict[str, Any]:
+        data = data or {}
+        try:
+            request = self.program_runner.build_request(
+                mode="debug",
+                flow_id=data.get("flow_id"),
+            )
+        except KeyError as exc:
+            raise IpcCommandError("FLOW_NOT_FOUND", str(exc)) from exc
+        except ValueError as exc:
+            raise IpcCommandError("INVALID_CONFIG", str(exc)) from exc
+        return self._start_debug_request(request)
+
+    def _ipc_run_step(self, data=None) -> dict[str, Any]:
+        data = data or {}
+        try:
+            step_index = int(data.get("step_index"))
+            request = self.program_runner.build_request(
+                mode="debug",
+                flow_id=data.get("flow_id"),
+                step_index=step_index,
+            )
+        except (TypeError, ValueError) as exc:
+            raise IpcCommandError("INVALID_CONFIG", str(exc)) from exc
+        except KeyError as exc:
+            raise IpcCommandError("FLOW_NOT_FOUND", str(exc)) from exc
+        return self._start_debug_request(request)
+
+    def _ipc_move_to_point(self, data=None) -> dict[str, Any]:
+        data = data or {}
+        point_name = str(data.get("point_name", "")).strip()
+        if not point_name:
+            raise IpcCommandError("INVALID_CONFIG", "point_name is required")
+        module = {
+            "type": "move",
+            "name": f"Debug move: {point_name}",
+            "params": {
+                "target": "saved_point",
+                "point_name": point_name,
+                "motion_type": str(data.get("motion_type", "MovJ")),
+                "speed": int(data.get("speed", 10)),
+            },
+        }
+        try:
+            request = self.program_runner.build_request(
+                mode="debug",
+                modules=[module],
+                flow_name=module["name"],
+            )
+            with use_config_snapshot(request.config):
+                if resolve_point(point_name) is None:
+                    raise ValueError(f"point does not exist: {point_name}")
+        except (TypeError, ValueError) as exc:
+            raise IpcCommandError("INVALID_CONFIG", str(exc)) from exc
+        return self._start_debug_request(request)
+
+    def _ipc_pause_debug_flow(self, _data=None) -> dict[str, Any]:
+        self._require_maintenance()
+        if self.program_runner.task_mode != "debug" or not self.program_runner.pause():
+            raise IpcCommandError("RUNTIME_BUSY", "No debug flow is running")
+        return {"paused": True, "task_id": self.program_runner.task_id}
+
+    def _ipc_resume_debug_flow(self, _data=None) -> dict[str, Any]:
+        self._require_maintenance()
+        if self.program_runner.task_mode != "debug" or not self.program_runner.resume():
+            raise IpcCommandError("RUNTIME_BUSY", "No paused debug flow is running")
+        return {"paused": False, "task_id": self.program_runner.task_id}
+
+    def _ipc_stop_debug_flow(self, _data=None) -> dict[str, Any]:
+        self._require_maintenance()
+        if self.program_runner.task_mode != "debug":
+            raise IpcCommandError("RUNTIME_BUSY", "No debug flow is running")
+        result = self._ipc_stop_current_task()
+        return {**result, "task_id": self.program_runner.task_id}
+
+    def _ipc_get_debug_task_status(self, _data=None) -> dict[str, Any]:
+        snapshot = self.program_runner.snapshot()
+        return {
+            key: snapshot.get(key)
+            for key in (
+                "running",
+                "task_id",
+                "task_mode",
+                "paused",
+                "flow_id",
+                "main_flow_id",
+                "main_flow_name",
+                "module_index",
+                "module_name",
+                "last_task_result",
+                "last_task_error",
+                "current_revision",
+            )
+        }
+
+    def _get_debug_vision(self, camera_type: str):
+        if camera_type not in {"D405", "D435i"}:
+            raise IpcCommandError(
+                "INVALID_CONFIG",
+                f"Unsupported camera type: {camera_type}",
+            )
+        vision = (
+            self.program_runner.vision_d405
+            if camera_type == "D405"
+            else self.program_runner.vision_d435i
+        )
+        if vision is None or not getattr(vision, "is_available", False):
+            raise IpcCommandError(
+                "CAMERA_NOT_READY",
+                f"{camera_type} is not ready",
+            )
+        return vision
+
+    def _capture_debug_snapshot(
+        self,
+        camera_type: str,
+        *,
+        include_color: bool,
+        include_depth: bool,
+        include_mask: bool,
+        run_detection: bool,
+    ) -> dict[str, Any]:
+        from .runtime_vision_debug import capture_vision_snapshot
+
+        self._require_maintenance()
+        if self.program_runner.snapshot().get("running"):
+            raise IpcCommandError(
+                "RUNTIME_BUSY",
+                "Vision capture is unavailable while a flow is running",
+            )
+        vision = self._get_debug_vision(camera_type)
+        lock = self.program_runner._camera_locks[camera_type]
+        with lock:
+            try:
+                return capture_vision_snapshot(
+                    vision,
+                    self.controller,
+                    camera_type=camera_type,
+                    include_color=include_color,
+                    include_depth=include_depth,
+                    include_mask=include_mask,
+                    run_detection=run_detection,
+                )
+            except Exception as exc:
+                raise IpcCommandError("INTERNAL_ERROR", str(exc)) from exc
+
+    def _ipc_test_d405(self, _data=None) -> dict[str, Any]:
+        return self._capture_debug_snapshot(
+            "D405",
+            include_color=False,
+            include_depth=False,
+            include_mask=False,
+            run_detection=False,
+        )
+
+    def _ipc_test_d435i(self, _data=None) -> dict[str, Any]:
+        return self._capture_debug_snapshot(
+            "D435i",
+            include_color=False,
+            include_depth=False,
+            include_mask=False,
+            run_detection=False,
+        )
+
+    def _ipc_test_detection(self, data=None) -> dict[str, Any]:
+        data = data or {}
+        return self._capture_debug_snapshot(
+            str(data.get("camera_type", "D405")),
+            include_color=False,
+            include_depth=False,
+            include_mask=False,
+            run_detection=True,
+        )
+
+    def _ipc_get_vision_snapshot(self, data=None) -> dict[str, Any]:
+        data = data or {}
+        return self._capture_debug_snapshot(
+            str(data.get("camera_type", "D405")),
+            include_color=bool(data.get("include_color", True)),
+            include_depth=bool(data.get("include_depth", False)),
+            include_mask=bool(data.get("include_mask", True)),
+            run_detection=bool(data.get("run_detection", True)),
+        )
+
+    def _ipc_get_visual_servo_telemetry(self, _data=None) -> dict[str, Any]:
+        flow = self.program_runner._active_flow
+        if flow is None or not hasattr(flow, "get_visual_servo_telemetry"):
+            return {"active": False, "telemetry": {}}
+        return {
+            "active": bool(getattr(flow, "active_visual_servo", None)),
+            "telemetry": flow.get_visual_servo_telemetry(),
+            "task_id": self.program_runner.task_id,
+        }
+
+    def _ipc_stop_current_task(self, _data=None) -> dict[str, Any]:
+        flow = getattr(self.controller, "_active_flow_thread", None)
+        flow_running = bool(self.program_runner.snapshot().get("running"))
+        if flow is not None:
+            ctx = getattr(flow, "_ctx", None)
+            if ctx is not None:
+                ctx.stop_event.set()
+            try:
+                flow.stop()
+            except Exception:
+                logger.exception("IPC停止当前流程标志设置失败")
+
+        stop_sent = False
+        if self.controller.dashboard is not None:
+            try:
+                with self.controller._temp_timeout(2.0):
+                    self.controller.dashboard.Stop()
+                stop_sent = True
+            except Exception:
+                logger.exception("IPC Stop()失败")
+        return {
+            "stop_requested": bool(flow is not None or flow_running or stop_sent),
+            "flow_was_running": flow_running,
+            "stop_sent": stop_sent,
+        }
+
+    def _modbus_main_flow_readiness(self):
+        with self._maintenance_lock:
+            if self.maintenance_mode:
+                return FlowReadinessResult(
+                    ok=False,
+                    missing_devices=("runtime",),
+                    reasons=("Runtime处于维护模式",),
+                )
+        return self.program_runner.check_main_flow_readiness()
+
+    def _runtime_motion_busy(self) -> bool:
+        if self.program_runner.snapshot().get("running"):
+            return True
+        if getattr(self.controller, "_active_flow_thread", None) is not None:
+            return True
+        modbus_thread = getattr(self.controller, "_modbus_exec_thread", None)
+        return bool(modbus_thread is not None and modbus_thread.is_alive())
+
+    def _run_program_from_modbus(self) -> bool:
+        with self._maintenance_lock:
+            if self.maintenance_mode:
+                logger.warning("维护模式下拒绝Modbus生产流程")
+                return False
+        return self.program_runner()
+
+    def _validate_publication_inputs(
+        self,
+        config: dict[str, Any],
+        library: FlowLibrary,
+    ) -> list[str]:
+        from .workers import validate_grasp_flow_modules
+
+        errors: list[str] = []
+        try:
+            ipaddress.ip_address(str(config.get("robot_ip", "")))
+        except ValueError:
+            errors.append("robot_ip is invalid")
+        try:
+            port = int(config.get("modbus_port", 502))
+            if not 1 <= port <= 65535:
+                errors.append("modbus_port must be between 1 and 65535")
+        except (TypeError, ValueError):
+            errors.append("modbus_port must be an integer")
+        camera_config = config.get("camera", {})
+        models = (
+            camera_config.get("models", {})
+            if isinstance(camera_config, dict)
+            else {}
+        )
+        if isinstance(models, dict):
+            for camera_type in ("D405", "D435i"):
+                configured = models.get(camera_type)
+                if not configured:
+                    continue
+                model_path = Path(str(configured))
+                if model_path.suffix.lower() != ".onnx":
+                    errors.append(f"{camera_type} model must be an ONNX file")
+                elif not model_path.is_file():
+                    errors.append(f"{camera_type} model does not exist: {model_path}")
+        for flow in library.flows:
+            for error in validate_grasp_flow_modules(flow["modules"]):
+                errors.append(f"{flow['name']}: {error}")
+        return errors
+
     def validate_startup_inputs(self) -> list[str]:
+        publication = self.publication_store.snapshot()
+        library = FlowLibrary(
+            publication["flow_library"],
+            path="published-flow.json",
+        )
+        errors = self._validate_publication_inputs(
+            publication["config"],
+            library,
+        )
+        if self.publication_store.load_error:
+            errors.append(self.publication_store.load_error)
+        return errors
+
+    def _validate_legacy_startup_inputs(self) -> list[str]:
         errors = []
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as handle:
@@ -858,11 +1771,20 @@ class DobotRuntimeAgent:
                 "running": not self.stop_event.is_set(),
                 "state": state.get("state", RuntimeState.STARTING.value),
                 "recovery_required": self.recovery_required,
+                "maintenance": self.maintenance_mode,
                 "startup_delay": self.startup_delay,
                 "startup_connect_timeout_s": self.startup_connect_timeout_s,
                 "poll_interval": self.poll_interval,
                 "last_error": self.last_error or self.supervisor.last_error,
                 "startup_errors": list(self.startup_errors),
+                "service_mode": self.service_mode,
+                "service_name": self.service_name or None,
+                "stop_reason": self.stop_reason,
+                "stop_marker_path": (
+                    str(self.service_stop_marker_path)
+                    if self.service_mode
+                    else None
+                ),
             },
             "robot": {
                 "ip": self.controller.robot_ip,
@@ -887,6 +1809,13 @@ class DobotRuntimeAgent:
                     getattr(getattr(self.controller, "modbus_server", None), "_server_thread", None)
                     and self.controller.modbus_server._server_thread.is_alive()
                 ),
+            },
+            "ipc": self.ipc_server.snapshot(),
+            "publication": {
+                **self.publication_store.status(),
+                "current_task_revision": runner.get("current_revision"),
+                "next_task_revision": self.publication_store.status()["revision"],
+                "load_error": self.publication_store.load_error,
             },
             "flow": runner,
             "startup_connection": {
@@ -915,13 +1844,30 @@ class DobotRuntimeAgent:
         atomic_write_json(self.health_path, self.build_health_payload())
 
     def tick(self) -> None:
+        if (
+            self._pending_camera_reload_revision
+            and not self.program_runner.snapshot()["running"]
+        ):
+            self.program_runner.reload_cameras()
+            self._pending_camera_reload_revision = None
         if not self.ensure_modbus_running():
             if self.controller.modbus_server:
                 self.controller._write_modbus_status(STATUS_ROBOT_ERR)
         supervisor_state = self.supervisor.step()
         self._update_startup_connection()
         metrics = get_process_metrics(self.health_path)
-        if metrics["disk_free_mb"] < self.disk_free_min_mb:
+        if self.maintenance_mode:
+            maintenance_error = ""
+            if metrics["disk_free_mb"] < self.disk_free_min_mb:
+                maintenance_error = (
+                    f"disk free space low: {metrics['disk_free_mb']}MB "
+                    f"< {self.disk_free_min_mb}MB"
+                )
+            self.state_store.transition(
+                RuntimeState.MAINTENANCE,
+                last_error=maintenance_error,
+            )
+        elif metrics["disk_free_mb"] < self.disk_free_min_mb:
             self.last_error = (
                 f"disk free space low: {metrics['disk_free_mb']}MB "
                 f"< {self.disk_free_min_mb}MB"
@@ -953,9 +1899,14 @@ class DobotRuntimeAgent:
             )
         self._state_initialized = True
         self.controller.set_modbus_program_runner(
-            self.program_runner,
-            readiness_checker=self.program_runner.check_main_flow_readiness,
+            self._run_program_from_modbus,
+            readiness_checker=self._modbus_main_flow_readiness,
         )
+        if not self.stop_event.is_set() and not self.ipc_server.start():
+            self.last_error = (
+                f"Runtime IPC启动失败: {self.ipc_server.last_error}"
+            )
+            logger.error(self.last_error)
         self.ensure_modbus_running()
         self.controller.set_runtime_recovery_required(
             self.recovery_required,
@@ -1014,14 +1965,30 @@ class DobotRuntimeAgent:
         )
         self.state_store.transition(state, last_error="")
 
-    def request_stop(self) -> None:
+    def request_stop(self, reason="requested") -> None:
+        self.stop_reason = str(reason)
+        if self.service_mode:
+            try:
+                atomic_write_json(
+                    self.service_stop_marker_path,
+                    {
+                        "timestamp": time.time(),
+                        "service_name": self.service_name,
+                        "reason": self.stop_reason,
+                    },
+                )
+            except Exception:
+                logger.exception("failed to write service stop marker")
         self.stop_event.set()
 
     def stop(self, clean=True) -> None:
         if self._stopped:
             return
         self._stopped = True
+        if not self.stop_reason:
+            self.stop_reason = "clean_shutdown" if clean else "crash_shutdown"
         self.stop_event.set()
+        self.ipc_server.stop()
         if self._state_initialized:
             try:
                 self.state_store.transition(RuntimeState.STOPPING)
@@ -1042,6 +2009,8 @@ class DobotRuntimeAgent:
         except Exception as e:
             logger.warning("stop_modbus during runtime shutdown failed: %s", e)
         self.program_runner.close_cameras()
+        self.controller.set_runtime_maintenance(False)
+        self.maintenance_mode = False
         self.supervisor.shutdown()
         if hasattr(self.controller, "release_control_lease"):
             self.controller.release_control_lease()
@@ -1085,7 +2054,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         def _stop(signum, _frame):
             logger.info("runtime stop signal received: %s", signum)
-            agent.request_stop()
+            agent.request_stop(f"signal:{signum}")
 
         signal.signal(signal.SIGINT, _stop)
         signal.signal(signal.SIGTERM, _stop)

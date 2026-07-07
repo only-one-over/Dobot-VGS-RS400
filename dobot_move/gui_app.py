@@ -5,6 +5,8 @@
 """
 
 import sys
+import json
+import base64
 import time
 import numpy as np
 import logging
@@ -13,25 +15,39 @@ from .qt_compat import (
     QPushButton, QLabel, QGroupBox, QGridLayout, QStatusBar,
     QMessageBox, QLineEdit, QDoubleSpinBox, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QFrame, QScrollArea, QStackedWidget,
-    QCheckBox, QSizePolicy,
-    Qt, QTimer, pyqtSignal,
+    QCheckBox, QSizePolicy, QTextEdit,
+    Qt, QTimer, QPixmap,
 )
 
-from .robot_controller import DobotController
-from .config_manager import get_robot_ip, get_modbus_port, get_modbus_slave_id, get_grasp_flow_file, ConfigService
-from .workers import RobotCmdThread
+from .alarm_history import AlarmHistory
+from .config_manager import (
+    ConfigService,
+    get_grasp_flow_file,
+    get_initial_point,
+    get_modbus_port,
+    get_modbus_slave_id,
+    get_robot_ip,
+    get_runtime_config,
+)
+from .gui_runtime_status import (
+    DEFAULT_RUNTIME_HEALTH_PATH,
+    RuntimeHealthReader,
+    RuntimeHealthSnapshot,
+)
+from .gui_ipc_client import RuntimeIpcClient, RuntimeIpcRequestThread
+from .runtime_ipc import DEFAULT_IPC_TOKEN_PATH
 from .gui_mixins import (
     RobotControlMixin,
     VisionMixin,
     ModbusMixin,
     PointManagementMixin,
     GraspFlowMixin,
-    StartupConnectionMixin,
 )
 from .ui_theme import apply_theme, apply_status_visual, set_button_role, NAV_ICONS, card_style, metric_label_style, metric_title_style
 from .flow_step_list import FlowStepList
 from .main_control_panel import MainControlPanel
-from .flow_library import FlowLibrary, required_camera_types
+from .flow_library import FlowLibrary
+from .gui_debug_widgets import ErrorTrendPlot
 
 logger = logging.getLogger(__name__)
 
@@ -40,53 +56,6 @@ try:
     HANDEYE_AVAILABLE = True
 except Exception:
     HANDEYE_AVAILABLE = False
-
-_missing_deps = []
-try:
-    import pyrealsense2 as rs
-except ImportError:
-    rs = None
-    _missing_deps.append(("pyrealsense2", "pip install pyrealsense2\n注意: 需要先安装 Intel RealSense SDK\n下载地址: https://github.com/IntelRealSense/librealsense/releases"))
-
-try:
-    import cv2
-except ImportError:
-    cv2 = None
-    _missing_deps.append(("opencv-python", "pip install opencv-python"))
-
-try:
-    import onnxruntime as ort
-except ImportError:
-    ort = None
-    _missing_deps.append(("onnxruntime", "pip install onnxruntime"))
-
-if _missing_deps:
-    logger.error("=" * 60)
-    logger.error("视觉系统导入失败，缺少以下依赖：")
-    for dep_name, dep_hint in _missing_deps:
-        logger.error(f"  ✗ {dep_name}")
-        logger.error(f" 安装命令: {dep_hint}")
-    logger.error("=" * 60)
-    VISION_AVAILABLE = False
-    rs = None
-    cv2 = None
-    class VisionSystem:
-        def __init__(self):
-            raise Exception("视觉系统不可用，缺少依赖: " + ", ".join(d[0] for d in _missing_deps))
-        def close(self):
-            pass
-else:
-    try:
-        from .vision_system import VisionSystem
-        VISION_AVAILABLE = True
-    except Exception as e:
-        logger.error(f"视觉系统导入失败: {e}")
-        VISION_AVAILABLE = False
-        class VisionSystem:
-            def __init__(self):
-                raise Exception("视觉系统不可用")
-            def close(self):
-                pass
 
 _DEFAULT_GRASP_FLOW_MODULES = [
     {
@@ -117,9 +86,8 @@ _DEFAULT_GRASP_FLOW_MODULES = [
     }
 ]
 
-class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, ModbusMixin, PointManagementMixin, GraspFlowMixin, QMainWindow):
+class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManagementMixin, GraspFlowMixin, QMainWindow):
     """机器人控制GUI"""
-    _modbus_program_requested = pyqtSignal()
     
     def __init__(self):
         super().__init__()
@@ -130,14 +98,31 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
         self.set_dark_theme()
         
         self.robot_ip = get_robot_ip()
-        self.controller = DobotController(self.robot_ip, enforce_single_instance=True)
-        self._modbus_program_requested.connect(self._run_modbus_program_from_signal)
-        self.controller.set_modbus_program_runner(
-            self._request_modbus_program_from_modbus,
-            readiness_checker=self.check_main_flow_readiness,
+        runtime_config = get_runtime_config()
+        health_path = runtime_config.get(
+            "health_path",
+            str(DEFAULT_RUNTIME_HEALTH_PATH),
         )
-        self.vision_d435i = None
-        self.vision_d405 = None
+        self._runtime_status_reader = RuntimeHealthReader(
+            health_path,
+            stale_after_s=3.0,
+        )
+        self._runtime_ipc_client = RuntimeIpcClient(
+            host=runtime_config.get("ipc_host", "127.0.0.1"),
+            port=runtime_config.get("ipc_port", 8765),
+            timeout_s=min(
+                3.0,
+                float(runtime_config.get("ipc_command_timeout_s", 5.0)),
+            ),
+            token_path=(
+                runtime_config.get("ipc_token_path")
+                or DEFAULT_IPC_TOKEN_PATH
+            ),
+        )
+        self._runtime_status = RuntimeHealthSnapshot()
+        self._ipc_request_threads = set()
+        self._ipc_pending_commands = set()
+        self._alarm_history = AlarmHistory()
         
         self._load_grasp_flow_modules()
         
@@ -158,7 +143,6 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
         if HANDEYE_AVAILABLE:
             self._load_calib_matrix("D435i")
         self.statusBar().showMessage("正在初始化状态监控...")
-        QTimer.singleShot(0, self._initialize_startup_connections)
 
     def _load_grasp_flow_modules(self):
         """加载抓取流程配置文件"""
@@ -178,20 +162,6 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
         self.grasp_flow_modules = self.flow_library.get_flow(
             self.editing_flow_id
         )["modules"]
-
-    def _request_modbus_program_from_modbus(self):
-        if getattr(self, "_flow_running", False):
-            return False
-        self._modbus_program_requested.emit()
-        return True
-
-    def _run_modbus_program_from_signal(self):
-        started = self.run_grasp_flow(
-            modbus_triggered=True,
-            flow_id=self.flow_library.main_flow_id,
-        )
-        if not started:
-            self.controller.mark_modbus_program_finished(False)
 
     @staticmethod
     def _wrap_in_scroll(widget):
@@ -275,7 +245,7 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
         status_layout.addWidget(self._create_status_card("推理", "#f59e0b", "gpu_status_label", "未检测"))
 
         # 初始位置卡片
-        status_layout.addWidget(self._create_status_card("位置", "#8b5cf6", "photo_position_label", f"{self.controller.initial_pose}", label_color="#8b5cf6"))
+        status_layout.addWidget(self._create_status_card("位置", "#8b5cf6", "photo_position_label", f"{get_initial_point()}", label_color="#8b5cf6"))
 
         
         # 右侧操作区
@@ -554,10 +524,10 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
         linear_force_layout.addStretch()
         linear_layout.addLayout(linear_force_layout)
 
-        read_current_btn = QPushButton("读取当前位置")
-        read_current_btn.setMinimumWidth(120)
-        read_current_btn.clicked.connect(self._on_read_current_for_linear)
-        linear_layout.addWidget(read_current_btn)
+        self.linear_read_current_btn = QPushButton("读取当前位置")
+        self.linear_read_current_btn.setMinimumWidth(120)
+        self.linear_read_current_btn.clicked.connect(self._on_read_current_for_linear)
+        linear_layout.addWidget(self.linear_read_current_btn)
         
         # 关节旋转参数
         self.joint_rotation_params = QWidget()
@@ -861,6 +831,11 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
         set_button_role(self.save_flow_btn, "secondary")
         self.save_flow_btn.clicked.connect(self.save_grasp_flow)
         flow_ops_layout.addWidget(self.save_flow_btn)
+
+        self.publish_flow_btn = QPushButton("发布到 Runtime")
+        set_button_role(self.publish_flow_btn, "primary")
+        self.publish_flow_btn.clicked.connect(self._publish_runtime_config)
+        flow_ops_layout.addWidget(self.publish_flow_btn)
         
         self.load_flow_btn = QPushButton("加载流程")
         set_button_role(self.load_flow_btn, "secondary")
@@ -1107,6 +1082,7 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
         self.cam_test_worker = None
 
         self._add_nav_page("相机测试", self._wrap_in_scroll(camera_test_tab))
+        self._create_runtime_debug_page()
 
         # Modbus 数据刷新定时器
         self._modbus_refresh_timer = QTimer()
@@ -1136,82 +1112,33 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
     def _update_emergency_stop_button(self):
         if not hasattr(self, "emergency_stop_btn"):
             return
-        active = bool(
-            getattr(self, "_software_emergency_active", False) or
-            getattr(self.controller, "software_emergency_active", False)
-        )
-        self.emergency_stop_btn.setText("解除" if active else "急停")
-        self.emergency_stop_btn.setProperty("active", "true" if active else "false")
+        self.emergency_stop_btn.setText("急停")
+        self.emergency_stop_btn.setProperty("active", "false")
         self.emergency_stop_btn.style().unpolish(self.emergency_stop_btn)
         self.emergency_stop_btn.style().polish(self.emergency_stop_btn)
 
     def _refresh_action_states(self):
-        robot_ready = bool(getattr(self.controller, "is_connected", False))
-        required_cameras = required_camera_types(
-            self.flow_library.get_main_flow()["modules"]
-        )
-        camera_ready = all(
-            (
-                camera_type == "D435i"
-                and self.vision_d435i is not None
-            ) or (
-                camera_type == "D405"
-                and self.vision_d405 is not None
-            )
-            for camera_type in required_cameras
-        )
-        flow_running = bool(getattr(self, "_flow_running", False))
-        cmd_running = bool(getattr(self, "_cmd_running", False))
-        connect_tasks = getattr(self, "_device_connect_tasks", {})
-        connecting = {
-            name
-            for name, task in connect_tasks.items()
-            if task is not None and task.is_alive
-        }
-
         for attr in (
             "enable_robot_btn", "disable_robot_btn", "get_pos_btn",
             "move_initial_btn", "collision_set_btn", "clear_error_btn", "run_flow_btn",
+            "run_task_btn", "connect_robot_btn", "pause_btn", "continue_btn",
+            "editor_pause_btn", "editor_continue_btn", "emergency_stop_btn",
+            "realtime_btn", "read_point_btn", "linear_read_current_btn",
+            "cam_test_start_btn", "cam_test_stop_btn",
         ):
             if hasattr(self, attr):
-                getattr(self, attr).setEnabled(robot_ready and not flow_running and not cmd_running)
-
-        if hasattr(self, "run_task_btn"):
-            self.run_task_btn.setEnabled(robot_ready and camera_ready and not flow_running and not cmd_running)
+                getattr(self, attr).setEnabled(False)
         if hasattr(self.main_control, "main_flow_combo"):
-            self.main_control.main_flow_combo.setEnabled(
-                not flow_running and not cmd_running
-            )
-        if hasattr(self, "connect_robot_btn"):
-            self.connect_robot_btn.setEnabled(
-                not robot_ready
-                and "robot" not in connecting
-                and not flow_running
-                and not cmd_running
-            )
-        for camera_type, vision, connect_btn, disconnect_btn in (
-            ("D435i", self.vision_d435i, self.d435i_connect_btn, self.d435i_disconnect_btn),
-            ("D405", self.vision_d405, self.d405_connect_btn, self.d405_disconnect_btn),
+            self.main_control.main_flow_combo.setEnabled(True)
+
+        for camera_type, camera_connected in (
+            ("D435i", self._runtime_status.d435i_connected),
+            ("D405", self._runtime_status.d405_connected),
         ):
-            camera_connected = vision is not None
-            connect_btn.setEnabled(
-                not camera_connected
-                and camera_type not in connecting
-                and not flow_running
-            )
-            disconnect_btn.setEnabled(camera_connected and not flow_running)
             self.main_control.set_camera_model_selection_enabled(
                 camera_type,
-                not camera_connected and camera_type not in connecting,
+                not camera_connected,
             )
-        if hasattr(self, "pause_btn"):
-            self.pause_btn.setEnabled(flow_running and not self.is_paused)
-        if hasattr(self, "continue_btn"):
-            self.continue_btn.setEnabled(flow_running and self.is_paused)
-        if hasattr(self, "editor_pause_btn"):
-            self.editor_pause_btn.setEnabled(flow_running and not self.is_paused)
-        if hasattr(self, "editor_continue_btn"):
-            self.editor_continue_btn.setEnabled(flow_running and self.is_paused)
         for attr in (
             "edit_flow_combo",
             "new_flow_btn",
@@ -1220,10 +1147,357 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
             "delete_flow_btn",
         ):
             if hasattr(self, attr):
-                getattr(self, attr).setEnabled(not flow_running and not cmd_running)
-        if hasattr(self, "emergency_stop_btn"):
-            self.emergency_stop_btn.setEnabled(robot_ready)
-            self._update_emergency_stop_button()
+                getattr(self, attr).setEnabled(True)
+        if hasattr(self, "collision_combo"):
+            self.collision_combo.setEnabled(False)
+        self._update_emergency_stop_button()
+
+    def _create_runtime_debug_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        runtime_group = QGroupBox("Runtime 维护控制")
+        runtime_layout = QHBoxLayout(runtime_group)
+        self.debug_runtime_state = QLabel("Runtime: 未连接")
+        runtime_layout.addWidget(self.debug_runtime_state)
+        for text, command in (
+            ("进入维护", "enter_maintenance"),
+            ("退出维护", "exit_maintenance"),
+            ("刷新状态", "get_status"),
+        ):
+            button = QPushButton(text)
+            button.clicked.connect(
+                lambda _checked=False, cmd=command: self._send_runtime_ipc(cmd)
+            )
+            runtime_layout.addWidget(button)
+        runtime_layout.addStretch()
+        layout.addWidget(runtime_group)
+
+        flow_group = QGroupBox("流程调试")
+        flow_layout = QGridLayout(flow_group)
+        self.debug_validate_btn = QPushButton("校验当前流程")
+        self.debug_validate_btn.clicked.connect(self._validate_debug_flow)
+        flow_layout.addWidget(self.debug_validate_btn, 0, 0)
+        self.debug_start_btn = QPushButton("运行当前流程")
+        self.debug_start_btn.clicked.connect(self._start_debug_flow)
+        flow_layout.addWidget(self.debug_start_btn, 0, 1)
+        flow_layout.addWidget(QLabel("步骤序号:"), 0, 2)
+        self.debug_step_input = QLineEdit("1")
+        self.debug_step_input.setMaximumWidth(80)
+        flow_layout.addWidget(self.debug_step_input, 0, 3)
+        self.debug_step_btn = QPushButton("运行单步")
+        self.debug_step_btn.clicked.connect(self._run_debug_step)
+        flow_layout.addWidget(self.debug_step_btn, 0, 4)
+        for column, (text, command) in enumerate(
+            (
+                ("暂停", "pause_debug_flow"),
+                ("继续", "resume_debug_flow"),
+                ("停止", "stop_debug_flow"),
+                ("读取位姿", "get_current_pose"),
+            )
+        ):
+            button = QPushButton(text)
+            button.clicked.connect(
+                lambda _checked=False, cmd=command: self._send_runtime_ipc(cmd)
+            )
+            flow_layout.addWidget(button, 1, column)
+        layout.addWidget(flow_group)
+
+        vision_group = QGroupBox("视觉诊断")
+        vision_layout = QGridLayout(vision_group)
+        self.debug_camera_combo = QComboBox()
+        self.debug_camera_combo.addItems(["D405", "D435i"])
+        vision_layout.addWidget(self.debug_camera_combo, 0, 0)
+        snapshot_button = QPushButton("采集诊断快照")
+        snapshot_button.clicked.connect(self._request_vision_snapshot)
+        vision_layout.addWidget(snapshot_button, 0, 1)
+        logs_button = QPushButton("读取 Runtime 日志")
+        logs_button.clicked.connect(
+            lambda: self._send_runtime_ipc(
+                "get_runtime_logs",
+                {"limit": 200},
+                self._show_runtime_logs,
+            )
+        )
+        vision_layout.addWidget(logs_button, 0, 2)
+        self.debug_live_button = QPushButton("开始实时图")
+        self.debug_live_button.setCheckable(True)
+        self.debug_live_button.toggled.connect(self._toggle_live_vision)
+        vision_layout.addWidget(self.debug_live_button, 0, 3)
+        self.debug_depth_checkbox = QCheckBox("深度图")
+        self.debug_depth_checkbox.setChecked(True)
+        vision_layout.addWidget(self.debug_depth_checkbox, 0, 4)
+
+        self.debug_image_label = QLabel("等待 Runtime 视觉快照")
+        self.debug_image_label.setMinimumSize(360, 240)
+        self.debug_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.debug_image_label.setStyleSheet(
+            "background-color:#0b0f1a; border:1px solid #2a3550;"
+        )
+        vision_layout.addWidget(self.debug_image_label, 1, 0, 1, 3)
+        self.debug_depth_label = QLabel("等待深度图")
+        self.debug_depth_label.setMinimumSize(360, 240)
+        self.debug_depth_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.debug_depth_label.setStyleSheet(
+            "background-color:#0b0f1a; border:1px solid #2a3550;"
+        )
+        vision_layout.addWidget(self.debug_depth_label, 1, 3, 1, 2)
+        layout.addWidget(vision_group)
+
+        self.debug_telemetry_table = QTableWidget(0, 11)
+        self.debug_telemetry_table.setHorizontalHeaderLabels(
+            [
+                "迭代",
+                "X误差",
+                "Y误差",
+                "Z误差",
+                "总误差",
+                "频率(Hz)",
+                "采集(ms)",
+                "推理(ms)",
+                "深度(ms)",
+                "下发(ms)",
+                "总周期(ms)",
+            ]
+        )
+        self.debug_telemetry_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.debug_telemetry_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        layout.addWidget(self.debug_telemetry_table)
+        plots_layout = QHBoxLayout()
+        self.debug_error_time_plot = ErrorTrendPlot(
+            "总误差 vs 时间",
+            x_mode="time",
+        )
+        self.debug_error_iteration_plot = ErrorTrendPlot(
+            "总误差 vs 迭代",
+            x_mode="iteration",
+        )
+        plots_layout.addWidget(self.debug_error_time_plot)
+        plots_layout.addWidget(self.debug_error_iteration_plot)
+        layout.addLayout(plots_layout)
+
+        self.debug_output = QTextEdit()
+        self.debug_output.setReadOnly(True)
+        self.debug_output.setMinimumHeight(150)
+        layout.addWidget(self.debug_output)
+        self._add_nav_page("Runtime 调试", self._wrap_in_scroll(page))
+
+        self._debug_telemetry_timer = QTimer(self)
+        self._debug_telemetry_timer.timeout.connect(
+            lambda: self._send_runtime_ipc(
+                "get_visual_servo_telemetry",
+                on_success=self._append_servo_telemetry,
+                quiet=True,
+            )
+        )
+        self._debug_telemetry_timer.start(1000)
+        self._debug_live_timer = QTimer(self)
+        self._debug_live_timer.timeout.connect(self._poll_live_vision)
+
+    def _send_runtime_ipc(
+        self,
+        command,
+        data=None,
+        on_success=None,
+        quiet=False,
+    ):
+        if command in self._ipc_pending_commands:
+            return
+        self._ipc_pending_commands.add(command)
+        thread = RuntimeIpcRequestThread(
+            self._runtime_ipc_client,
+            command,
+            data,
+            self,
+        )
+        self._ipc_request_threads.add(thread)
+
+        def completed(response):
+            if response.get("ok"):
+                payload = response.get("data") or {}
+                if on_success:
+                    on_success(payload)
+                elif not quiet:
+                    self._debug_append(
+                        f"{command}: {json.dumps(payload, ensure_ascii=False)}"
+                    )
+            elif not quiet:
+                error = response.get("error") or {}
+                self._debug_append(
+                    f"{command} [{error.get('code', 'ERROR')}]: "
+                    f"{error.get('message', '')}"
+                )
+
+        def failed(message):
+            if not quiet:
+                self._debug_append(f"{command}: Runtime 离线或请求失败: {message}")
+
+        def cleanup():
+            self._ipc_pending_commands.discard(command)
+            self._ipc_request_threads.discard(thread)
+            thread.deleteLater()
+
+        thread.completed.connect(completed)
+        thread.failed.connect(failed)
+        thread.finished.connect(cleanup)
+        thread.start()
+
+    def _debug_append(self, message):
+        if hasattr(self, "debug_output"):
+            self.debug_output.append(str(message))
+        self.statusBar().showMessage(str(message), 5000)
+
+    def _publish_runtime_config(self):
+        if self.save_grasp_flow() is False:
+            return
+        ConfigService.instance().flush()
+        self._send_runtime_ipc(
+            "publish_config",
+            on_success=lambda data: self._debug_append(
+                f"发布成功，下一任务版本: {data.get('revision')}"
+            ),
+        )
+
+    def _validate_debug_flow(self):
+        self._send_runtime_ipc(
+            "validate_flow",
+            {"flow_id": self.editing_flow_id},
+        )
+
+    def _start_debug_flow(self):
+        self._send_runtime_ipc(
+            "start_debug_flow",
+            {"flow_id": self.editing_flow_id},
+        )
+
+    def _run_debug_step(self):
+        try:
+            step_index = int(self.debug_step_input.text().strip()) - 1
+        except ValueError:
+            self._debug_append("步骤序号必须是整数")
+            return
+        self._send_runtime_ipc(
+            "run_step",
+            {
+                "flow_id": self.editing_flow_id,
+                "step_index": step_index,
+            },
+        )
+
+    def _request_vision_snapshot(self):
+        self._send_runtime_ipc(
+            "get_vision_snapshot",
+            {
+                "camera_type": self.debug_camera_combo.currentText(),
+                "include_color": True,
+                "include_depth": self.debug_depth_checkbox.isChecked(),
+                "include_mask": True,
+                "run_detection": True,
+            },
+            self._show_vision_snapshot,
+        )
+
+    def _show_vision_snapshot(self, data):
+        encoded = data.get("color_jpeg_base64")
+        if encoded:
+            pixmap = QPixmap()
+            pixmap.loadFromData(base64.b64decode(encoded))
+            self.debug_image_label.setPixmap(
+                pixmap.scaled(
+                    self.debug_image_label.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        depth_encoded = data.get("depth_preview_jpeg_base64")
+        if depth_encoded:
+            depth_pixmap = QPixmap()
+            depth_pixmap.loadFromData(base64.b64decode(depth_encoded))
+            self.debug_depth_label.setPixmap(
+                depth_pixmap.scaled(
+                    self.debug_depth_label.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        summary = {
+            "detection": data.get("detection"),
+            "coordinates": data.get("coordinates"),
+            "depth": data.get("depth"),
+            "timings_ms": data.get("timings_ms"),
+            "provider": data.get("provider"),
+        }
+        self._debug_append(json.dumps(summary, ensure_ascii=False, indent=2))
+
+    def _show_runtime_logs(self, data):
+        self.debug_output.setPlainText("\n".join(data.get("lines", [])))
+
+    def _toggle_live_vision(self, active):
+        self.debug_live_button.setText("停止实时图" if active else "开始实时图")
+        if active:
+            self._debug_live_timer.start(750)
+            self._poll_live_vision()
+        else:
+            self._debug_live_timer.stop()
+
+    def _poll_live_vision(self):
+        if not self.debug_live_button.isChecked():
+            return
+        self._send_runtime_ipc(
+            "get_vision_snapshot",
+            {
+                "camera_type": self.debug_camera_combo.currentText(),
+                "include_color": True,
+                "include_depth": self.debug_depth_checkbox.isChecked(),
+                "include_mask": True,
+                "run_detection": True,
+            },
+            self._show_vision_snapshot,
+            quiet=True,
+        )
+
+    def _append_servo_telemetry(self, data):
+        telemetry = data.get("telemetry") or {}
+        if not telemetry:
+            return
+        row = self.debug_telemetry_table.rowCount()
+        if row >= 100:
+            self.debug_telemetry_table.removeRow(0)
+            row -= 1
+        self.debug_telemetry_table.insertRow(row)
+        xyz = list(telemetry.get("error_xyz_mm") or [0.0, 0.0, 0.0])
+        xyz += [0.0] * (3 - len(xyz))
+        values = (
+            telemetry.get("iterations", 0),
+            xyz[0],
+            xyz[1],
+            xyz[2],
+            telemetry.get("error_mm", 0.0),
+            telemetry.get("loop_hz", 0.0),
+            telemetry.get("capture_ms", 0.0),
+            telemetry.get("inference_ms", 0.0),
+            telemetry.get("depth_ms", 0.0),
+            telemetry.get("servo_ms", 0.0),
+            telemetry.get("control_total_ms", 0.0),
+        )
+        for column, value in enumerate(values):
+            text = str(value) if column == 0 else f"{float(value):.2f}"
+            self.debug_telemetry_table.setItem(
+                row,
+                column,
+                QTableWidgetItem(text),
+            )
+        timestamp = time.monotonic()
+        iteration = int(telemetry.get("iterations", 0))
+        error_mm = float(telemetry.get("error_mm", 0.0))
+        self.debug_error_time_plot.add_sample(timestamp, iteration, error_mm)
+        self.debug_error_iteration_plot.add_sample(timestamp, iteration, error_mm)
 
     def _start_status_timer(self):
         self._status_timer = QTimer(self)
@@ -1232,27 +1506,45 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
         self._poll_status()
 
     def _poll_status(self):
-        if self.controller:
-            if self.controller.is_connected:
-                # Check 30004 feedback health separately
-                fb_health = self.controller.get_feedback_health()
-                if fb_health["health"] == "ok":
-                    robot_status = "已连接"
-                elif fb_health["health"] == "stale":
-                    robot_status = "已连接(反馈延迟)"
-                else:
-                    robot_status = "已连接(反馈异常)"
-            else:
-                robot_status = "未连接"
-            self.update_status("robot", robot_status)
+        self._runtime_status = self._runtime_status_reader.read()
+        snapshot = self._runtime_status
+        if hasattr(self, "debug_runtime_state"):
+            publication = snapshot.raw.get("publication", {})
+            revision = publication.get("next_task_revision") or publication.get(
+                "revision",
+                "-",
+            )
+            self.debug_runtime_state.setText(
+                f"Runtime: {snapshot.runtime_state} | 下一任务版本: {revision}"
+            )
+        if not snapshot.online:
+            robot_status = "Runtime 离线"
+        elif snapshot.robot_connected:
+            robot_status = "已连接"
+        else:
+            robot_status = "未连接"
+        self.update_status("robot", robot_status)
 
         cameras = []
-        if self.vision_d435i and hasattr(self.vision_d435i, "camera") and self.vision_d435i.camera:
+        if snapshot.d435i_connected:
             cameras.append("D435i")
-        if self.vision_d405 and hasattr(self.vision_d405, "camera") and self.vision_d405.camera:
+        if snapshot.d405_connected:
             cameras.append("D405")
-        camera_status = "已连接(" + "+".join(cameras) + ")" if cameras else "未连接"
+        camera_status = (
+            "已连接(" + "+".join(cameras) + ")"
+            if cameras
+            else ("Runtime 离线" if not snapshot.online else "未连接")
+        )
         self.update_status("camera", camera_status)
+        self._set_camera_status(
+            "D435i",
+            "已连接" if snapshot.d435i_connected else "未连接",
+        )
+        self._set_camera_status(
+            "D405",
+            "已连接" if snapshot.d405_connected else "未连接",
+        )
+        self._refresh_modbus_table()
     
     def update_gpu_status(self, provider_text=None):
         """更新GPU推理模式状态显示。"""
@@ -1294,59 +1586,10 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
         self._refresh_action_states()
 
     def on_emergency_stop(self):
-        # 防抖：500ms 内重复点击忽略
-        import time as _time
-        now = _time.monotonic()
-        if now - getattr(self, '_last_emergency_click_ts', 0.0) < 0.5:
-            return
-        self._last_emergency_click_ts = now
-
-        active = bool(
-            getattr(self, "_software_emergency_active", False) or
-            getattr(self.controller, "software_emergency_active", False)
-        )
-        if getattr(self, "_emergency_cmd_running", False):
-            if not active:
-                logger.warning("急停命令正在执行中，忽略重复点击")
-                return
-            # 解除急停时允许覆盖正在执行的急停命令
-            logger.info("急停命令执行中，允许解除操作")
-        if active:
-            self.statusBar().showMessage("正在解除软件急停...")
-            thread = RobotCmdThread("解除软件急停", self.controller.release_emergency_stop, self)
-        else:
-            # Immediately mark emergency active and stop flow
-            self._software_emergency_active = True
-            if hasattr(self, "_flow_thread") and self._flow_thread is not None and self._flow_thread.isRunning():
-                self._flow_thread.stop()
-            self.statusBar().showMessage("正在触发软件急停...")
-            thread = RobotCmdThread("软件急停", self.controller.emergency_stop, self)
-        self._emergency_thread = thread
-        self._emergency_cmd_running = True
-        self._refresh_action_states()
-        thread.cmd_finished.connect(self._on_emergency_stop_finished)
-        thread.finished.connect(thread.deleteLater)
-        thread.start()
+        return self._show_runtime_ipc_required("GUI 软件急停")
 
     def _on_emergency_stop_finished(self, cmd_name, success):
-        self._emergency_cmd_running = False
-        if cmd_name == "解除软件急停":
-            if success:
-                self._software_emergency_active = False
-                self.statusBar().showMessage("软件急停已解除")
-            else:
-                self.statusBar().showMessage("解除软件急停失败")
-        else:
-            if success:
-                self._software_emergency_active = True
-                self.statusBar().showMessage("软件急停已触发")
-            else:
-                self.statusBar().showMessage("软件急停失败")
-        if hasattr(self, "_refresh_alarm_table"):
-            self._refresh_alarm_table()
-        if hasattr(self, "_refresh_modbus_table"):
-            self._refresh_modbus_table()
-        self._refresh_action_states()
+        del cmd_name, success
 
     def _create_alarm_tab(self):
         alarm_tab = QWidget()
@@ -1363,6 +1606,7 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
         self.alarm_clear_btn = QPushButton("清空本地记录")
         self.alarm_clear_btn.setMinimumWidth(120)
         self.alarm_clear_btn.clicked.connect(self._clear_alarm_history)
+        self.alarm_clear_btn.setEnabled(False)
         ops_layout.addWidget(self.alarm_clear_btn)
         ops_layout.addStretch()
         alarm_layout.addLayout(ops_layout)
@@ -1379,7 +1623,13 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
         self._refresh_alarm_table()
 
     def _refresh_alarm_table(self):
-        records = self.controller.alarm_history.list_records()
+        try:
+            with open(self._alarm_history.path, "r", encoding="utf-8") as handle:
+                records = json.load(handle)
+            if not isinstance(records, list):
+                records = []
+        except (OSError, ValueError, json.JSONDecodeError):
+            records = []
         self.alarm_table.setRowCount(len(records))
         fields = ["time", "source", "code", "level", "description", "solution", "raw"]
         for row, record in enumerate(reversed(records)):
@@ -1387,15 +1637,7 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
                 self.alarm_table.setItem(row, col, QTableWidgetItem(str(record.get(field, ""))))
 
     def _clear_alarm_history(self):
-        reply = QMessageBox.question(
-            self,
-            "确认",
-            "确定清空本地报警记录吗？这不会清除机器人真实报警。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            self.controller.alarm_history.clear()
-            self._refresh_alarm_table()
+        return self._show_runtime_ipc_required("清空报警历史")
     
     def _on_calib_camera_changed(self, camera_type):
         self._load_calib_matrix(camera_type)
@@ -1428,10 +1670,6 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
             manager = HandEyeCalibManager()
             if manager.set_matrix_direct(camera_type, matrix):
                 QMessageBox.information(self, "成功", f"{camera_type} 标定矩阵已保存")
-                if camera_type == "D435i" and self.vision_d435i is not None:
-                    self.vision_d435i.T_cam2gripper = matrix.copy()
-                elif camera_type == "D405" and self.vision_d405 is not None:
-                    self.vision_d405.T_cam2gripper = matrix.copy()
             else:
                 QMessageBox.critical(self, "错误", "保存标定矩阵失败")
         except Exception as e:
@@ -1457,63 +1695,20 @@ class DobotMainWindow(StartupConnectionMixin, RobotControlMixin, VisionMixin, Mo
         self._load_calib_matrix(camera_type)
 
     def closeEvent(self, event):
-        """窗口关闭 - 按顺序停止所有线程和服务"""
+        """Close GUI-only resources without touching Runtime hardware."""
         logger.info("正在关闭应用程序...")
-        self._shutdown_startup_connections()
-
-        # 0. 停止状态定时器
         if hasattr(self, '_status_timer') and self._status_timer is not None:
             self._status_timer.stop()
-
-        # 1. 停止流程
-        if hasattr(self, '_flow_thread') and self._flow_thread is not None:
-            self._flow_thread.stop()
-            self._flow_thread.wait(3000)
-            if self._flow_thread.isRunning():
-                logger.warning("FlowThread 未能正常退出")
-            self._flow_thread = None
-
-        # 2. 停止视觉伺服
-        # (visual servo is managed within FlowThread, so it should be stopped already)
-
-        # 3. 停止 Modbus server
-        try:
-            self.stop_modbus_server()
-            logger.info("Modbus server 已停止")
-        except Exception as e:
-            logger.warning("停止 Modbus server 时出错: %s", e)
-
-        # 4. 停止相机 workers 和关闭相机
-        if hasattr(self, 'cam_test_worker') and self.cam_test_worker is not None:
-            self.cam_test_worker.stop()
-            self.cam_test_worker.wait(3000)
-            if self.cam_test_worker.isRunning():
-                logger.warning("CameraTestWorker 未能正常退出")
-            self.cam_test_worker = None
-
-
-
-        if hasattr(self, 'vision_d435i') and self.vision_d435i is not None:
-            self.vision_d435i.close()
-            self.vision_d435i = None
-
-        if hasattr(self, 'vision_d405') and self.vision_d405 is not None:
-            self.vision_d405.close()
-            self.vision_d405 = None
-
-        # 5. 停止实时反馈和监控线程
-
-        # 6. 断开机器人连接
-        if hasattr(self, 'controller') and self.controller is not None:
-            try:
-                if self.controller.is_connected:
-                    self.controller.disconnect()
-                    logger.info("机器人已断开连接")
-                else:
-                    self.controller.release_control_lease()
-            except Exception as e:
-                logger.warning("断开机器人连接时出错: %s", e)
-
+        if hasattr(self, "_modbus_refresh_timer"):
+            self._modbus_refresh_timer.stop()
+        if hasattr(self, "_debug_telemetry_timer"):
+            self._debug_telemetry_timer.stop()
+        if hasattr(self, "_debug_live_timer"):
+            self._debug_live_timer.stop()
+        for thread in list(getattr(self, "_ipc_request_threads", ())):
+            thread.requestInterruption()
+            thread.wait(3500)
+        ConfigService.instance().flush()
         logger.info("应用程序关闭完成")
         event.accept()
 

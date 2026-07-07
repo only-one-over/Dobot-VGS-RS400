@@ -26,6 +26,11 @@ from .runtime_resilience import SingleInstanceLock
 
 logger = logging.getLogger(__name__)
 STATUS_DELAY_WAIT = STATUS_HOOK_OK
+_FEEDBACK_MAGIC = 0x123456789ABCDEF
+
+
+class _ConnectionSupersededError(RuntimeError):
+    pass
 
 
 class DobotController:
@@ -37,6 +42,12 @@ class DobotController:
         self.is_connected = False
         self.is_enabled = False
         self.last_error = ""
+        self._transport_lock = threading.RLock()
+        self._connect_attempt_lock = threading.Lock()
+        self._connection_generation = 0
+        self._robot_connect_deadline_s = 5.0
+        self._socket_connect_timeout_s = 2.0
+        self._feedback_read_timeout_s = 1.0
         self._enforce_single_instance = bool(enforce_single_instance)
         self._control_lease_path = (
             Path(__file__).resolve().parent.parent / "robot_control.lock"
@@ -108,6 +119,7 @@ class DobotController:
         self._modbus_delay_release_event = threading.Event()
         self._runtime_recovery_required = False
         self._runtime_recovery_cleared_callback = None
+        self._runtime_maintenance = False
         self._disconnect_stop_thread = None
         self._disconnect_stop_lock = threading.Lock()
         self.alarm_history = AlarmHistory()
@@ -196,10 +208,16 @@ class DobotController:
 
     @contextmanager
     def _temp_timeout(self, seconds):
-        if self.dashboard is None:
+        with self._api_timeout(self.dashboard, seconds):
+            yield
+
+    @staticmethod
+    @contextmanager
+    def _api_timeout(api, seconds):
+        if api is None:
             yield
             return
-        socket_dobot = getattr(self.dashboard, "socket_dobot", None)
+        socket_dobot = getattr(api, "socket_dobot", None)
         if socket_dobot is None or not hasattr(socket_dobot, "gettimeout") or not hasattr(socket_dobot, "settimeout"):
             yield
             return
@@ -389,143 +407,234 @@ class DobotController:
             return False, None, f"解析GetAngle响应失败: {str(e)}"
 
     def connect(self):
-        """连接机器人"""
+        """Build and validate candidate transports before publishing them."""
         if not self._acquire_control_lease():
             logger.error(self.last_error)
             return False
-        logger.info(f"\n===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 开始连接机器人 =====")
-        logger.info(f" [连接] 目标IP: {self.robot_ip}")
-        logger.info(f" [连接] 目标端口: 29999")
-
-        test_ok, test_msg = self.test_connection()
-        if not test_ok:
-            logger.error(f" [连接] 网络测试失败: {test_msg}")
-            logger.error(f"===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 连接失败 =====")
+        if not self._connect_attempt_lock.acquire(blocking=False):
+            self.last_error = "机器人连接任务已在执行"
+            logger.warning(self.last_error)
             return False
 
+        candidate_dashboard = None
+        candidate_feedback = None
         try:
-            logger.info(" [连接] 创建Dashboard连接...")
-            self.dashboard = DobotApiDashboard(self.robot_ip, 29999)
+            if self.is_connected and self.dashboard is not None:
+                return True
+            with self._transport_lock:
+                self._connection_generation += 1
+                generation = self._connection_generation
+            deadline = time.monotonic() + max(
+                0.5,
+                float(self._robot_connect_deadline_s),
+            )
 
-            if self.dashboard.socket_dobot == 0:
-                self.last_error = "Socket连接失败，可能是网络问题或端口未开放"
-                logger.error(f" [连接] {self.last_error}")
-                self.dashboard = None
-                logger.error(f"===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 连接失败 =====")
-                return False
+            logger.info(
+                "===== [%s] 开始连接机器人 generation=%d ip=%s =====",
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                generation,
+                self.robot_ip,
+            )
+            connect_timeout = min(
+                self._socket_connect_timeout_s,
+                self._remaining_connect_time(deadline),
+            )
+            candidate_dashboard = DobotApiDashboard(
+                self.robot_ip,
+                29999,
+                connect_timeout=connect_timeout,
+                io_timeout=connect_timeout,
+            )
+            self._require_current_connection_attempt(generation)
 
-            with self._temp_timeout(3):
-                logger.info(" [连接] 发送RobotMode指令验证连接...")
-                response = self.dashboard.RobotMode()
-                logger.debug(f" [连接] RobotMode响应: {response}")
+            with self._api_timeout(
+                candidate_dashboard,
+                min(2.0, self._remaining_connect_time(deadline)),
+            ):
+                response = candidate_dashboard.RobotMode()
+            valid, mode, msg = self._validate_robot_mode(response)
+            if not valid:
+                raise RuntimeError(f"RobotMode验证失败: {msg}")
 
-                valid, mode, msg = self._validate_robot_mode(response)
-                if not valid:
-                    self.last_error = f"RobotMode验证失败: {msg}"
-                    logger.error(f" [连接] {self.last_error}")
-                    self.dashboard.close()
-                    self.dashboard = None
-                    logger.error(f"===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 连接失败 =====")
-                    return False
-                logger.info(f" [连接] RobotMode验证通过，当前模式: {mode}")
+            with self._api_timeout(
+                candidate_dashboard,
+                min(2.0, self._remaining_connect_time(deadline)),
+            ):
+                response = candidate_dashboard.GetAngle()
+            valid, angles, msg = self._validate_get_angle(response)
+            if not valid:
+                raise RuntimeError(f"GetAngle验证失败: {msg}")
+            logger.info(
+                "Dashboard验证通过 generation=%d mode=%s angles=%s",
+                generation,
+                mode,
+                angles[:3],
+            )
+            self._require_current_connection_attempt(generation)
 
-                logger.info(" [连接] 发送GetAngle指令验证关节数据...")
-                response = self.dashboard.GetAngle()
-                logger.debug(f" [连接] GetAngle响应: {response}")
+            feedback_timeout = min(
+                self._socket_connect_timeout_s,
+                self._remaining_connect_time(deadline),
+            )
+            candidate_feedback = DobotApiFeedBack(
+                self.robot_ip,
+                30004,
+                connect_timeout=feedback_timeout,
+                io_timeout=min(
+                    self._feedback_read_timeout_s,
+                    self._remaining_connect_time(deadline),
+                ),
+            )
+            initial_packet = self._wait_for_candidate_feedback(
+                candidate_feedback,
+                generation,
+                deadline,
+            )
 
-                valid, angles, msg = self._validate_get_angle(response)
-                if not valid:
-                    self.last_error = f"GetAngle验证失败: {msg}"
-                    logger.error(f" [连接] {self.last_error}")
-                    self.dashboard.close()
-                    self.dashboard = None
-                    logger.error(f"===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 连接失败 =====")
-                    return False
-                logger.info(f" [连接] GetAngle验证通过，关节角度: {angles[:3]}...")
-
-            logger.info(" [连接] 测试实时反馈端口30004...")
-            feedback_port_ok, feedback_msg = self.test_connection(30004, timeout=2)
-            if not feedback_port_ok:
-                logger.warning(f" [连接] 警告: 反馈端口30004测试失败: {feedback_msg}")
-                logger.warning(" [连接] 将尝试继续连接，但实时反馈功能可能受限")
-
-            logger.info(" [连接] 启动实时反馈线程...")
-            self.start_feedback()
-
-            logger.info(" [连接] 等待实时反馈数据...")
-            feedback_timeout = 10
-            feedback_retries = 3
-            feed_ok = False
-
-            for retry in range(feedback_retries):
-                start_time = time.time()
-                while time.time() - start_time < feedback_timeout:
-                    with self.feed_lock:
-                        if self.feed_data is not None:
-                            logger.info(" [连接] 实时反馈数据接收成功")
-                            feed_ok = True
-                            break
-                    time.sleep(0.1)
-                if feed_ok:
-                    break
-                logger.warning(f" [连接] 反馈数据等待超时，重试 {retry+1}/{feedback_retries}...")
-                self.stop_feedback()
-                time.sleep(0.5)
-                self.start_feedback()
-
-            if not feed_ok:
-                self.last_error = f"实时反馈超时({feedback_timeout*feedback_retries}秒)，未收到反馈数据"
-                logger.error(f" [连接] {self.last_error}")
-                self.stop_feedback()
-                self.dashboard.close()
-                self.dashboard = None
-                logger.error(f"===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 连接失败 =====")
-                return False
-
-            self.is_connected = True
-            self.last_error = ""
-
-            logger.info(f"===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 机器人连接成功！ =====")
+            old_dashboard, old_feedback, old_feed_thread = (
+                self._commit_candidate_transport(
+                    candidate_dashboard,
+                    candidate_feedback,
+                    initial_packet,
+                    generation,
+                )
+            )
+            candidate_dashboard = None
+            candidate_feedback = None
+            self._close_replaced_transport(
+                old_dashboard,
+                old_feedback,
+                old_feed_thread,
+            )
+            logger.info(
+                "===== [%s] 机器人连接成功 generation=%d =====",
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                generation,
+            )
             return True
 
-        except socket.timeout:
-            self.last_error = "连接超时(3秒)，请检查网络稳定性和机器人状态"
-            logger.error(f" [连接] {self.last_error}")
-            if self.dashboard:
-                self.dashboard.close()
-            self.dashboard = None
-            logger.error(f"===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 连接失败 =====")
+        except _ConnectionSupersededError as exc:
+            self.last_error = str(exc)
+            logger.info("机器人连接结果已丢弃: %s", exc)
+            return False
+        except (socket.timeout, TimeoutError):
+            self.last_error = "机器人连接超过业务截止时间"
+            logger.error(self.last_error)
             return False
         except ConnectionRefusedError:
             self.last_error = "连接被拒绝，请确保机器人已启用TCP/IP控制模式"
-            logger.error(f" [连接] {self.last_error}")
-            if self.dashboard:
-                self.dashboard.close()
-            self.dashboard = None
-            logger.error(f"===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 连接失败 =====")
+            logger.error(self.last_error)
             return False
-        except OSError as e:
+        except OSError as exc:
             error_codes = {
                 10061: "端口拒绝连接，请检查机器人TCP/IP控制模式是否启用",
                 10060: "连接超时，请检查网络连接和IP地址",
                 10051: "网络不可达，请检查电脑和机器人是否在同一网段",
-                10054: "连接被重置，机器人可能已断开或重启"
+                10054: "连接被重置，机器人可能已断开或重启",
             }
-            self.last_error = error_codes.get(e.errno, f"网络错误: {str(e)}")
-            logger.error(f" [连接] {self.last_error}")
-            if self.dashboard:
-                self.dashboard.close()
-            self.dashboard = None
-            logger.error(f"===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 连接失败 =====")
+            self.last_error = error_codes.get(
+                getattr(exc, "errno", None),
+                f"网络错误: {exc}",
+            )
+            logger.error(self.last_error)
             return False
         except Exception as e:
             self.last_error = f"连接异常: {str(e)}"
-            logger.error(f" [连接] {self.last_error}")
-            if self.dashboard:
-                self.dashboard.close()
-            self.dashboard = None
-            logger.error(f"===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] 连接失败 =====")
+            logger.exception(self.last_error)
             return False
+        finally:
+            self._close_api(candidate_feedback)
+            self._close_api(candidate_dashboard)
+            self._connect_attempt_lock.release()
+
+    @staticmethod
+    def _close_api(api):
+        if api is None:
+            return
+        try:
+            api.close()
+        except Exception:
+            logger.exception("关闭候选机器人连接失败")
+
+    @staticmethod
+    def _remaining_connect_time(deadline):
+        remaining = float(deadline) - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("机器人连接业务截止时间已到")
+        return remaining
+
+    def _require_current_connection_attempt(self, generation):
+        with self._transport_lock:
+            if generation != self._connection_generation:
+                raise _ConnectionSupersededError(
+                    f"连接代次已过期: {generation} != {self._connection_generation}"
+                )
+
+    def _wait_for_candidate_feedback(self, feedback, generation, deadline):
+        while True:
+            self._require_current_connection_attempt(generation)
+            remaining = self._remaining_connect_time(deadline)
+            try:
+                with self._api_timeout(
+                    feedback,
+                    min(self._feedback_read_timeout_s, remaining),
+                ):
+                    result = feedback.feedBackData()
+            except socket.timeout:
+                continue
+            if result is None or len(result) == 0:
+                continue
+            try:
+                magic_ok = int(result[0]["TestValue"]) == _FEEDBACK_MAGIC
+            except Exception:
+                magic_ok = False
+            if magic_ok:
+                return result
+
+    def _commit_candidate_transport(
+        self,
+        dashboard,
+        feedback,
+        initial_packet,
+        generation,
+    ):
+        with self._transport_lock:
+            self._require_current_connection_attempt(generation)
+            old_dashboard = self.dashboard
+            old_feedback = self.feed_four
+            old_feed_thread = self.feed_thread
+            with self.feed_lock:
+                self._reset_feedback_cache_locked()
+            self._store_feedback_packet(initial_packet)
+            self.dashboard = dashboard
+            self.feed_four = feedback
+            self._feed_running = True
+            self.feed_thread = threading.Thread(
+                target=self._feed_loop,
+                args=(feedback, generation),
+                name=f"DobotFeedback-{generation}",
+                daemon=True,
+            )
+            self.feed_thread.start()
+            self.is_connected = True
+            self.is_enabled = False
+            self.last_error = ""
+            return old_dashboard, old_feedback, old_feed_thread
+
+    def _close_replaced_transport(
+        self,
+        old_dashboard,
+        old_feedback,
+        old_feed_thread,
+    ):
+        self._close_api(old_feedback)
+        self._close_api(old_dashboard)
+        if (
+            old_feed_thread is not None
+            and old_feed_thread is not threading.current_thread()
+            and old_feed_thread.is_alive()
+        ):
+            old_feed_thread.join(timeout=1.0)
 
     def disconnect(self):
         """断开连接"""
@@ -537,16 +646,30 @@ class DobotController:
 
     def close_robot_transport(self):
         """Close robot sockets without stopping Modbus or releasing the control lease."""
-        self.stop_feedback()
-        if self.dashboard:
-            try:
-                self.dashboard.close()
-            except Exception:
-                logger.exception("关闭Dashboard连接失败")
-        self.dashboard = None
-        self.is_connected = False
-        self.is_enabled = False
-        self._last_speed_factor = None
+        with self._transport_lock:
+            self._connection_generation += 1
+            self._feed_running = False
+            dashboard = self.dashboard
+            feedback = self.feed_four
+            feed_thread = self.feed_thread
+            self.dashboard = None
+            self.feed_four = None
+            self.feed_thread = None
+            self.is_connected = False
+            self.is_enabled = False
+            self._last_speed_factor = None
+        self._close_api(feedback)
+        self._close_api(dashboard)
+        if (
+            feed_thread is not None
+            and feed_thread is not threading.current_thread()
+            and feed_thread.is_alive()
+        ):
+            feed_thread.join(timeout=1.0)
+            if feed_thread.is_alive():
+                logger.warning("反馈线程未能在1秒内退出")
+        with self.feed_lock:
+            self._reset_feedback_cache_locked()
 
     def release_control_lease(self):
         if self._control_lease is not None:
@@ -2137,38 +2260,116 @@ class DobotController:
         self.latest_q_target_time = 0.0
 
     def start_feedback(self):
-        with self.feed_lock:
-            self._reset_feedback_cache_locked()
-        self.feed_four = DobotApiFeedBack(self.robot_ip, 30004)
-        self._feed_running = True
-        self.feed_thread = threading.Thread(target=self._feed_loop, daemon=True)
-        self.feed_thread.start()
-        return True
+        with self._transport_lock:
+            self._connection_generation += 1
+            generation = self._connection_generation
+        feedback = None
+        try:
+            feedback = DobotApiFeedBack(
+                self.robot_ip,
+                30004,
+                connect_timeout=self._socket_connect_timeout_s,
+                io_timeout=self._feedback_read_timeout_s,
+            )
+            self._require_current_connection_attempt(generation)
+            with self._transport_lock:
+                old_feedback = self.feed_four
+                old_feed_thread = self.feed_thread
+                self.feed_four = feedback
+                self._feed_running = True
+                with self.feed_lock:
+                    self._reset_feedback_cache_locked()
+                self.feed_thread = threading.Thread(
+                    target=self._feed_loop,
+                    args=(feedback, generation),
+                    name=f"DobotFeedback-{generation}",
+                    daemon=True,
+                )
+                self.feed_thread.start()
+                feedback = None
+            self._close_api(old_feedback)
+            if old_feed_thread and old_feed_thread.is_alive():
+                old_feed_thread.join(timeout=1.0)
+            return True
+        finally:
+            self._close_api(feedback)
 
     def stop_feedback(self):
-        self._feed_running = False
-        # Close socket first to unblock recv() in _feed_loop
-        if self.feed_four:
-            try:
-                self.feed_four.close()
-            except Exception:
-                pass
-        if self.feed_thread:
-            self.feed_thread.join(timeout=1.0)
-            if self.feed_thread.is_alive():
+        with self._transport_lock:
+            self._connection_generation += 1
+            self._feed_running = False
+            feedback = self.feed_four
+            feed_thread = self.feed_thread
+            self.feed_four = None
+            self.feed_thread = None
+        self._close_api(feedback)
+        if feed_thread and feed_thread is not threading.current_thread():
+            feed_thread.join(timeout=1.0)
+            if feed_thread.is_alive():
                 logger.warning("反馈线程未能在1秒内退出")
-        self.feed_thread = None
-        self.feed_four = None
         with self.feed_lock:
             self._reset_feedback_cache_locked()
 
-    def _feed_loop(self):
+    def _store_feedback_packet(self, result):
+        now = time.time()
+        pose = self._extract_pose_from_feed_data(result)
+        robot_mode = self._extract_robot_mode_from_feed_data(result)
+        tcp_speed = self._extract_tcp_speed_from_feed_data(result)
+        actual_tcp_force = self._extract_actual_tcp_force_from_feed_data(result)
+        running_status = self._extract_running_status_from_feed_data(result)
+        run_queued_cmd = self._extract_run_queued_cmd_from_feed_data(result)
+        current_command_id = self._extract_current_command_id_from_feed_data(result)
+        tool_vector_target = self._extract_tool_vector_target_from_feed_data(result)
+        q_actual = self._extract_q_actual_from_feed_data(result)
+        q_target = self._extract_q_target_from_feed_data(result)
+        with self.feed_lock:
+            self.feed_data = result
+            self.last_feed_time = now
+            self.latest_feed_time = now
+            if pose is not None:
+                self.latest_pose = pose
+                self.latest_pose_time = now
+            if robot_mode is not None:
+                self.latest_robot_mode = robot_mode
+                self.latest_robot_mode_time = now
+            if tcp_speed is not None:
+                self.latest_tcp_speed = tcp_speed
+                self.latest_tcp_speed_time = now
+            if actual_tcp_force is not None:
+                self.latest_actual_tcp_force = actual_tcp_force
+                self.latest_actual_tcp_force_time = now
+            if running_status is not None:
+                self.latest_running_status = running_status
+                self.latest_running_status_time = now
+            if run_queued_cmd is not None:
+                self.latest_run_queued_cmd = run_queued_cmd
+                self.latest_run_queued_cmd_time = now
+            if current_command_id is not None:
+                self.latest_current_command_id = current_command_id
+                self.latest_current_command_id_time = now
+            if tool_vector_target is not None:
+                self.latest_tool_vector_target = tool_vector_target
+                self.latest_tool_vector_target_time = now
+            if q_actual is not None:
+                self.latest_q_actual = q_actual
+                self.latest_q_actual_time = now
+            if q_target is not None:
+                self.latest_q_target = q_target
+                self.latest_q_target_time = now
+
+    def _feed_loop(self, feedback=None, generation=None):
+        feedback = feedback or self.feed_four
         while self._feed_running:
+            if (
+                generation is not None
+                and generation != self._connection_generation
+            ):
+                break
             try:
-                result = self.feed_four.feedBackData()
+                result = feedback.feedBackData()
                 if result is not None and len(result) > 0:
                     try:
-                        magic_ok = result[0]['TestValue'] == 0x123456789abcdef
+                        magic_ok = int(result[0]["TestValue"]) == _FEEDBACK_MAGIC
                     except Exception:
                         magic_ok = False
 
@@ -2179,60 +2380,24 @@ class DobotController:
                         self._feed_error_count = 0
                         continue
 
-                    if magic_ok:
-                        now = time.time()
-                        pose = self._extract_pose_from_feed_data(result)
-                        robot_mode = self._extract_robot_mode_from_feed_data(result)
-                        tcp_speed = self._extract_tcp_speed_from_feed_data(result)
-                        actual_tcp_force = self._extract_actual_tcp_force_from_feed_data(result)
-                        running_status = self._extract_running_status_from_feed_data(result)
-                        run_queued_cmd = self._extract_run_queued_cmd_from_feed_data(result)
-                        current_command_id = self._extract_current_command_id_from_feed_data(result)
-                        tool_vector_target = self._extract_tool_vector_target_from_feed_data(result)
-                        q_actual = self._extract_q_actual_from_feed_data(result)
-                        q_target = self._extract_q_target_from_feed_data(result)
-                        with self.feed_lock:
-                            self.feed_data = result
-                            self.last_feed_time = now
-                            self.latest_feed_time = now
-                            if pose is not None:
-                                self.latest_pose = pose
-                                self.latest_pose_time = now
-                            if robot_mode is not None:
-                                self.latest_robot_mode = robot_mode
-                                self.latest_robot_mode_time = now
-                            if tcp_speed is not None:
-                                self.latest_tcp_speed = tcp_speed
-                                self.latest_tcp_speed_time = now
-                            if actual_tcp_force is not None:
-                                self.latest_actual_tcp_force = actual_tcp_force
-                                self.latest_actual_tcp_force_time = now
-                            if running_status is not None:
-                                self.latest_running_status = running_status
-                                self.latest_running_status_time = now
-                            if run_queued_cmd is not None:
-                                self.latest_run_queued_cmd = run_queued_cmd
-                                self.latest_run_queued_cmd_time = now
-                            if current_command_id is not None:
-                                self.latest_current_command_id = current_command_id
-                                self.latest_current_command_id_time = now
-                            if tool_vector_target is not None:
-                                self.latest_tool_vector_target = tool_vector_target
-                                self.latest_tool_vector_target_time = now
-                            if q_actual is not None:
-                                self.latest_q_actual = q_actual
-                                self.latest_q_actual_time = now
-                            if q_target is not None:
-                                self.latest_q_target = q_target
-                                self.latest_q_target_time = now
-                        self._feed_error_count = 0
+                    self._store_feedback_packet(result)
+                    self._feed_error_count = 0
             except Exception as e:
+                if (
+                    generation is not None
+                    and generation != self._connection_generation
+                ):
+                    break
                 self._feed_error_count += 1
                 if self._feed_error_count <= 5 or self._feed_error_count % 50 == 0:
                     logger.warning(f" FeedBack异常(第{self._feed_error_count}次): {e}")
                 if self._feed_error_count >= 100:
                     logger.error(f"  连续100次FeedBack异常，停止反馈线程")
-                    self._feed_running = False
+                    if (
+                        generation is None
+                        or generation == self._connection_generation
+                    ):
+                        self._feed_running = False
                     break
                 time.sleep(0.1)
 
@@ -2463,6 +2628,12 @@ class DobotController:
         if required:
             self._write_modbus_status(STATUS_HOOK_ERR)
 
+    def set_runtime_maintenance(self, active=True):
+        """Block PLC motion commands while Runtime is in maintenance."""
+        self._runtime_maintenance = bool(active)
+        if self._runtime_maintenance:
+            self._write_modbus_status(STATUS_IDLE, mode=MODE_MANUAL)
+
     def _clear_runtime_recovery_required(self):
         self._runtime_recovery_required = False
         callback = self._runtime_recovery_cleared_callback
@@ -2492,7 +2663,17 @@ class DobotController:
                 self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
             return
         if cmd == CMD_STOP:
-            self._modbus_stop_immediate(mode=mode)
+            self._modbus_stop_immediate(
+                mode=mode,
+                auto_enable=not self._runtime_maintenance,
+            )
+            return
+        if self._runtime_maintenance:
+            logger.info(
+                "Runtime维护模式下忽略Modbus运动命令: cmd=%d",
+                cmd,
+            )
+            self._write_modbus_status(STATUS_IDLE, mode=MODE_MANUAL)
             return
 
         flow_active = self._active_flow_thread is not None
@@ -2542,7 +2723,7 @@ class DobotController:
             self._modbus_exec_thread.start()
             return True
 
-    def _modbus_stop_immediate(self, mode=MODE_AUTO):
+    def _modbus_stop_immediate(self, mode=MODE_AUTO, auto_enable=True):
         """Immediately stop current robot/flow motion for external 40001=0."""
         logger.info("Modbus停止命令: 立即停止机械臂并保持40001=0")
 
@@ -2565,7 +2746,7 @@ class DobotController:
                 except Exception as pause_error:
                     logger.error("Modbus Pause()兜底失败: %s", pause_error)
 
-        self._clear_faults_for_modbus_zero(auto_enable=True)
+        self._clear_faults_for_modbus_zero(auto_enable=auto_enable)
         self._modbus_hook_status = 0
         self._write_modbus_status(STATUS_IDLE, mode=mode)
 

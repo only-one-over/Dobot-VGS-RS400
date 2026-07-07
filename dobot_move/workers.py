@@ -265,6 +265,39 @@ class FlowThread(QThread):
         self._stop_requested = False
         self._ctx: Optional[FlowRunContext] = None
         self.performance_config = get_performance_config()
+        self.active_visual_servo = None
+        self.last_visual_servo_telemetry = {}
+
+    def get_visual_servo_telemetry(self):
+        controller = self.active_visual_servo
+        if controller is None:
+            return dict(self.last_visual_servo_telemetry)
+        servo = getattr(controller, "servo_thread", None)
+        vision = getattr(controller, "vision_thread", None)
+        if servo is None:
+            return dict(self.last_visual_servo_telemetry)
+        telemetry = {
+            "running": bool(getattr(servo, "_running", False)),
+            "error_mm": float(getattr(servo, "last_error_mm", 0.0)),
+            "error_xyz_mm": list(
+                getattr(servo, "last_error_xyz", [0.0, 0.0, 0.0])
+            ),
+            "final_error_mm": float(getattr(servo, "final_error_mm", -1.0)),
+            "iterations": int(getattr(servo, "iterations", 0)),
+            "period_ms": float(getattr(servo, "servo_period", 0.0)) * 1000.0,
+            "loop_hz": float(getattr(servo, "last_hz", 0.0)),
+            "target_age_ms": float(getattr(servo, "last_target_age", 0.0)) * 1000.0,
+            "pose_age_ms": float(getattr(servo, "last_pose_age", 0.0)) * 1000.0,
+            "servo_ms": float(getattr(servo, "last_servo_ms", 0.0)),
+            "average_servo_ms": float(getattr(servo, "avg_servo_ms", 0.0)),
+            "control_total_ms": float(getattr(servo, "last_total_ms", 0.0)),
+            "capture_ms": float(getattr(vision, "last_capture_ms", 0.0)) if vision else 0.0,
+            "inference_ms": float(getattr(vision, "last_detect_ms", 0.0)) if vision else 0.0,
+            "depth_ms": float(getattr(vision, "last_depth_ms", 0.0)) if vision else 0.0,
+            "vision_total_ms": float(getattr(vision, "last_total_ms", 0.0)) if vision else 0.0,
+        }
+        self.last_visual_servo_telemetry = telemetry
+        return dict(telemetry)
 
     def _fail_module(self, ctx, module_index, module_name, reason):
         """Unified failure handler: record timing, emit log/signal, write alarm."""
@@ -1105,13 +1138,18 @@ class FlowThread(QThread):
                             max_step_near=float(p.get('max_step_near', _vs_cfg.get('max_step_near', 6.0))),
                             max_step_fine=float(p.get('max_step_fine', _vs_cfg.get('max_step_fine', 2.0))),
                         )
+                        self.active_visual_servo = servo_ctrl
 
                         def servo_log(msg):
                             self.flow_log.emit(msg)
 
-                        success, final_error, iterations = servo_ctrl.servo_to_target(
-                            log_callback=servo_log,
-                        )
+                        try:
+                            success, final_error, iterations = servo_ctrl.servo_to_target(
+                                log_callback=servo_log,
+                            )
+                        finally:
+                            self.get_visual_servo_telemetry()
+                            self.active_visual_servo = None
 
                         if not success:
                             self._fail_module(ctx, i, name, f"视觉伺服失败，最终误差={final_error:.1f}mm")

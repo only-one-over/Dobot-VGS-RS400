@@ -37,6 +37,7 @@ RUNTIME_STATE_FILE = os.path.join(USER_DATA_DIR, "runtime_state.json")
 RUNTIME_PUBLICATION_FILE = os.path.join(USER_DATA_DIR, "runtime_publication.json")
 RUNTIME_LOCKOUT_FILE = os.path.join(USER_DATA_DIR, "runtime_watchdog_lockout.json")
 RUNTIME_IPC_TOKEN_FILE = os.path.join(USER_DATA_DIR, "runtime_ipc.token")
+REMOTE_API_HEALTH_FILE = os.path.join(USER_DATA_DIR, "remote_api_health.json")
 LOG_DIR = os.path.join(USER_DATA_DIR, "logs")
 
 # Bundled resources (shipped with the package, updated on replacement)
@@ -130,6 +131,20 @@ DEFAULT_RUNTIME_CONFIG = {
     "ipc_host": "127.0.0.1",
     "ipc_port": 8765,
     "ipc_command_timeout_s": 5.0,
+}
+
+
+DEFAULT_REMOTE_API_CONFIG = {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "token": "",
+    "feedback_port": 30004,
+    "feedback_reconnect_interval_s": 2.0,
+    "feedback_stale_ok_s": 0.3,
+    "feedback_stale_fail_s": 2.0,
+    "modbus_client_timeout_s": 3.0,
+    "modbus_host": "127.0.0.1",
+    "allowed_ips": [],
 }
 
 
@@ -379,6 +394,14 @@ def get_runtime_config():
     if isinstance(config.get("runtime"), dict):
         runtime.update(config["runtime"])
     return runtime
+
+
+def get_remote_api_config():
+    config = load_config()
+    remote_api = dict(DEFAULT_REMOTE_API_CONFIG)
+    if isinstance(config.get("remote_api"), dict):
+        remote_api.update(config["remote_api"])
+    return remote_api
 
 
 def _validate_camera_type(camera_type):

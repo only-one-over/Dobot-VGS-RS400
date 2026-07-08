@@ -429,23 +429,19 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         flow_select_layout.addWidget(self.edit_flow_combo, 1)
         self.new_flow_btn = QPushButton("新建")
         self.new_flow_btn.clicked.connect(self.create_flow)
-        # PR 2: production flow roles are locked to three fixed flows.
-        # Hide the new/rename/duplicate/delete flow buttons; editing
-        # step content remains available.
-        self.new_flow_btn.setVisible(False)
+        # Role-flow protection is enforced at FlowLibrary layer:
+        # delete_flow/rename_flow raise ValueError for role flows;
+        # the mixin's try/except surfaces a QMessageBox to the user.
         flow_select_layout.addWidget(self.new_flow_btn)
         self.rename_flow_btn = QPushButton("重命名")
         self.rename_flow_btn.clicked.connect(self.rename_flow)
-        self.rename_flow_btn.setVisible(False)
         flow_select_layout.addWidget(self.rename_flow_btn)
         self.duplicate_flow_btn = QPushButton("复制")
         self.duplicate_flow_btn.clicked.connect(self.duplicate_flow)
-        self.duplicate_flow_btn.setVisible(False)
         flow_select_layout.addWidget(self.duplicate_flow_btn)
         self.delete_flow_btn = QPushButton("删除")
         set_button_role(self.delete_flow_btn, "danger")
         self.delete_flow_btn.clicked.connect(self.delete_flow)
-        self.delete_flow_btn.setVisible(False)
         flow_select_layout.addWidget(self.delete_flow_btn)
         grasp_flow_layout.addLayout(flow_select_layout)
         

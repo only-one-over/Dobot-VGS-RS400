@@ -5,8 +5,26 @@ import threading
 import time
 from contextlib import suppress
 from pymodbus.server import ModbusTcpServer
-from pymodbus.simulator import SimData, SimDevice, DataType
-from pymodbus import ModbusDeviceIdentification
+
+# pymodbus 3.6.4+ relocated ModbusDeviceIdentification from the top-level
+# package to pymodbus.device. Support both layouts so the module remains
+# importable across versions.
+try:
+    from pymodbus import ModbusDeviceIdentification
+except ImportError:
+    from pymodbus.device import ModbusDeviceIdentification
+
+# pymodbus.simulator was removed in pymodbus 3.6.4+; make it optional so the
+# module-level constants (REGISTER_NAME, REG_CMD_STATUS, ...) remain importable
+# by clients (e.g. remote_api.modbus_client) without requiring the simulator.
+# The ModbusServer methods that use SimData/SimDevice/DataType will raise at
+# runtime if the simulator backend is unavailable.
+try:
+    from pymodbus.simulator import SimData, SimDevice, DataType
+except ImportError:
+    SimData = None  # type: ignore[assignment]
+    SimDevice = None  # type: ignore[assignment]
+    DataType = None  # type: ignore[assignment]
 
 try:
     import winsound

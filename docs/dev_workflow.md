@@ -27,6 +27,17 @@ python -m dobot_move
 
 应用期望运行时配置位于 `user_data/config.json`（首次升级时从 `dobot_move/config.json` 自动迁移）。D435i、D405 可在主控制页分别选择 ONNX 模型，路径保存到 `camera.models`；缺少该配置时使用 `dobot_move/best.onnx`。模型文件不提交到 Git，部署时需单独复制到工控机。
 
+### 启动 Remote REST API（可选）
+
+供外部平板/MES 只读查询的独立 HTTP 服务，与 Runtime 解耦：
+
+```powershell
+.\.venv\Scripts\activate
+python -m dobot_move.remote_api --host 0.0.0.0 --port 8000
+```
+
+配置块见 `user_data/config.json` 的 `remote_api` 段（缺失时使用默认值）。`token` 为空时禁用认证；生产环境应配置非空 token 并限制 `allowed_ips`。架构与端点契约见 [architecture.md](architecture.md#阶段-8-remote-rest-api)。
+
 ## 运行测试和检查
 
 当前测试覆盖率有限。使用定向检查：
@@ -47,6 +58,23 @@ python -m pytest tests\test_flow_executor_callbacks.py -v
 
 # 验证 runtime_agent 不依赖 Qt（AST 级 + 运行时导入检查）
 python -m pytest tests\test_runtime_no_qt_import.py -v
+```
+
+Remote REST API 验证：
+
+```powershell
+# 语法检查
+python -m py_compile dobot_move\remote_api\app.py dobot_move\remote_api\handlers.py dobot_move\remote_api\feedback_worker.py dobot_move\remote_api\modbus_client.py dobot_move\remote_api\config.py
+
+# 单元测试（纯函数 + Token 中间件 + 301 重定向 + 配置默认值合并）
+python -m pytest tests\test_remote_api_handlers.py -v
+
+# 冒烟测试：--help 正常退出
+python -m dobot_move.remote_api --help
+
+# 冒烟测试：启动后访问 health 端点（免认证）
+python -m dobot_move.remote_api --port 8000 &
+Invoke-WebRequest http://localhost:8000/api/v1/health
 ```
 
 仅在确认所需模型/输入假设后使用 `test_yolo26_bbox.py`。TODO：将测试脚本移至 `tests/` 并记录测试夹具。

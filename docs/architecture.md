@@ -66,6 +66,30 @@
 - Runtime 后端不再直接或间接依赖 `QThread`、`QImage`、`pyqtSignal`，可在无 Qt 环境运行。
 - `workers.py` shim 从三个新模块 re-export 全部公开符号，现有 `from dobot_move.flow.workers import X` 导入无需改动；新代码应按场景从对应模块直接导入（headless 用 `flow_executor`，GUI 用 `qt_workers`/`camera_test_worker`）。
 
+## 阶段 8 Remote REST API
+
+`dobot_move/remote_api/` 子包为外部平板/MES 提供只读 HTTP 查询服务，独立进程运行，不影响 Runtime/Watchdog/GUI。
+
+- **进程隔离**：作为独立进程启动（`python -m dobot_move.remote_api`），不注册为 Windows Service，由现场按需拉起。与 Runtime 解耦，崩溃不影响生产链路。
+- **数据获取**：
+  - 30004 反馈：`FeedbackWorker` 维护独立 30004 连接（Dobot CR 支持多客户端并发），缓存最新反馈帧，按 `feedback_stale_ok_s` / `feedback_stale_fail_s` 判定新鲜度。
+  - Modbus 寄存器：作为 Modbus TCP 客户端读 `localhost:502`（Runtime 启动的 Modbus Server），不重复开服务。
+  - 生产状态：读 `user_data/remote_api_health.json`（remote_api 自己每秒原子写入），不直接读 Runtime 的 `runtime_health.json`，避免与 Watchdog 竞争。
+- **API 版本化**：所有端点以 `/api/v1/` 为前缀；旧路径 `/api/status` 等返回 301 重定向到 v1 对应路径，保留 query string。
+- **Token 认证**：`Authorization: Bearer <token>`，`hmac.compare_digest()` 防时序攻击；`token` 为空时禁用认证（仅限内网调试）；`/api/v1/health` 始终免认证。
+- **CORS**：所有响应附带 `Access-Control-Allow-Origin: *`，支持浏览器端平板应用直接调用。
+- **端点契约**：
+  - `GET /api/v1/health` — 免认证，返回 `{status, uptime_s, feedback_health, request_count, error_count}`
+  - `GET /api/v1/status` — 连接/使能/运动状态摘要
+  - `GET /api/v1/feedback/all` — 完整 30004 反馈快照
+  - `GET /api/v1/modbus/registers` — Modbus 寄存器读取
+  - `GET /api/v1/production/status` — 读 `remote_api_health.json` 返回生产状态摘要
+- **响应格式**：成功 `{code:0, data:{...}}`，错误 `{code:-1, msg:"..."}`
+- **日志**：`setup_remote_api_logging()` 写入 `user_data/logs/remote_api.log`，`RotatingFileHandler` 5MB×5 UTF-8，与 Runtime 日志风格一致。
+- **健康文件**：`RemoteApiServer` 每秒原子写入 `user_data/remote_api_health.json`，字段包含 `timestamp` / `pid` / `uptime_s` / `feedback_health` / `request_count` / `error_count` / `last_error`，崩溃后文件保留最后状态。
+- **零新依赖**：仅使用标准库 `http.server.ThreadingHTTPServer`、`hmac`、`json`、`urllib.parse`、`logging.handlers.RotatingFileHandler`。
+- **安全边界**：只读 API，不暴露任何控制命令；不写入 Modbus 寄存器（40001-40004 均为 PLC/Runtime 独占）；不修改 Runtime/Watchdog/GUI 代码。
+
 ## Windows Service 部署
 
 - `DobotRuntimeService` 由 WinSW 2.12.0 包装，使用专用本地账户运行并独占全部硬件；服务停止通过 Ctrl+C 进入 Runtime 现有安全清理路径。
@@ -92,6 +116,7 @@
 │   ├── runtime/                 # 生产后端（runtime_agent、watchdog、resilience、ipc）
 │   ├── config/                  # 配置管理 + 报警码
 │   ├── communication/           # Modbus 通信
+│   ├── remote_api/              # 外部只读 REST API（ThreadingHTTPServer + Token）
 │   └── windows_service/         # Windows 服务封装
 ├── user_data/                   # 用户数据（config.json、流程库、日志、运行时状态）
 ├── cpp_core/                    # 可选的 C++17 pybind11 加速模块
@@ -102,6 +127,7 @@
 ├── run.py                       # GUI 入口
 ├── runtime_agent.py             # Runtime 入口（薄兼容层）
 ├── runtime_watchdog.py          # Watchdog 入口（薄兼容层）
+├── remote_api.py                # Remote API 入口（薄兼容层）
 └── DobotControl.spec            # PyInstaller 打包规范
 ```
 
@@ -122,6 +148,8 @@
 - `runtime/runtime_resilience.py`：运行状态持久化、单实例锁、重启窗口、资源指标和动态超时预算。
 - 根目录 `runtime_agent.py`、`runtime_watchdog.py`：仅为旧启动命令保留的薄兼容入口，不包含业务实现。
 - `cpp_core/`：在原生代码中镜像部分 Python 视觉数学运算以提升性能。必须保留 `vision_system.py` 使用的输入/输出契约。
+- `remote_api/`：外部只读 REST API 子包，独立进程运行。`app.py` 提供 `RemoteApiServer` + `APIHandler`（v1 路由 + Token + CORS + 301 旧路径重定向）；`feedback_worker.py` 维护独立的 30004 反馈连接；`modbus_client.py` 作为 Modbus TCP 客户端读 `localhost:502`；`handlers.py` 提供 5 个纯函数响应构建器；`config.py` 委托给 `config_manager`。不暴露任何控制命令，不写 Modbus 寄存器，不修改 Runtime/Watchdog/GUI。
+- 根目录 `remote_api.py`：与 `runtime_agent.py` 同款的薄兼容入口，支持 `python remote_api.py` 与 `python -m dobot_move.remote_api` 等价启动。
 
 ## 数据流
 

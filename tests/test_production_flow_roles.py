@@ -354,23 +354,24 @@ def test_v3_config_not_re_migrated(flow_path):
 
 
 # ---------------------------------------------------------------------------
-# Task 5: GUI hides new/rename/duplicate/delete flow buttons
+# Task 5: GUI shows new/rename/duplicate/delete flow buttons
 # ---------------------------------------------------------------------------
 
 
-def test_gui_app_hides_flow_management_buttons():
-    """The four flow management buttons are hidden via setVisible(False).
+def test_gui_app_shows_flow_management_buttons():
+    """The four flow management buttons are visible (not hidden).
 
     Source-inspection approach: instantiating ``DobotMainWindow`` requires
     a Qt display and many runtime dependencies, so we verify the source
-    contains the required ``setVisible(False)`` calls for each button.
-    This matches the spec's "or simpler: check the buttons are not
-    created / setVisible(False) called" guidance.
+    does NOT contain ``setVisible(False)`` calls for any of the four
+    buttons. Role-flow protection is enforced at the FlowLibrary layer
+    (delete_flow/rename_flow raise ValueError for role flows), and the
+    mixin's try/except surfaces a QMessageBox to the user.
     """
     gui_app_path = Path(__file__).resolve().parent.parent / "dobot_move" / "ui" / "gui_app.py"
     source = gui_app_path.read_text(encoding="utf-8")
 
-    # Each of the four buttons must have a setVisible(False) call.
+    # Each of the four buttons must be created and must NOT be hidden.
     button_attrs = (
         "new_flow_btn",
         "rename_flow_btn",
@@ -378,25 +379,23 @@ def test_gui_app_hides_flow_management_buttons():
         "delete_flow_btn",
     )
     for attr in button_attrs:
-        # The button is created and then explicitly hidden.
         creation_pattern = f"self.{attr} = QPushButton"
         hide_pattern = f"self.{attr}.setVisible(False)"
         assert creation_pattern in source, (
             f"Missing button creation for {attr} in gui_app.py"
         )
-        assert hide_pattern in source, (
-            f"Missing setVisible(False) for {attr} in gui_app.py "
-            "(PR 2 requires hiding flow management buttons)"
+        assert hide_pattern not in source, (
+            f"{attr} must not be hidden via setVisible(False) in gui_app.py "
+            "(restore-user-flow-crud spec requires visible flow management buttons)"
         )
 
 
 def test_grasp_flow_mixin_still_exposes_flow_methods():
     """The mixin still defines create_flow/rename_flow/duplicate_flow/delete_flow.
 
-    The buttons are hidden, but the underlying handler methods remain
-    defined (they are called from the GUI constructor's signal wiring
-    and may be invoked programmatically). This guards against accidental
-    deletion of the methods during the button-hiding refactor.
+    The buttons are visible, and the underlying handler methods remain
+    defined (they are called from the GUI constructor's signal wiring).
+    This guards against accidental deletion of the methods.
     """
     from dobot_move.ui.mixins.grasp_flow_mixin import GraspFlowMixin
 

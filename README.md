@@ -47,6 +47,7 @@
 - 🛡️ **ServoP 队列保护** — TCP 往返超伺服周期时自动跳帧降频，连续失败暂停重试
 - 📝 **报警详情补全** — 异步获取 GetError 详情后自动追加到报警记录
 - 🧩 **Runtime 去 Qt 化** — 后台流程执行器纯 Python 实现，不依赖 QThread/QImage/pyqtSignal，可在无 Qt 环境运行
+- 🌐 **Remote REST API** — 独立 HTTP 服务供外部平板/MES 只读查询机器人状态、30004 反馈、Modbus 寄存器和生产状态，Token 认证 + CORS + 旧路径 301 重定向
 
 ## 快速开始
 
@@ -161,11 +162,13 @@ dobot_move_python/
 │   ├── flow/                     # 流程编排
 │   ├── config/                   # 配置管理 + 报警码
 │   ├── communication/            # Modbus 通信
+│   ├── remote_api/               # 外部 REST API（只读查询）
 │   └── windows_service/          # Windows 服务封装
 ├── cpp_core/                     # C++ 加速模块源码
 ├── run.py                        # GUI 入口
 ├── runtime_agent.py              # Runtime 入口
 ├── runtime_watchdog.py           # Watchdog 入口
+├── remote_api.py                 # Remote API 入口（薄兼容层）
 └── requirements.txt
 ```
 
@@ -206,6 +209,24 @@ python -m dobot_move.runtime_agent
 Windows 10/11 生产部署推荐使用 WinSW 双服务：Runtime 服务独占硬件，Watchdog 服务负责卡死恢复，GUI 由登录用户独立启动。安装、校验和回滚步骤见 [docs/windows_service.md](docs/windows_service.md)。
 
 生产环境应同时运行 `dobot_move.runtime_agent` 和 `dobot_move.runtime_watchdog`。GUI 与后台都会先启动 Modbus，再立即在后台并发连接机器人和主流程需要的相机；5 秒观察窗口结束后不阻塞、不报码，后台继续低频重连。运行流程前使用缓存状态快速检查，缺少设备时 Modbus 写 `110` 并拒绝本次启动。根目录同名脚本只保留为旧命令兼容入口。开机自启动、异常恢复、`40001` 状态协议和状态排查见 [docs/runtime_agent.md](docs/runtime_agent.md)。
+
+### Remote REST API（可选）
+
+供外部平板/MES 只读查询机器人状态的独立 HTTP 服务，不暴露任何控制命令，不影响 Runtime/Watchdog/GUI：
+
+```powershell
+python -m dobot_move.remote_api --host 0.0.0.0 --port 8000
+```
+
+- 与 Runtime 解耦：通过 30004 反馈端口（Dobot CR 支持多客户端并发）和 Modbus TCP 客户端（读 `localhost:502`）获取数据，不重复开服务
+- 生产状态通过读取 `user_data/remote_api_health.json` 间接获取（Runtime 写入 `runtime_health.json`，remote_api 写入自己的健康文件）
+- Token 认证：`Authorization: Bearer <token>`，token 为空时禁用认证（仅限内网调试）
+- 端点：`/api/v1/health`（免认证）、`/api/v1/status`、`/api/v1/feedback/all`、`/api/v1/modbus/registers`、`/api/v1/production/status`
+- 旧路径 `/api/status` 等返回 301 重定向到 v1（保留 query string）
+- CORS 头 `Access-Control-Allow-Origin: *`
+- 零新第三方依赖（仅用标准库 `ThreadingHTTPServer`）
+
+配置示例见 [config.example.json](dobot_move/config/config.example.json) 的 `remote_api` 块。
 
 ### 首次设置
 
@@ -282,6 +303,23 @@ Windows 10/11 生产部署推荐使用 WinSW 双服务：Runtime 服务独占硬
 | `modbus_port` | int | 本地 Modbus 服务器端口 | `502` |
 | `user_index` | int | 用户坐标系索引 | `0` |
 | `tool_index` | int | 工具坐标系索引 | `0` |
+
+#### Remote API
+
+`remote_api` 配置块控制外部只读 HTTP 服务的监听地址、认证、30004 反馈和 Modbus 客户端行为。整块缺失时使用默认值。
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|--------|------|
+| `host` | string | `"0.0.0.0"` | HTTP 监听地址 |
+| `port` | int | `8000` | HTTP 监听端口 |
+| `token` | string | `""` | Bearer Token，为空时禁用认证（仅限内网调试） |
+| `feedback_port` | int | `30004` | 30004 反馈端口 |
+| `feedback_reconnect_interval_s` | float | `2.0` | 反馈断流后重连间隔 |
+| `feedback_stale_ok_s` | float | `0.3` | 反馈新鲜阈值（秒） |
+| `feedback_stale_fail_s` | float | `2.0` | 反馈失效阈值（秒） |
+| `modbus_client_timeout_s` | float | `3.0` | Modbus 客户端读取超时 |
+| `modbus_host` | string | `"127.0.0.1"` | Modbus 客户端目标主机（默认读本地 Runtime 的 502） |
+| `allowed_ips` | array | `[]` | IP 白名单（空数组表示不限制） |
 
 #### 性能配置
 

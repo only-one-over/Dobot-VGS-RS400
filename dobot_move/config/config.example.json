@@ -19,5 +19,17 @@
   },
   "points": {},
   "robot_ip": "192.168.5.1",
-  "modbus_port": 502
+  "modbus_port": 502,
+  "remote_api": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "token": "",
+    "feedback_port": 30004,
+    "feedback_reconnect_interval_s": 2.0,
+    "feedback_stale_ok_s": 0.3,
+    "feedback_stale_fail_s": 2.0,
+    "modbus_client_timeout_s": 3.0,
+    "modbus_host": "127.0.0.1",
+    "allowed_ips": []
+  }
 }

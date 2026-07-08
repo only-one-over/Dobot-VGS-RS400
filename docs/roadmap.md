@@ -41,6 +41,7 @@
 - ✅ 视觉-机器人时间戳对齐：RobotPoseBuffer 环形缓冲+插值、变 dt 卡尔曼、Mahalanobis 协方差门控、预测年龄/缺失计数
 - ✅ GUI IPC 停止通道：双通道 IPC（常规 8765 + 高优先级停止 8766）、安全停止按钮、维护状态显示、run_step/move_point/camera_test 调试入口
 - ✅ Runtime 去 Qt 化：workers.py 拆分为 flow_executor（纯 Python）+ qt_workers（Qt 适配）+ camera_test_worker（GUI 专用），runtime_agent 不再依赖 QThread/QImage/pyqtSignal
+- ✅ Remote REST API 整合：新增 `dobot_move/remote_api/` 子包（第 8 个子包），独立进程提供只读 HTTP 查询服务；30004 多客户端连接、Modbus TCP 客户端读 localhost:502、健康文件解耦、Token 认证 + CORS + 301 旧路径重定向；零新第三方依赖；根目录 `remote_api.py` 薄入口与 `runtime_agent.py` 同款
 
 ## 短期任务
 

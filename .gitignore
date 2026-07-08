@@ -22,6 +22,7 @@ DobotControl.spec
 .trae/
 test_yolo26_*.py
 .pytest_cache/
+.pytest_tmp/
 AGENTS.md
 PORTING_GUIDE.md
 figma_thumbnail.png

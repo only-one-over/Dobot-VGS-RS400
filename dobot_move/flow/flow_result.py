@@ -12,17 +12,35 @@ depends only on the Python standard library so it can be imported by
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Optional
+from enum import Enum
+from typing import Optional, Union
 
 
-# Recognised failure_kind values. Kept as plain strings (not an Enum) so
-# the runtime can log/persist them without import cycles.
-FAILURE_KIND_VISION_PROCESS = "vision_process"
-FAILURE_KIND_ROBOT = "robot"
-FAILURE_KIND_CAMERA = "camera"
-FAILURE_KIND_FLOW = "flow"
-FAILURE_KIND_PROTOCOL = "protocol"
+class FailureKind(str, Enum):
+    """Typed failure classification for FlowResult.
+
+    Inherits from ``str`` so that ``FailureKind.CAMERA == "camera"`` remains
+    ``True`` for backward compatibility with existing string comparisons and
+    so the runtime can log/persist the value without import cycles.
+    """
+
+    VISION_PROCESS = "vision_process"
+    ROBOT = "robot"
+    CAMERA = "camera"
+    FLOW = "flow"
+    PROTOCOL = "protocol"
+
+
+# Backward-compatible string aliases. Because ``FailureKind`` inherits from
+# ``str``, ``FAILURE_KIND_CAMERA == "camera"`` and
+# ``FAILURE_KIND_CAMERA == FailureKind.CAMERA`` both remain ``True``.
+FAILURE_KIND_VISION_PROCESS = FailureKind.VISION_PROCESS
+FAILURE_KIND_ROBOT = FailureKind.ROBOT
+FAILURE_KIND_CAMERA = FailureKind.CAMERA
+FAILURE_KIND_FLOW = FailureKind.FLOW
+FAILURE_KIND_PROTOCOL = FailureKind.PROTOCOL
 
 
 @dataclass
@@ -39,8 +57,9 @@ class FlowResult:
     message:
         Human-readable detail; empty on success.
     failure_kind:
-        One of ``"vision_process"`` / ``"robot"`` / ``"camera"`` /
-        ``"flow"`` / ``"protocol"``. Empty string on success.
+        A :class:`FailureKind` value classifying the failure. On success a
+        ``FailureKind.FLOW`` placeholder is stored (success callers should
+        consult :attr:`success` rather than :attr:`failure_kind`).
     failed_module_index:
         0-based index of the module whose execution failed; ``None`` if
         the failure was not tied to a specific module or on success.
@@ -54,7 +73,7 @@ class FlowResult:
     success: bool
     code: str
     message: str
-    failure_kind: str
+    failure_kind: FailureKind
     failed_module_index: Optional[int] = None
     failed_module_name: Optional[str] = None
     recoverable: bool = False
@@ -66,7 +85,7 @@ class FlowResult:
             success=True,
             code="OK",
             message="",
-            failure_kind="",
+            failure_kind=FailureKind.FLOW,
             recoverable=False,
         )
 
@@ -75,18 +94,35 @@ class FlowResult:
         cls,
         code: str,
         message: str,
-        failure_kind: str,
+        failure_kind: Union[FailureKind, str],
         *,
         failed_module_index: Optional[int] = None,
         failed_module_name: Optional[str] = None,
         recoverable: bool = False,
     ) -> "FlowResult":
-        """Build a failure result with the given fields."""
+        """Build a failure result with the given fields.
+
+        ``failure_kind`` accepts either a :class:`FailureKind` member or a
+        plain ``str`` (matched by value) for backward compatibility with
+        existing callers that still pass string literals. Unknown string
+        values fall back to :attr:`FailureKind.FLOW` with a warning log.
+        """
+        if isinstance(failure_kind, FailureKind):
+            kind = failure_kind
+        else:
+            try:
+                kind = FailureKind(str(failure_kind))
+            except ValueError:
+                logging.getLogger(__name__).warning(
+                    "Unknown failure_kind=%r; falling back to FailureKind.FLOW",
+                    failure_kind,
+                )
+                kind = FailureKind.FLOW
         return cls(
             success=False,
             code=str(code),
             message=str(message),
-            failure_kind=str(failure_kind),
+            failure_kind=kind,
             failed_module_index=failed_module_index,
             failed_module_name=failed_module_name,
             recoverable=bool(recoverable),
@@ -95,6 +131,7 @@ class FlowResult:
 
 __all__ = [
     "FlowResult",
+    "FailureKind",
     "FAILURE_KIND_VISION_PROCESS",
     "FAILURE_KIND_ROBOT",
     "FAILURE_KIND_CAMERA",

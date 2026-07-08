@@ -27,6 +27,7 @@ class ProductionState(str, Enum):
     MANUAL_OFFLINE = "manual_offline"
     IDLE = "idle"
     STANDBY = "standby"
+    STARTING = "starting"
     RUNNING = "running"
     PAUSED = "paused"
     HOLDING_HOOK = "holding_hook"

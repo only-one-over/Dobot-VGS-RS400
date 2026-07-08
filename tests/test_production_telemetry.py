@@ -127,7 +127,7 @@ class _FakeController:
     def close_robot_transport(self):
         self.close_transport_calls += 1
 
-    def abort_active_flow_for_disconnect(self, reason):
+    def abort_active_flow_for_disconnect(self, reason, source="flow"):
         pass
 
     def _write_modbus_status(self, status, mode=0):
@@ -222,7 +222,7 @@ def _runtime_agent_fixture():
             }
         )
         agent.program_runner.build_production_request = MagicMock(
-            side_effect=lambda flow_id: _make_fake_request(flow_id)
+            side_effect=lambda flow_id, task_id="": _make_fake_request(flow_id)
         )
         agent.program_runner.start_request = MagicMock(return_value=True)
         agent.program_runner.pause = MagicMock(return_value=True)
@@ -238,7 +238,7 @@ def _runtime_agent_fixture():
 def _start_running_task(agent, hook_type=0):
     """Helper: drive the agent into RUNNING with a production task."""
     agent._set_production_state(ProductionState.STANDBY)
-    agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=hook_type)
+    agent._dispatch_command(cmd=3, mode=0, hook_type=hook_type)
     assert agent.production_state == ProductionState.RUNNING
     assert agent.production_task is not None
 

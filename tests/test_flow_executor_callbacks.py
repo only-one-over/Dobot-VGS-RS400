@@ -30,15 +30,6 @@ class _DelayController:
     def release_motion(self, owner):
         self.released = owner == "flow"
 
-    def begin_modbus_delay_wait(self):
-        pass
-
-    def is_modbus_delay_released(self):
-        return False
-
-    def end_modbus_delay_wait(self, restore_running=True):
-        pass
-
     def record_alarm(self, *args, **kwargs):
         pass
 

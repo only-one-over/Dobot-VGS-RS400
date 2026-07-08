@@ -25,9 +25,9 @@ from ..robot.motion_safety import (
 from ..robot.robot_pose_buffer import RobotPoseBuffer
 from ..config.alarm_history import AlarmHistory
 from ..runtime.runtime_resilience import SingleInstanceLock
+from ..flow.flow_result import FlowResult, FailureKind
 
 logger = logging.getLogger(__name__)
-STATUS_DELAY_WAIT = STATUS_HOOK_OK
 _FEEDBACK_MAGIC = 0x123456789ABCDEF
 
 # 提钩杆类型常量（与 Modbus 40004 协议层一致）
@@ -125,6 +125,11 @@ class DobotController:
         # PR 5 Task 4: optional callback invoked when 40004 (hook_type)
         # changes. Signature: (old_hook: int, new_hook: int) -> None.
         self._modbus_on_hook_type_changed = None
+        # PR-FIX-3 Task 6: optional callback invoked when a flow is aborted
+        # due to device disconnect. Signature: (FlowResult) -> None. Routes
+        # the synthesized typed FlowResult into the runtime production state
+        # machine instead of writing 40001 directly.
+        self._production_finished_callback = None
         self._last_modbus_command = None
         self._last_modbus_command_time = 0.0
         self._last_fault_code = 0
@@ -132,8 +137,6 @@ class DobotController:
         self.software_emergency_active = False
         self._active_flow_thread = None
         self._modbus_flow_state_lock = threading.Lock()
-        self._modbus_delay_waiting = False
-        self._modbus_delay_release_event = threading.Event()
         self._runtime_recovery_required = False
         self._runtime_recovery_cleared_callback = None
         self._runtime_maintenance = False
@@ -2499,13 +2502,65 @@ class DobotController:
         if self.modbus_server is not None:
             self.modbus_server._on_hook_type_changed = callback
 
-    def abort_active_flow_for_disconnect(self, reason):
-        """Stop the current flow immediately and send robot Stop off-thread."""
+    def set_production_finished_callback(self, callback):
+        """Register a callback invoked when a flow is aborted due to disconnect.
+
+        PR-FIX-3 Task 6: used by RuntimeAgent to receive the typed
+        FlowResult synthesized in :meth:`abort_active_flow_for_disconnect`
+        so the production state machine (not a direct 40001 write) owns
+        the resulting fault state. Signature: ``(FlowResult) -> None``.
+        """
+        self._production_finished_callback = callback
+
+    def abort_active_flow_for_disconnect(self, reason, source="flow"):
+        """Stop the current flow immediately and send robot Stop off-thread.
+
+        PR-FIX-3 Task 6: ``source`` (``"robot"``/``"camera"``/``"flow"``)
+        selects the typed FailureKind of the synthesized FlowResult. The
+        result is dispatched through the registered production-finished
+        callback so the state machine writes 40001 (111/112/110) instead
+        of this method writing 40001 directly.
+        """
         flow = self._active_flow_thread
         ctx = getattr(flow, "_ctx", None) if flow is not None else None
         if ctx is not None:
             ctx.stop_event.set()
-        self._write_modbus_status(STATUS_HOOK_ERR)
+
+        if source == "robot":
+            abort_result = FlowResult.failure(
+                code="ROBOT_DISCONNECTED",
+                message=f"robot disconnect: {reason}",
+                failure_kind=FailureKind.ROBOT,
+                recoverable=False,
+            )
+        elif source == "camera":
+            abort_result = FlowResult.failure(
+                code="CAMERA_DISCONNECTED",
+                message=f"camera disconnect: {reason}",
+                failure_kind=FailureKind.CAMERA,
+                recoverable=False,
+            )
+        else:
+            abort_result = FlowResult.failure(
+                code="FLOW_ABORTED",
+                message=f"flow abort: {reason}",
+                failure_kind=FailureKind.FLOW,
+                recoverable=False,
+            )
+
+        callback = self._production_finished_callback
+        if callback is not None and callable(callback):
+            try:
+                callback(abort_result)
+            except Exception:
+                logger.exception("production_finished callback failed during abort")
+        else:
+            # No production callback registered (debug mode or not initialized).
+            # Just log; do NOT write 40001 directly.
+            logger.warning(
+                "abort_active_flow_for_disconnect: no production callback; "
+                "skip state machine notification"
+            )
 
         with self._disconnect_stop_lock:
             if (
@@ -2539,7 +2594,7 @@ class DobotController:
         }
 
     def _update_modbus_status(self):
-        """更新Modbus状态寄存器（40001 和 40002）"""
+        """更新Modbus状态寄存器（仅 40001，40002 由 PLC 独占）"""
         if not self.modbus_server:
             return
         if not self.is_connected:
@@ -2590,16 +2645,15 @@ class DobotController:
             else:
                 status = STATUS_IDLE
 
-        self.modbus_server.update_status_registers(status=status, mode=mode)
+        self.modbus_server.write_status_register(status)
 
     def _write_modbus_status(self, status, mode=None):
-        if mode is None:
-            mode = getattr(self, '_modbus_mode', MODE_AUTO)
+        # mode 参数已废弃（40002 为 PLC 独占），仅为向后兼容保留。
         if self._runtime_recovery_required:
             status = STATUS_HOOK_ERR
         self._modbus_status_override = status
         if self.modbus_server:
-            self.modbus_server.update_status_registers(status=status, mode=mode)
+            self.modbus_server.write_status_register(status)
 
     def ensure_robot_ready_for_motion(self, auto_enable=True, feedback_max_age=0.5):
         """Ensure robot is connected, feedback is fresh, alarm-free, and enabled."""
@@ -2649,43 +2703,18 @@ class DobotController:
         if success:
             self._modbus_hook_status = 2
             self._last_fault_code = 0
-            self._write_modbus_status(STATUS_HOOK_OK, mode=mode)
+            self._write_modbus_status(STATUS_HOOK_OK)
         else:
             self._modbus_hook_status = 3
-            self._write_modbus_status(failure_status or STATUS_HOOK_ERR, mode=mode)
+            self._write_modbus_status(failure_status or STATUS_HOOK_ERR)
 
     def reset_modbus_status_to_standby(self, mode=MODE_AUTO):
         self._modbus_hook_status = 0
-        self._write_modbus_status(STATUS_STANDBY, mode=mode)
+        self._write_modbus_status(STATUS_STANDBY)
 
     def reset_modbus_status_to_idle(self, mode=MODE_AUTO):
         self._modbus_hook_status = 0
-        self._write_modbus_status(STATUS_IDLE, mode=mode)
-
-    def begin_modbus_delay_wait(self):
-        """Publish 40001=5 and arm 40001=1 as the current delay release signal."""
-        with self._modbus_flow_state_lock:
-            self._modbus_delay_release_event.clear()
-            self._modbus_delay_waiting = True
-        self._write_modbus_status(STATUS_DELAY_WAIT)
-
-    def is_modbus_delay_released(self):
-        return self._modbus_delay_release_event.is_set()
-
-    def end_modbus_delay_wait(self, restore_running=True):
-        """Disarm delay release and restore 40001=4 while the flow continues."""
-        with self._modbus_flow_state_lock:
-            self._modbus_delay_waiting = False
-            self._modbus_delay_release_event.clear()
-        if restore_running and self._active_flow_thread is not None:
-            self._write_modbus_status(STATUS_RUNNING)
-
-    def _release_modbus_delay_if_waiting(self):
-        with self._modbus_flow_state_lock:
-            if not self._modbus_delay_waiting:
-                return False
-            self._modbus_delay_release_event.set()
-            return True
+        self._write_modbus_status(STATUS_IDLE)
 
     def set_runtime_recovery_required(self, required=True, on_cleared=None):
         self._runtime_recovery_required = bool(required)
@@ -2698,7 +2727,7 @@ class DobotController:
         """Block PLC motion commands while Runtime is in maintenance."""
         self._runtime_maintenance = bool(active)
         if self._runtime_maintenance:
-            self._write_modbus_status(STATUS_IDLE, mode=MODE_MANUAL)
+            self._write_modbus_status(STATUS_IDLE)
 
     def _clear_runtime_recovery_required(self):
         self._runtime_recovery_required = False
@@ -2739,10 +2768,10 @@ class DobotController:
             if cmd == CMD_STOP:
                 self._modbus_stop_immediate(mode=mode)
                 self._clear_runtime_recovery_required()
-                self._write_modbus_status(STATUS_IDLE, mode=mode)
+                self._write_modbus_status(STATUS_IDLE)
             else:
                 logger.warning("运行时恢复锁生效，忽略40001=%d；请先下发0", cmd)
-                self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
+                self._write_modbus_status(STATUS_HOOK_ERR)
             return
         if cmd == CMD_STOP:
             self._modbus_stop_immediate(
@@ -2755,23 +2784,15 @@ class DobotController:
                 "Runtime维护模式下忽略Modbus运动命令: cmd=%d",
                 cmd,
             )
-            self._write_modbus_status(STATUS_IDLE, mode=MODE_MANUAL)
+            self._write_modbus_status(STATUS_IDLE)
             return
 
         flow_active = self._active_flow_thread is not None
         if flow_active:
-            if cmd == CMD_RESET and self._release_modbus_delay_if_waiting():
-                logger.info("流程延时等待中收到40001=1，放行下一步")
-                self._write_modbus_status(STATUS_DELAY_WAIT, mode=mode)
-            else:
-                with self._modbus_flow_state_lock:
-                    delay_waiting = self._modbus_delay_waiting
-                allowed = "0或1" if delay_waiting else "0"
-                logger.info("流程运行中忽略40001=%d；当前阶段仅接受%s", cmd, allowed)
-                self._write_modbus_status(
-                    STATUS_DELAY_WAIT if delay_waiting else STATUS_RUNNING,
-                    mode=mode,
-                )
+            # PR 7: 旧 Delay 语义已移除，扶钩等待由状态机 HOLDING_HOOK 状态处理。
+            # 流程运行中除 40001=0（在上方 CMD_STOP 分支处理）外一律忽略。
+            logger.info("流程运行中忽略40001=%d；当前阶段仅接受0", cmd)
+            self._write_modbus_status(STATUS_RUNNING)
             return
 
         if mode == MODE_MANUAL:
@@ -2784,14 +2805,14 @@ class DobotController:
             logger.info("机械臂未连接，仅记录命令不执行: cmd=%d, mode=%d", cmd, mode)
             if cmd == CMD_RESET:
                 self.record_alarm("Modbus命令", "DISCONNECTED", "故障", "机械臂未连接，命令被拒绝")
-                self._write_modbus_status(STATUS_ROBOT_ERR, mode=mode)
+                self._write_modbus_status(STATUS_ROBOT_ERR)
             return
 
         if cmd == CMD_RESET:
             # 复位回原点：移动到 initial_point，完成后写 40001=2
             if not self._modbus_dispatch_motion(self._modbus_move_initial, "回原点"):
                 self.record_alarm("Modbus回原点", "BUSY", "故障", "上一条Modbus运动仍在执行，回原点被拒绝")
-                self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
+                self._write_modbus_status(STATUS_HOOK_ERR)
         else:
             logger.warning("未知Modbus命令: %d", cmd)
 
@@ -2811,9 +2832,6 @@ class DobotController:
 
         if self._active_flow_thread is not None and hasattr(self._active_flow_thread, '_ctx') and self._active_flow_thread._ctx is not None:
             self._active_flow_thread._ctx.stop_event.set()
-        with self._modbus_flow_state_lock:
-            self._modbus_delay_waiting = False
-            self._modbus_delay_release_event.set()
 
         if self.is_connected and self.dashboard:
             try:
@@ -2830,7 +2848,7 @@ class DobotController:
 
         self._clear_faults_for_modbus_zero(auto_enable=auto_enable)
         self._modbus_hook_status = 0
-        self._write_modbus_status(STATUS_IDLE, mode=mode)
+        self._write_modbus_status(STATUS_IDLE)
 
     def _clear_faults_for_modbus_zero(self, auto_enable=True):
         """Best-effort cleanup for 40001=0 while keeping Modbus status at 0."""
@@ -2912,14 +2930,14 @@ class DobotController:
             modbus_motion_busy = self._modbus_exec_thread is not None and self._modbus_exec_thread.is_alive()
         if modbus_motion_busy:
             logger.info("Modbus流程准备已在后台执行，忽略重复40001=3")
-            self._write_modbus_status(STATUS_RUNNING, mode=mode)
+            self._write_modbus_status(STATUS_RUNNING)
             return
 
         runner = self._modbus_program_runner
         if runner is None:
             logger.error("Modbus执行流程失败: 未注册运动编辑流程runner")
             self.record_alarm("Modbus执行流程", "NO_RUNNER", "故障", "未注册运动编辑流程runner")
-            self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
+            self._write_modbus_status(STATUS_HOOK_ERR)
             return
 
         ready, readiness_message = self._check_modbus_program_readiness()
@@ -2931,16 +2949,16 @@ class DobotController:
                 "故障",
                 readiness_message,
             )
-            self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
+            self._write_modbus_status(STATUS_HOOK_ERR)
             return
 
         self._modbus_hook_status = 1
-        self._write_modbus_status(STATUS_RUNNING, mode=mode)
+        self._write_modbus_status(STATUS_RUNNING)
         if not self._modbus_dispatch_motion(
             lambda: self._prepare_and_start_modbus_program(runner, mode, hook_type),
             "执行流程准备",
         ):
-            self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
+            self._write_modbus_status(STATUS_HOOK_ERR)
 
     def _check_modbus_program_readiness(self):
         checker = self._modbus_program_readiness_checker
@@ -2961,7 +2979,7 @@ class DobotController:
             message = self.last_error or "机器人未就绪"
             logger.error("Modbus流程后台准备失败: %s", message)
             self.record_alarm("Modbus执行流程", "PREPARE_FAILED", "故障", message)
-            self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
+            self._write_modbus_status(STATUS_HOOK_ERR)
             return
 
         ready, readiness_message = self._check_modbus_program_readiness()
@@ -2973,7 +2991,7 @@ class DobotController:
                 "故障",
                 readiness_message,
             )
-            self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
+            self._write_modbus_status(STATUS_HOOK_ERR)
             return
 
         try:
@@ -2981,13 +2999,13 @@ class DobotController:
         except Exception as e:
             logger.error("Modbus执行流程runner异常: %s", e)
             self.record_alarm("Modbus执行流程", "RUNNER_EXCEPTION", "故障", "运动编辑流程runner异常", raw=e)
-            self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
+            self._write_modbus_status(STATUS_HOOK_ERR)
             return
 
         if not accepted:
             logger.warning("Modbus执行流程请求被拒绝")
             self.record_alarm("Modbus执行流程", "REJECTED", "故障", "运动编辑流程请求被拒绝")
-            self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
+            self._write_modbus_status(STATUS_HOOK_ERR)
             return
 
     @staticmethod
@@ -3058,12 +3076,12 @@ class DobotController:
             self._modbus_status_override = STATUS_HOOK_ERR
             self.record_alarm("Modbus复位", "BUSY", "故障", "流程运行中，复位被拒绝")
             if self.modbus_server:
-                self.modbus_server.update_status_registers(status=STATUS_HOOK_ERR, mode=MODE_AUTO)
+                self.modbus_server.write_status_register(STATUS_HOOK_ERR)
             return
         try:
             self._modbus_status_override = STATUS_RUNNING
             if self.modbus_server:
-                self.modbus_server.update_status_registers(status=STATUS_RUNNING, mode=getattr(self, '_modbus_mode', MODE_AUTO))
+                self.modbus_server.write_status_register(STATUS_RUNNING)
             # 清除故障
             self.clear_error(auto_enable=True)
             self._modbus_status_override = None
@@ -3193,7 +3211,7 @@ class DobotController:
             self.record_alarm("软件急停", "ALL_FAILED", "故障", "软件急停独立连接和主连接均失败")
 
         if self.modbus_server:
-            self.modbus_server.update_status_registers(status=STATUS_ROBOT_ERR, mode=MODE_AUTO)
+            self.modbus_server.write_status_register(STATUS_ROBOT_ERR)
 
         self.record_alarm("软件急停", "0", "急停", "软件急停信号已触发", "复位软件急停信号后清除报警并重新使能", "")
         logger.warning("软件急停已触发 (独立连接=%s)", "成功" if direct_ok else "失败")
@@ -3233,7 +3251,7 @@ class DobotController:
         if self._modbus_status_override == 5:
             self._modbus_status_override = None
         if self.modbus_server:
-            self.modbus_server.update_status_registers(status=STATUS_STANDBY, mode=MODE_AUTO)
+            self.modbus_server.write_status_register(STATUS_STANDBY)
         logger.info("软件急停信号已解除 (独立连接=%s)", "成功" if direct_ok else "失败")
         return True
 
@@ -3270,7 +3288,7 @@ class DobotController:
             self._modbus_status_override = STATUS_HOOK_ERR
             self.record_alarm("Modbus提钩", "BUSY", "故障", "流程运行中，提钩被拒绝")
             if self.modbus_server:
-                self.modbus_server.update_status_registers(status=STATUS_HOOK_ERR, mode=MODE_AUTO)
+                self.modbus_server.write_status_register(STATUS_HOOK_ERR)
             return
         try:
             # 从 config.json 读取提钩目标
@@ -3297,14 +3315,14 @@ class DobotController:
                 self._modbus_status_override = STATUS_HOOK_ERR
                 self.record_alarm("Modbus提钩", str(result.code), "故障", f"提钩目标校验失败: {result.message}")
                 if self.modbus_server:
-                    self.modbus_server.update_status_registers(status=STATUS_HOOK_ERR, mode=MODE_AUTO)
+                    self.modbus_server.write_status_register(STATUS_HOOK_ERR)
                 return
 
             # 设置状态：运行中 (40001=4)
             self._modbus_hook_status = 1
             self._modbus_status_override = STATUS_RUNNING
             if self.modbus_server:
-                self.modbus_server.update_status_registers(status=STATUS_RUNNING, mode=MODE_AUTO)
+                self.modbus_server.write_status_register(STATUS_RUNNING)
 
             # 执行运动到目标位姿
             success = self.move_to_point(
@@ -3321,14 +3339,14 @@ class DobotController:
                 self._modbus_status_override = STATUS_HOOK_ERR
                 self.record_alarm("Modbus提钩", "REJECTED", "故障", "提钩运动指令被拒绝或超时")
                 if self.modbus_server:
-                    self.modbus_server.update_status_registers(status=STATUS_HOOK_ERR, mode=MODE_AUTO)
+                    self.modbus_server.write_status_register(STATUS_HOOK_ERR)
             else:
                 # 提钩OK (40001=5)
                 self._modbus_hook_status = 2
                 self._modbus_status_override = STATUS_HOOK_OK
                 self._last_fault_code = 0
                 if self.modbus_server:
-                    self.modbus_server.update_status_registers(status=STATUS_HOOK_OK, mode=MODE_AUTO)
+                    self.modbus_server.write_status_register(STATUS_HOOK_OK)
                 logger.info("自动提钩流程完成")
         except Exception as e:
             logger.error("自动提钩失败: %s", e)
@@ -3336,7 +3354,7 @@ class DobotController:
             self._modbus_status_override = STATUS_HOOK_ERR
             self.record_alarm("Modbus提钩", "EXCEPTION", "故障", "提钩执行异常", raw=e)
             if self.modbus_server:
-                self.modbus_server.update_status_registers(status=STATUS_HOOK_ERR, mode=MODE_AUTO)
+                self.modbus_server.write_status_register(STATUS_HOOK_ERR)
         finally:
             self.release_motion("modbus")
 

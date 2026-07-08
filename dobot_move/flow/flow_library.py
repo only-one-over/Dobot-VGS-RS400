@@ -123,6 +123,11 @@ class FlowLibrary:
             for f in flows
             if isinstance(f, dict)
         }
+        existing_names: set[str] = {
+            str(f.get("name", ""))
+            for f in flows
+            if isinstance(f, dict)
+        }
 
         # flow_roles: keep user mapping, fill in any missing default roles.
         raw_roles = payload.get("flow_roles")
@@ -138,16 +143,23 @@ class FlowLibrary:
         payload["flow_roles"] = flow_roles
 
         # Ensure three fixed role flows exist; create empty ones if missing.
+        # If a role flow's default display name collides with an existing
+        # user flow name, append "_migrated" suffix to disambiguate.
+        # flow_id is preserved (still uses the DEFAULT_FLOW_ROLES mapping).
         for role_fid in DEFAULT_FLOW_ROLES.values():
             if role_fid not in existing_ids:
+                name = ROLE_FLOW_NAMES.get(role_fid, role_fid)
+                if name in existing_names:
+                    name = f"{name}_migrated"
                 flows.append(
                     {
                         "id": role_fid,
-                        "name": ROLE_FLOW_NAMES.get(role_fid, role_fid),
+                        "name": name,
                         "modules": [],
                     }
                 )
                 existing_ids.add(role_fid)
+                existing_names.add(name)
 
         # Repair main_flow_id / last_edited_flow_id if they point to
         # missing flows. Prefer the legacy main flow when still present;

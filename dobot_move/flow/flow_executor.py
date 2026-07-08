@@ -30,7 +30,7 @@ from ..config.config_manager import (
 from ..vision.vision_system import FramePacket
 from ..robot.arc_motion_controller import ArcMotionController
 from ..robot.visual_servo_controller import VisualServoController
-from .flow_result import FlowResult
+from .flow_result import FlowResult, FailureKind
 
 try:
     import cv2
@@ -104,9 +104,13 @@ def wait_for_flow_delay_or_signal(
     stop_event,
     is_paused_ref=None,
     poll_interval=0.05,
-    signal_checker=None,
 ):
-    """Wait until timeout, stop, or an optional external signal matches."""
+    """Wait until timeout or stop while remaining responsive to pause.
+
+    PR 7: 旧 ``signal_checker`` 参数与 ``modbus_or_timeout`` 模式已移除，
+    扶钩等待由状态机 HOLDING_HOOK 状态处理。返回值仅可能为 ``"stopped"``
+    或 ``"timeout"``。
+    """
     duration_s = float(duration_s)
     if not math.isfinite(duration_s) or duration_s <= 0:
         raise ValueError("延时时长必须是大于0的有限数值")
@@ -124,13 +128,6 @@ def wait_for_flow_delay_or_signal(
         if not paused:
             remaining -= max(0.0, now - last_tick)
         last_tick = now
-
-        if not paused and signal_checker is not None:
-            try:
-                if signal_checker():
-                    return "signal"
-            except Exception:
-                logger.debug("延时模块读取外部信号失败", exc_info=True)
 
         if remaining <= 0:
             return "timeout"
@@ -233,8 +230,8 @@ def validate_grasp_flow_modules(modules: list) -> list:
             elif duration_s > 3600:
                 errors.append(f"第{step}步「{name}」：延时时长不能超过3600秒")
             wait_mode = params.get("wait_mode", "time")
-            if wait_mode not in ("time", "modbus_or_timeout"):
-                errors.append(f"第{step}步「{name}」：延时等待方式无效")
+            if wait_mode != "time":
+                errors.append(f"第{step}步「{name}」：延时等待方式无效（仅支持 time）")
 
     return errors
 
@@ -321,7 +318,7 @@ class FlowExecutor:
         reason,
         *,
         code: str = "MODULE_FAILED",
-        failure_kind: str = "flow",
+        failure_kind: FailureKind = FailureKind.FLOW,
         recoverable: bool = True,
     ):
         """Unified failure handler: record timing, emit log/signal, write alarm.
@@ -642,7 +639,7 @@ class FlowExecutor:
                 self.last_result = FlowResult.failure(
                     code="MOTION_LOCK_BUSY",
                     message="无法获取运动控制权，可能有其他操作正在执行",
-                    failure_kind="flow",
+                    failure_kind=FailureKind.FLOW,
                     recoverable=False,
                 )
                 if self.on_finished:
@@ -669,7 +666,7 @@ class FlowExecutor:
                     if ctx.stop_event.is_set():
                         self._fail_module(
                             ctx, i, module.get("name", f"模块{i+1}"), "用户停止",
-                            code="USER_STOP", failure_kind="flow", recoverable=False,
+                            code="USER_STOP", failure_kind=FailureKind.FLOW, recoverable=False,
                         )
                         return self.last_result
 
@@ -677,7 +674,7 @@ class FlowExecutor:
                         if ctx.stop_event.is_set():
                             self._fail_module(
                                 ctx, i, module.get("name", f"模块{i+1}"), "用户停止",
-                                code="USER_STOP", failure_kind="flow", recoverable=False,
+                                code="USER_STOP", failure_kind=FailureKind.FLOW, recoverable=False,
                             )
                             return self.last_result
                         time.sleep(0.1)
@@ -719,7 +716,7 @@ class FlowExecutor:
                             move_timing = getattr(self.controller, '_last_move_timing', {})
                         elif module['params']['target'] == "camera_detected":
                             if base_coords is None:
-                                self._fail_module(ctx, i, name, "相机未识别到物体坐标，请确保流程中先有相机识别步骤", code="CAMERA_NOT_DETECTED", failure_kind="camera", recoverable=True)
+                                self._fail_module(ctx, i, name, "相机未识别到物体坐标，请确保流程中先有相机识别步骤", code="CAMERA_NOT_DETECTED", failure_kind=FailureKind.CAMERA, recoverable=True)
                                 return self.last_result
                             if module['params']['motion_type'] == "MovL":
                                 point_name = module['params'].get('point_name', '')
@@ -778,16 +775,16 @@ class FlowExecutor:
 
                     elif module['type'] == "arc_motion":
                         if not self.controller.is_connected:
-                            self._fail_module(ctx, i, name, "机器人未连接，无法执行圆弧运动", code="ROBOT_DISCONNECTED", failure_kind="robot", recoverable=False)
+                            self._fail_module(ctx, i, name, "机器人未连接，无法执行圆弧运动", code="ROBOT_DISCONNECTED", failure_kind=FailureKind.ROBOT, recoverable=False)
                             return self.last_result
                         if not self.controller.is_enabled:
-                            self._fail_module(ctx, i, name, "机器人未使能，无法执行圆弧运动", code="ROBOT_NOT_ENABLED", failure_kind="robot", recoverable=False)
+                            self._fail_module(ctx, i, name, "机器人未使能，无法执行圆弧运动", code="ROBOT_NOT_ENABLED", failure_kind=FailureKind.ROBOT, recoverable=False)
                             return self.last_result
                         try:
                             p = dict(module['params'])
                             current_pose = self.controller.get_current_pose_fast(max_age=pose_cache_max_age)
                             if not current_pose or len(current_pose) < 6:
-                                self._fail_module(ctx, i, name, "无法获取当前机器人位姿，无法生成圆弧", code="POSE_UNAVAILABLE", failure_kind="robot", recoverable=False)
+                                self._fail_module(ctx, i, name, "无法获取当前机器人位姿，无法生成圆弧", code="POSE_UNAVAILABLE", failure_kind=FailureKind.ROBOT, recoverable=False)
                                 return self.last_result
                             # 位姿缓冲区由 RobotController 拥有，在 _store_feedback_packet 中 push；
                             # 此处补充 push 当前位姿作为退化兜底（feedback 线程可能尚未 push 最新帧）。
@@ -865,10 +862,10 @@ class FlowExecutor:
 
                     elif module['type'] == "relative_move":
                         if not self.controller.is_connected:
-                            self._fail_module(ctx, i, name, "机器人未连接，无法执行相对移动", code="ROBOT_DISCONNECTED", failure_kind="robot", recoverable=False)
+                            self._fail_module(ctx, i, name, "机器人未连接，无法执行相对移动", code="ROBOT_DISCONNECTED", failure_kind=FailureKind.ROBOT, recoverable=False)
                             return self.last_result
                         if not self.controller.is_enabled:
-                            self._fail_module(ctx, i, name, "机器人未使能，无法执行相对移动", code="ROBOT_NOT_ENABLED", failure_kind="robot", recoverable=False)
+                            self._fail_module(ctx, i, name, "机器人未使能，无法执行相对移动", code="ROBOT_NOT_ENABLED", failure_kind=FailureKind.ROBOT, recoverable=False)
                             return self.last_result
                         p = module.get('params', {})
                         offsets = p.get('offsets', [0, 0, 0, 0, 0, 0])
@@ -905,10 +902,10 @@ class FlowExecutor:
 
                     elif module['type'] == "relative_path":
                         if not self.controller.is_connected:
-                            self._fail_module(ctx, i, name, "机器人未连接，无法执行连续相对路径", code="ROBOT_DISCONNECTED", failure_kind="robot", recoverable=False)
+                            self._fail_module(ctx, i, name, "机器人未连接，无法执行连续相对路径", code="ROBOT_DISCONNECTED", failure_kind=FailureKind.ROBOT, recoverable=False)
                             return self.last_result
                         if not self.controller.is_enabled:
-                            self._fail_module(ctx, i, name, "机器人未使能，无法执行连续相对路径", code="ROBOT_NOT_ENABLED", failure_kind="robot", recoverable=False)
+                            self._fail_module(ctx, i, name, "机器人未使能，无法执行连续相对路径", code="ROBOT_NOT_ENABLED", failure_kind=FailureKind.ROBOT, recoverable=False)
                             return self.last_result
                         p = module['params']
                         # Global defaults
@@ -944,7 +941,7 @@ class FlowExecutor:
                                 if not seg.get('enabled', True):
                                     continue
                                 if ctx.stop_event.is_set():
-                                    self._fail_module(ctx, i, name, f"用户停止（第{seg_idx+1}段下发前）", code="USER_STOP", failure_kind="flow", recoverable=False)
+                                    self._fail_module(ctx, i, name, f"用户停止（第{seg_idx+1}段下发前）", code="USER_STOP", failure_kind=FailureKind.FLOW, recoverable=False)
                                     return self.last_result
                                 offsets = [
                                     float(seg.get('x', 0)), float(seg.get('y', 0)), float(seg.get('z', 0)),
@@ -1000,7 +997,7 @@ class FlowExecutor:
                                         self.on_log(f"  段{seg_idx+1}: 已禁用，跳过")
                                     continue
                                 if ctx.stop_event.is_set():
-                                    self._fail_module(ctx, i, name, f"用户停止（第{seg_idx+1}段）", code="USER_STOP", failure_kind="flow", recoverable=False)
+                                    self._fail_module(ctx, i, name, f"用户停止（第{seg_idx+1}段）", code="USER_STOP", failure_kind=FailureKind.FLOW, recoverable=False)
                                     return self.last_result
                                 offsets = [
                                     float(seg.get('x', 0)), float(seg.get('y', 0)), float(seg.get('z', 0)),
@@ -1052,61 +1049,30 @@ class FlowExecutor:
                             self._fail_module(ctx, i, name, "延时时长必须大于0秒且不超过3600秒")
                             return self.last_result
 
+                        # PR 7: 旧 ``modbus_or_timeout`` 模式已移除，delay 模块仅支持纯超时。
+                        # 扶钩等待由状态机 HOLDING_HOOK 状态处理。
                         wait_mode = p.get('wait_mode', 'time')
-                        signal_checker = None
-                        if wait_mode == "modbus_or_timeout":
-                            if self.on_log:
-                                self.on_log(
-                                    f"⏱️ 最长等待 {duration_s:.1f} 秒，"
-                                    "延时期间40001=5，收到40001=1时提前通过"
-                                )
-
-                            modbus_server = getattr(self.controller, "modbus_server", None)
-                            if modbus_server is None or not modbus_server.is_running():
-                                if self.on_log:
-                                    self.on_log("  Modbus服务未运行，将等待至超时后继续")
-
-                            self.controller.begin_modbus_delay_wait()
-                            signal_checker = self.controller.is_modbus_delay_released
-                        elif wait_mode == "time":
-                            if self.on_log:
-                                self.on_log(f"⏱️ 延时 {duration_s:.1f} 秒")
-                        else:
-                            self._fail_module(ctx, i, name, "延时等待方式无效")
+                        if wait_mode != "time":
+                            self._fail_module(ctx, i, name, "延时等待方式无效（仅支持 time）")
                             return self.last_result
 
+                        if self.on_log:
+                            self.on_log(f"⏱️ 延时 {duration_s:.1f} 秒")
+
                         wait_start = time.perf_counter()
-                        try:
-                            wait_result = wait_for_flow_delay_or_signal(
-                                duration_s,
-                                ctx.stop_event,
-                                self.is_paused_ref,
-                                poll_interval=min(wait_poll_interval, 0.05),
-                                signal_checker=signal_checker,
-                            )
-                        finally:
-                            if wait_mode == "modbus_or_timeout":
-                                self.controller.end_modbus_delay_wait(
-                                    restore_running=not ctx.stop_event.is_set()
-                                )
+                        wait_result = wait_for_flow_delay_or_signal(
+                            duration_s,
+                            ctx.stop_event,
+                            self.is_paused_ref,
+                            poll_interval=min(wait_poll_interval, 0.05),
+                        )
                         if wait_result == "stopped":
-                            self._fail_module(ctx, i, name, "用户停止（延时中）", code="USER_STOP", failure_kind="flow", recoverable=False)
+                            self._fail_module(ctx, i, name, "用户停止（延时中）", code="USER_STOP", failure_kind=FailureKind.FLOW, recoverable=False)
                             return self.last_result
                         wait_elapsed = time.perf_counter() - wait_start
                         cmd_elapsed = 0.0
-                        if wait_result == "signal":
-                            if self.on_log:
-                                self.on_log(
-                                    f"✅ 模块{i+1}收到Modbus信号，等待{wait_elapsed:.1f}秒后提前完成"
-                                )
-                        elif wait_mode == "modbus_or_timeout":
-                            if self.on_log:
-                                self.on_log(
-                                    f"✅ 模块{i+1}等待超时，继续下一步"
-                                )
-                        else:
-                            if self.on_log:
-                                self.on_log(f"✅ 模块{i+1}延时完成")
+                        if self.on_log:
+                            self.on_log(f"✅ 模块{i+1}延时完成")
 
                     elif module['type'] == "camera":
                         camera_type = module['params'].get('camera_type', 'D435i')
@@ -1116,7 +1082,7 @@ class FlowExecutor:
                             vision_to_use = self.vision_d435i
 
                         if vision_to_use is None:
-                            self._fail_module(ctx, i, name, f"{camera_type} 相机未连接，无法识别物体", code="CAMERA_DISCONNECTED", failure_kind="camera", recoverable=True)
+                            self._fail_module(ctx, i, name, f"{camera_type} 相机未连接，无法识别物体", code="CAMERA_DISCONNECTED", failure_kind=FailureKind.CAMERA, recoverable=True)
                             return self.last_result
 
                         camera_start = time.perf_counter()
@@ -1141,7 +1107,7 @@ class FlowExecutor:
 
                         min_confidence = float(self.performance_config.get("flow_camera_min_confidence", 0.3))
                         if not best_result or best_confidence < min_confidence:
-                            self._fail_module(ctx, i, name, f"多帧检测失败，最高置信度={best_confidence:.2f}", code="CAMERA_DETECTION_FAILED", failure_kind="camera", recoverable=True)
+                            self._fail_module(ctx, i, name, f"多帧检测失败，最高置信度={best_confidence:.2f}", code="CAMERA_DETECTION_FAILED", failure_kind=FailureKind.CAMERA, recoverable=True)
                             return self.last_result
 
                         object_position = best_result
@@ -1201,7 +1167,7 @@ class FlowExecutor:
 
                     elif module['type'] == "visual_servo":
                         if self.vision_d405 is None:
-                            self._fail_module(ctx, i, name, "D405 相机未连接，无法执行视觉伺服", code="CAMERA_DISCONNECTED", failure_kind="camera", recoverable=True)
+                            self._fail_module(ctx, i, name, "D405 相机未连接，无法执行视觉伺服", code="CAMERA_DISCONNECTED", failure_kind=FailureKind.CAMERA, recoverable=True)
                             return self.last_result
 
                         _vs_cfg = get_visual_servo_config()
@@ -1249,7 +1215,7 @@ class FlowExecutor:
                             self.active_visual_servo = None
 
                         if not success:
-                            self._fail_module(ctx, i, name, f"视觉伺服失败，最终误差={final_error:.1f}mm", code="VISUAL_SERVO_FAILED", failure_kind="vision_process", recoverable=True)
+                            self._fail_module(ctx, i, name, f"视觉伺服失败，最终误差={final_error:.1f}mm", code="VISUAL_SERVO_FAILED", failure_kind=FailureKind.VISION_PROCESS, recoverable=True)
                             return self.last_result
 
                         if self.on_log:
@@ -1315,7 +1281,7 @@ class FlowExecutor:
             self.last_result = FlowResult.failure(
                 code="FLOW_EXCEPTION",
                 message=str(e),
-                failure_kind="flow",
+                failure_kind=FailureKind.FLOW,
                 recoverable=False,
             )
             if self.on_finished:
@@ -1323,5 +1289,5 @@ class FlowExecutor:
         return self.last_result or FlowResult.failure(
             code="UNKNOWN",
             message="flow ended without explicit result",
-            failure_kind="flow",
+            failure_kind=FailureKind.FLOW,
         )

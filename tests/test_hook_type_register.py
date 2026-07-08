@@ -212,7 +212,9 @@ def test_illegal_hook_type_rejects_cmd_hook_and_writes_110():
         on_command_callback=lambda cmd, mode=0, hook_type=0: calls.append((cmd, mode, hook_type))
     )
     # 桩 _write_status_hook_err 以记录调用而不真正写寄存器
-    server._write_status_hook_err = lambda: write_calls.append(modbus_server.STATUS_HOOK_ERR)
+    async def _async_hook_err_stub():
+        write_calls.append(modbus_server.STATUS_HOOK_ERR)
+    server._write_status_hook_err = _async_hook_err_stub
 
     asyncio.run(
         server._action_callback(
@@ -260,6 +262,9 @@ def test_illegal_hook_type_with_non_hook_cmd_still_passes_with_warning():
 class _FakeStatusServer:
     def __init__(self):
         self.calls = []
+
+    def write_status_register(self, status):
+        self.calls.append({"status": status, "mode": 0})
 
     def update_status_registers(self, **kwargs):
         self.calls.append(kwargs)

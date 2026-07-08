@@ -88,7 +88,7 @@ class TestFlowResultDataclass:
         assert result.success is True
         assert result.code == "OK"
         assert result.message == ""
-        assert result.failure_kind == ""
+        assert result.failure_kind == FAILURE_KIND_FLOW
         assert result.failed_module_index is None
         assert result.failed_module_name is None
         assert result.recoverable is False
@@ -310,7 +310,7 @@ class _FakeController:
     def close_robot_transport(self):
         pass
 
-    def abort_active_flow_for_disconnect(self, reason):
+    def abort_active_flow_for_disconnect(self, reason, source="flow"):
         pass
 
     def _write_modbus_status(self, status, mode=0):
@@ -410,7 +410,7 @@ def _recovery_agent_fixture(robot_mode=5, error_status=0, feedback_health="ok"):
             }
         )
         agent.program_runner.build_production_request = MagicMock(
-            side_effect=lambda flow_id: _make_fake_request(flow_id)
+            side_effect=lambda flow_id, task_id="": _make_fake_request(flow_id)
         )
         agent.program_runner.start_request = MagicMock(return_value=True)
         agent.program_runner.pause = MagicMock(return_value=True)
@@ -431,7 +431,7 @@ def _start_primary_task(agent, controller, hook_type=0):
     """Drive the agent into RUNNING with a latched ProductionTaskContext."""
     agent._set_production_state(ProductionState.STANDBY)
     controller.written_statuses.clear()
-    agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=hook_type)
+    agent._dispatch_command(cmd=3, mode=0, hook_type=hook_type)
     assert agent.production_state == ProductionState.RUNNING
     assert agent.production_task is not None
 

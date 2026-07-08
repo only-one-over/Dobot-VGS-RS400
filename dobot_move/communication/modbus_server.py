@@ -33,7 +33,6 @@ STATUS_IDLE = 0
 STATUS_STANDBY = 2
 STATUS_RUNNING = 4
 STATUS_HOOK_OK = 5
-STATUS_DELAY_WAIT = 5
 STATUS_HOOK_ERR = 110
 STATUS_ROBOT_ERR = 111
 STATUS_CAMERA_ERR = 112
@@ -114,6 +113,7 @@ class DobotModbusServer:
             REG_CMD_STATUS: ("命令/状态(0=停止/1=非运行时复位或延时中放行/2=复位完成/3=非运行时执行流程/4=运行中/5=延时等待或流程完成/110=流程ERR/111=机器人报错/112=相机报错)", "U16", "双向"),
             REG_MODE: ("模式(0=自动模式/1=手动模式)", "U16", "双向"),
             REG_HEARTBEAT: ("心跳(1/0交替)", "U16", "从站写"),
+            REG_HOOK_TYPE: ("提钩杆类型(0=低钩子/1=高钩子)", "U16", "PLC写"),
         }
 
     def _build_devices(self):
@@ -302,7 +302,7 @@ class DobotModbusServer:
                         "[Modbus协议错误] 40004 钩子类型非法: %d (合法范围 0/1)，拒绝 40001=3 启动，写 40001=110",
                         current_hook_type,
                     )
-                    self._write_status_hook_err()
+                    await self._write_status_hook_err()
                     return None
                 else:
                     logger.warning(
@@ -315,18 +315,18 @@ class DobotModbusServer:
 
         return None
 
-    def _write_status_hook_err(self):
-        """写 40001=110 (流程ERR) 表示钩子类型非法等协议错误"""
+    async def _write_status_hook_err(self):
+        """写 40001=110 (流程ERR) 表示钩子类型非法等协议错误。
+
+        ``async def``：在 ``_action_callback`` 内通过 ``await`` 调用，
+        不再使用 ``run_coroutine_threadsafe().result()`` 避免事件循环阻塞。
+        """
         if not self._loop or not self._loop.is_running() or not self._server:
             return
         values = [STATUS_HOOK_ERR]
         signature = self._mark_internal_status_write(_WIRE_ADDR, values)
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._server.context.async_setValues(self._slave_id, 3, _WIRE_ADDR, values),
-                self._loop,
-            )
-            future.result(timeout=2.0)
+            await self._server.context.async_setValues(self._slave_id, 3, _WIRE_ADDR, values)
         except Exception as e:
             logger.error("_write_status_hook_err failed: %s", e)
         finally:
@@ -455,11 +455,15 @@ class DobotModbusServer:
             "last_duration_ms": self._last_duration_ms,
         }
 
-    def update_status_registers(self, status=0, mode=0):
-        """更新状态寄存器（40001 和 40002）"""
+    def write_status_register(self, status: int):
+        """仅写 40001 状态寄存器，禁止写 40002/40004（PLC 独占）。
+
+        从非事件循环线程调用（如 robot_controller / runtime_agent 工作线程），
+        使用 ``run_coroutine_threadsafe`` + ``future.result(timeout=2.0)`` 同步等待。
+        """
         if not self._loop or not self._loop.is_running() or not self._server:
             return
-        values = [int(status), int(mode)]
+        values = [int(status)]
         signature = self._mark_internal_status_write(_WIRE_ADDR, values)
         try:
             future = asyncio.run_coroutine_threadsafe(
@@ -468,9 +472,20 @@ class DobotModbusServer:
             )
             future.result(timeout=2.0)
         except Exception as e:
-            logger.error("update_status_registers failed: %s", e)
+            logger.error("write_status_register failed: %s", e)
         finally:
             self._discard_internal_status_write(signature)
+
+    def update_status_registers(self, status=0, mode=0):
+        """[DEPRECATED] 更新状态寄存器。
+
+        废弃方法：仅写 40001，不再写 40002（PLC 独占）。``mode`` 参数被忽略，
+        仅为向后兼容保留。请改用 :meth:`write_status_register`。
+        """
+        logger.warning(
+            "update_status_registers is deprecated, use write_status_register instead"
+        )
+        self.write_status_register(status)
 
     def get_register_values(self):
         """获取寄存器当前值"""
@@ -478,7 +493,7 @@ class DobotModbusServer:
             return {}
         try:
             future = asyncio.run_coroutine_threadsafe(
-                self._server.context.async_getValues(self._slave_id, 3, _WIRE_ADDR, 3),
+                self._server.context.async_getValues(self._slave_id, 3, _WIRE_ADDR, 4),
                 self._loop,
             )
             vals = future.result(timeout=2.0)
@@ -489,7 +504,7 @@ class DobotModbusServer:
         if vals is None:
             return {}
         result = {}
-        for i, addr in enumerate([REG_CMD_STATUS, REG_MODE, REG_HEARTBEAT]):
+        for i, addr in enumerate([REG_CMD_STATUS, REG_MODE, REG_HEARTBEAT, REG_HOOK_TYPE]):
             info = self._register_info.get(addr, None)
             val = vals[i]
             entry = {
@@ -504,5 +519,7 @@ class DobotModbusServer:
                 entry["value_display"] = _MODE_DISPLAY.get(val, str(val))
             elif addr == REG_HEARTBEAT:
                 entry["value_display"] = str(val)
+            elif addr == REG_HOOK_TYPE:
+                entry["value_display"] = REGISTER_VALUE_DESC.get((addr, val), str(val))
             result[addr] = entry
         return result

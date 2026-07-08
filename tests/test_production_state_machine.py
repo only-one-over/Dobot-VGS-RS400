@@ -89,6 +89,7 @@ class TestProductionState:
             "manual_offline",
             "idle",
             "standby",
+            "starting",
             "running",
             "paused",
             "holding_hook",
@@ -381,7 +382,7 @@ class _FakeController:
     def close_robot_transport(self):
         self.close_transport_calls += 1
 
-    def abort_active_flow_for_disconnect(self, reason):
+    def abort_active_flow_for_disconnect(self, reason, source="flow"):
         pass
 
     def _write_modbus_status(self, status, mode=0):
@@ -484,7 +485,7 @@ def _runtime_agent_fixture():
         # Mock program_runner heavy methods; keep pause/resume/stop as
         # real no-ops by replacing them with MagicMock(return_value=True).
         agent.program_runner.build_production_request = MagicMock(
-            side_effect=lambda flow_id: _make_fake_request(flow_id)
+            side_effect=lambda flow_id, task_id="": _make_fake_request(flow_id)
         )
         agent.program_runner.start_request = MagicMock(return_value=True)
         agent.program_runner.pause = MagicMock(return_value=True)
@@ -509,13 +510,13 @@ class TestLowHookSelection:
             agent._set_production_state(ProductionState.STANDBY)
             controller.written_statuses.clear()
             # Dispatch 40001=3, mode=AUTO, hook_type=0 (low)
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.RUNNING
             assert agent.production_task is not None
             assert agent.production_task.hook_type == 0
             assert agent.production_task.primary_flow_id == "flow-low"
             agent.program_runner.build_production_request.assert_called_once_with(
-                "flow-low"
+                "flow-low", task_id=agent.production_task.task_id
             )
             # 40001 should be written to 4 (RUNNING)
             assert (4, 0) in controller.written_statuses
@@ -532,13 +533,13 @@ class TestHighHookSelection:
         with _runtime_agent_fixture() as (agent, controller):
             agent._set_production_state(ProductionState.STANDBY)
             controller.written_statuses.clear()
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=1)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=1)
             assert agent.production_state == ProductionState.RUNNING
             assert agent.production_task is not None
             assert agent.production_task.hook_type == 1
             assert agent.production_task.primary_flow_id == "flow-high"
             agent.program_runner.build_production_request.assert_called_once_with(
-                "flow-high"
+                "flow-high", task_id=agent.production_task.task_id
             )
 
 
@@ -554,7 +555,7 @@ class TestInvalidHookType:
             agent._set_production_state(ProductionState.STANDBY)
             controller.written_statuses.clear()
             # hook_type=2 is invalid; flow_router.resolve_primary raises ValueError
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=2)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=2)
             assert agent.production_state == ProductionState.FLOW_ERROR
             assert agent.production_task is None
             # 40001 should be written to 110 (FLOW_ERROR)
@@ -574,13 +575,13 @@ class TestHookTypeLatching:
         with _runtime_agent_fixture() as (agent, controller):
             agent._set_production_state(ProductionState.STANDBY)
             # Start a low-hook task
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             assert agent.production_task is not None
             original_task_id = agent.production_task.task_id
             assert agent.production_task.hook_type == 0
             # PLC sends another 40001=3 with hook_type=1 while RUNNING.
             # Per spec, RUNNING state ignores duplicate 40001=3.
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=1)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=1)
             assert agent.production_state == ProductionState.RUNNING
             assert agent.production_task.hook_type == 0
             assert agent.production_task.task_id == original_task_id
@@ -597,14 +598,13 @@ class TestAutoPause:
         """RUNNING + 40001=0 (auto mode) → PAUSED, task retained, no stop_event.set."""
         with _runtime_agent_fixture() as (agent, controller):
             agent._set_production_state(ProductionState.STANDBY)
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             task = agent.production_task
             assert task is not None
             original_task_id = task.task_id
             controller.written_statuses.clear()
             # 40001=0 in auto mode → delegate returns True (pause handled)
-            handled = agent._on_modbus_command_delegate(cmd=0, mode=0, hook_type=0)
-            assert handled is True
+            agent._dispatch_command(cmd=0, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.PAUSED
             # Task MUST be retained
             assert agent.production_task is not None
@@ -617,12 +617,17 @@ class TestAutoPause:
             # 40001 written to 0 (PAUSED maps to 0)
             assert (0, 0) in controller.written_statuses
 
-    def test_pause_in_non_running_state_falls_through(self):
-        """40001=0 when not RUNNING → delegate returns False (controller default)."""
+    def test_pause_in_non_running_state_enqueued_no_state_change(self):
+        """40001=0 when not RUNNING → delegate enqueues (returns True);
+        _dispatch_command no-ops (no state change)."""
         with _runtime_agent_fixture() as (agent, _controller):
             agent._set_production_state(ProductionState.STANDBY)
+            # PR 5 Task 4: auto-mode commands are always consumed (enqueued).
             handled = agent._on_modbus_command_delegate(cmd=0, mode=0, hook_type=0)
-            assert handled is False
+            assert handled is True
+            # _handle_pause_command is a no-op outside RUNNING.
+            agent._dispatch_command(cmd=0, mode=0, hook_type=0)
+            assert agent.production_state == ProductionState.STANDBY
 
 
 # ---------------------------------------------------------------------------
@@ -635,16 +640,16 @@ class TestResumeFlow:
         """PAUSED + 40001=3 → RUNNING, same task_id, no 40004 re-read."""
         with _runtime_agent_fixture() as (agent, controller):
             agent._set_production_state(ProductionState.STANDBY)
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             task = agent.production_task
             assert task is not None
             original_task_id = task.task_id
             # Pause
-            agent._on_modbus_command_delegate(cmd=0, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=0, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.PAUSED
             controller.written_statuses.clear()
             # Resume with 40001=3 (hook_type arg ignored in PAUSED path)
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=1)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=1)
             assert agent.production_state == ProductionState.RUNNING
             assert agent.production_task is not None
             assert agent.production_task.task_id == original_task_id
@@ -669,7 +674,7 @@ class TestManualOffline:
         """40002 0→1 → MANUAL_OFFLINE, manual_offline=True, task cleared."""
         with _runtime_agent_fixture() as (agent, controller):
             agent._set_production_state(ProductionState.STANDBY)
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             assert agent.production_task is not None
             # Simulate 40002 0→1 via the mode-changed callback
             agent._on_mode_changed(old_mode=0, new_mode=1)
@@ -704,7 +709,7 @@ class TestReOnline:
         """MANUAL_OFFLINE + 40002=0 + 40001=1 → STANDBY + 40001=2."""
         with _runtime_agent_fixture() as (agent, controller):
             agent._set_production_state(ProductionState.STANDBY)
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             # Go manual offline
             agent._on_mode_changed(old_mode=0, new_mode=1)
             assert agent.production_state == ProductionState.MANUAL_OFFLINE
@@ -715,8 +720,7 @@ class TestReOnline:
             # Now 40001=1 triggers re-online
             controller.written_statuses.clear()
             # controller.is_connected is True in the fixture
-            handled = agent._on_modbus_command_delegate(cmd=1, mode=0, hook_type=0)
-            assert handled is True
+            agent._dispatch_command(cmd=1, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.STANDBY
             assert agent.manual_offline is False
             assert agent.supervisor.manual_offline is False
@@ -738,7 +742,7 @@ class TestHoldingHook:
         """Main flow success → HOLDING_HOOK + 40001=5 + task retained."""
         with _runtime_agent_fixture() as (agent, controller):
             agent._set_production_state(ProductionState.STANDBY)
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             task = agent.production_task
             assert task is not None
             original_task_id = task.task_id
@@ -762,7 +766,7 @@ class TestHoldingHook:
                 recovery_flow_id="flow-recovery",
                 state="holding_hook",
             )
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.HOLDING_HOOK
             # No new task started
             agent.program_runner.start_request.assert_not_called()
@@ -785,8 +789,7 @@ class TestResetAfterHoldingHook:
                 state="holding_hook",
             )
             controller.written_statuses.clear()
-            handled = agent._on_modbus_command_delegate(cmd=1, mode=0, hook_type=0)
-            assert handled is True
+            agent._dispatch_command(cmd=1, mode=0, hook_type=0)
             # Final state STANDBY
             assert agent.production_state == ProductionState.STANDBY
             # Task cleared
@@ -808,8 +811,7 @@ class TestResetAfterHoldingHook:
             )
             controller.move_to_initial_return = False
             controller.written_statuses.clear()
-            handled = agent._on_modbus_command_delegate(cmd=1, mode=0, hook_type=0)
-            assert handled is True
+            agent._dispatch_command(cmd=1, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.FLOW_ERROR
             assert (110, 0) in controller.written_statuses
 
@@ -824,11 +826,11 @@ class TestRunningIgnoresDuplicateHook:
         """RUNNING + 40001=3 → ignored, no new task."""
         with _runtime_agent_fixture() as (agent, _controller):
             agent._set_production_state(ProductionState.STANDBY)
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.RUNNING
             call_count = agent.program_runner.build_production_request.call_count
             # Duplicate 40001=3
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.RUNNING
             assert agent.program_runner.build_production_request.call_count == call_count
 
@@ -838,16 +840,21 @@ class TestResettingStateGuards:
         """RESETTING + 40001=3 → ignored (only 40001=0 falls through)."""
         with _runtime_agent_fixture() as (agent, _controller):
             agent._set_production_state(ProductionState.RESETTING)
-            handled = agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
-            assert handled is True  # delegate owns it (rejected)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
+            # delegate owns it (rejected); state unchanged
             assert agent.production_state == ProductionState.RESETTING
 
-    def test_resetting_stop_falls_through(self):
-        """RESETTING + 40001=0 → falls through to controller (hard stop)."""
+    def test_resetting_stop_enqueued_no_state_change(self):
+        """RESETTING + 40001=0 → delegate enqueues (returns True);
+        _dispatch_command no-ops (RESETTING guard, no state change)."""
         with _runtime_agent_fixture() as (agent, _controller):
             agent._set_production_state(ProductionState.RESETTING)
+            # PR 5 Task 4: auto-mode commands are always consumed (enqueued).
             handled = agent._on_modbus_command_delegate(cmd=0, mode=0, hook_type=0)
-            assert handled is False  # controller default stop path
+            assert handled is True
+            # _dispatch_command no-ops for CMD_STOP in RESETTING.
+            agent._dispatch_command(cmd=0, mode=0, hook_type=0)
+            assert agent.production_state == ProductionState.RESETTING
 
 
 class TestManualModeFallthrough:
@@ -866,7 +873,7 @@ class TestStartNewTaskGuards:
         with _runtime_agent_fixture() as (agent, _controller):
             agent._set_production_state(ProductionState.STANDBY)
             agent.maintenance_mode = True
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.STANDBY
             agent.program_runner.start_request.assert_not_called()
 
@@ -874,7 +881,7 @@ class TestStartNewTaskGuards:
         with _runtime_agent_fixture() as (agent, _controller):
             agent._set_production_state(ProductionState.STANDBY)
             agent.program_runner.task_mode = "debug"
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.STANDBY
             agent.program_runner.start_request.assert_not_called()
 
@@ -882,7 +889,7 @@ class TestStartNewTaskGuards:
         with _runtime_agent_fixture() as (agent, _controller):
             agent._set_production_state(ProductionState.STANDBY)
             agent.program_runner.start_request = MagicMock(return_value=False)
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.STANDBY
             assert agent.production_task is None
 
@@ -891,7 +898,7 @@ class TestProductionFlowFailure:
     def test_production_flow_failure_transitions_to_flow_error(self):
         with _runtime_agent_fixture() as (agent, controller):
             agent._set_production_state(ProductionState.STANDBY)
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
             controller.written_statuses.clear()
             agent._on_production_flow_finished(
                 FlowResult.failure(
@@ -910,12 +917,11 @@ class TestResetFromPaused:
         """PAUSED + 40001=1 → RESETTING → STANDBY + task cleared."""
         with _runtime_agent_fixture() as (agent, controller):
             agent._set_production_state(ProductionState.STANDBY)
-            agent._on_modbus_command_delegate(cmd=3, mode=0, hook_type=0)
-            agent._on_modbus_command_delegate(cmd=0, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=3, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=0, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.PAUSED
             controller.written_statuses.clear()
-            handled = agent._on_modbus_command_delegate(cmd=1, mode=0, hook_type=0)
-            assert handled is True
+            agent._dispatch_command(cmd=1, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.STANDBY
             assert agent.production_task is None
             assert controller.move_to_initial_calls >= 1
@@ -928,8 +934,7 @@ class TestResetFromError:
         with _runtime_agent_fixture() as (agent, controller):
             agent._set_production_state(ProductionState.FLOW_ERROR)
             controller.written_statuses.clear()
-            handled = agent._on_modbus_command_delegate(cmd=1, mode=0, hook_type=0)
-            assert handled is True
+            agent._dispatch_command(cmd=1, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.STANDBY
             assert controller.clear_error_calls >= 1
             assert controller.enable_calls >= 1
@@ -946,7 +951,7 @@ class TestReonlineNotConnected:
             agent.supervisor.manual_offline = True
             controller.is_connected = False
             controller.written_statuses.clear()
-            agent._on_modbus_command_delegate(cmd=1, mode=0, hook_type=0)
+            agent._dispatch_command(cmd=1, mode=0, hook_type=0)
             # manual_offline flags cleared
             assert agent.manual_offline is False
             assert agent.supervisor.manual_offline is False

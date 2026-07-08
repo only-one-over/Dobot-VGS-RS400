@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from ..flow.flow_result import FlowResult
+from ..flow.flow_result import FlowResult, FailureKind
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,10 @@ class RecoveryPolicy:
         if result is None:
             return False
         if not result.recoverable:
+            return False
+        # PR-FIX-3 Task 7: robot failures are never recoverable, even if the
+        # FlowResult.recoverable flag was set to True by the flow executor.
+        if result.failure_kind == FailureKind.ROBOT:
             return False
         if controller is None:
             return False

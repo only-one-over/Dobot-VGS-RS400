@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..flow.flow_library import required_camera_types
+from .flow_result import FailureKind
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,20 @@ class FlowReadinessResult:
     @property
     def message(self) -> str:
         return "；".join(self.reasons) if self.reasons else "设备已就绪"
+
+    @property
+    def primary_failure_kind(self) -> FailureKind:
+        """Infer the primary FailureKind from missing_devices.
+
+        Priority: robot > camera > flow. When both robot and camera are
+        missing, robot takes precedence (it's the more fundamental
+        prerequisite).
+        """
+        if "robot" in self.missing_devices:
+            return FailureKind.ROBOT
+        if "D435i" in self.missing_devices or "D405" in self.missing_devices:
+            return FailureKind.CAMERA
+        return FailureKind.FLOW
 
 
 def check_flow_readiness(

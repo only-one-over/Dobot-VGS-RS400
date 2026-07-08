@@ -131,7 +131,7 @@ class _FakeController:
         self.is_connected = False
         self.is_enabled = False
 
-    def abort_active_flow_for_disconnect(self, reason):
+    def abort_active_flow_for_disconnect(self, reason, source="flow"):
         flow = self._active_flow_thread
         ctx = getattr(flow, "_ctx", None) if flow is not None else None
         if ctx is not None:
@@ -564,6 +564,8 @@ def test_runtime_agent_latches_recovery_after_unclean_state():
 
 
 def test_runtime_runner_camera_failure_writes_flow_error(monkeypatch):
+    from dobot_move.flow.flow_result import FailureKind
+
     controller = _FakeController()
     controller.is_connected = True
     runner = RuntimeProgramRunner(controller)
@@ -572,9 +574,20 @@ def test_runtime_runner_camera_failure_writes_flow_error(monkeypatch):
         "_load_modules",
         lambda: [{"type": "camera", "params": {"camera_type": "D405"}}],
     )
+    dispatched: list = []
+    runner.on_production_finished = lambda result: dispatched.append(result)
     runner._run_once()
 
-    assert controller.finished == [(False, 0, 110)]
+    # PR-FIX-3 Task 4: readiness failure classified by primary_failure_kind
+    # (D405 missing → FailureKind.CAMERA, code=CAMERA_NOT_READY).
+    assert len(dispatched) == 1
+    assert dispatched[0].success is False
+    assert dispatched[0].code == "CAMERA_NOT_READY"
+    assert dispatched[0].failure_kind == FailureKind.CAMERA
+    # PR-FIX-3 Task 5: production path no longer calls
+    # mark_modbus_program_finished directly; 40001 is owned by the
+    # production state machine via the callback.
+    assert controller.finished == []
 
 
 def test_runtime_runner_passes_reused_cameras_to_flow(monkeypatch):
@@ -611,7 +624,8 @@ def test_runtime_runner_passes_reused_cameras_to_flow(monkeypatch):
 
     assert captured["vision_d435i"] is None
     assert captured["vision_d405"] is runner.vision_d405
-    assert controller.finished == [(True, 0, 110)]
+    # PR-FIX-3 Task 5: production path no longer writes 40001 directly.
+    assert controller.finished == []
 
 
 def test_runtime_runner_timeout_requests_flow_and_robot_stop(monkeypatch):
@@ -649,5 +663,8 @@ def test_runtime_runner_timeout_requests_flow_and_robot_stop(monkeypatch):
 
     assert stopped.is_set()
     assert controller.dashboard.stop_calls == 1
-    assert controller.finished[-1][0] is False
+    # PR-FIX-3 Task 5: production path no longer calls
+    # mark_modbus_program_finished directly; the timeout FlowResult is
+    # dispatched via on_production_finished instead.
+    assert controller.finished == []
     assert any(args[0] == "Runtime流程看门狗" for args, _ in controller.alarms)

@@ -156,7 +156,7 @@ class _FakeController:
     def close_robot_transport(self):
         pass
 
-    def abort_active_flow_for_disconnect(self, reason):
+    def abort_active_flow_for_disconnect(self, reason, source="flow"):
         pass
 
     def _write_modbus_status(self, status, mode=0):

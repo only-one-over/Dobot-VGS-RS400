@@ -29,7 +29,11 @@ def test_legacy_list_is_migrated_and_backed_up(flow_path):
     assert library.snapshot_modules() == legacy
     assert flow_path.with_suffix(".json.bak").exists()
     saved = json.loads(flow_path.read_text(encoding="utf-8"))
-    assert saved["schema_version"] == 2
+    # PR 2: legacy list is now migrated all the way to schema_version=3
+    # (flow_roles + three fixed role flows are added alongside flow-1).
+    assert saved["schema_version"] == 3
+    assert "flow_roles" in saved
+    assert saved["flow_roles"]["low_hook"] == "flow-low-hook"
 
 
 def test_flow_crud_and_main_flow_rules(flow_path):

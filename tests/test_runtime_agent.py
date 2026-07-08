@@ -595,8 +595,10 @@ def test_runtime_runner_passes_reused_cameras_to_flow(monkeypatch):
             self.on_progress = None
 
         def run(self):
+            # PR 4: on_finished now receives a FlowResult.
+            from dobot_move.flow.flow_result import FlowResult
             if self.on_finished:
-                self.on_finished(True)
+                self.on_finished(FlowResult.success_result())
 
     monkeypatch.setattr(
         runner,

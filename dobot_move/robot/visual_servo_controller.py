@@ -60,6 +60,15 @@ class TargetObservation:
     prediction_age: float
     covariance: Optional[np.ndarray] = None
 
+    @property
+    def measurement_age(self) -> float:
+        """距采集时刻的年龄（秒），基于 perf_counter 单调时钟。
+
+        用于替代 published_age（距发布时刻）判定新鲜度，
+        使 read_base/read_end 的 age 反映真实采集时刻而非缓存写入时刻。
+        """
+        return time.perf_counter() - self.measurement_time
+
 
 # ---------------------------------------------------------------------------
 # 线程安全缓存
@@ -109,13 +118,14 @@ class TargetCache:
             self.timestamp = time.monotonic()
 
     def update_from_detection(self, target_end, pose_at_capture, confidence, vision,
-                              measurement_time=None):
+                              measurement_time=None, source="detection"):
         """VisionThread 主路径：缓存末端坐标 + 按采集时刻位姿预计算 base 坐标
 
         - pose_at_capture 为 None 时：仅更新 target_end（退化兼容，ServoThread 走 fallback），
           生成 TargetObservation(source="fallback")
         - pose_at_capture 有效时：预计算 target_base，ServoThread 主路径直接使用，
-          生成 TargetObservation(source="detection")
+          生成 TargetObservation(source=source)，source 默认 "detection"，
+          经 Kalman 平滑的检测路径应传 "smoothed"
         - measurement_time 为采集时刻 (perf_counter)，未提供时用当前 perf_counter 近似
         """
         published_time = time.perf_counter()
@@ -150,7 +160,7 @@ class TargetCache:
             self._observation = TargetObservation(
                 measurement_time=float(measurement_time),
                 published_time=published_time,
-                source="detection",
+                source=source,
                 confidence=float(confidence),
                 prediction_age=0.0,
                 covariance=None,
@@ -198,11 +208,18 @@ class TargetCache:
             )
 
     def read_end(self, max_age: float = 0.3):
-        """读取末端坐标缓存，超过 max_age 返回 None"""
+        """读取末端坐标缓存，超过 max_age 返回 None。
+
+        优先使用 observation.measurement_age（距采集时刻）判定新鲜度；
+        observation 缺失时退化为 time.monotonic() - self.timestamp。
+        """
         with self._lock:
             if self.target_end is None:
                 return None, 0.0, float('inf')
-            age = time.monotonic() - self.timestamp
+            if self._observation is not None:
+                age = self._observation.measurement_age
+            else:
+                age = time.monotonic() - self.timestamp
             if age > max_age:
                 return None, 0.0, age
             return self.target_end.copy(), self.confidence, age
@@ -210,12 +227,18 @@ class TargetCache:
     def read_base(self, max_age: float = 0.3):
         """读取基座坐标缓存，超过 max_age 返回 None。
 
-        返回签名保持 (target_base, confidence, age) 兼容；内部从 observation 提取置信度。
+        返回签名保持 (target_base, confidence, age) 兼容；
+        age 优先使用 observation.measurement_age（距采集时刻），
+        observation 缺失时退化为 time.monotonic() - self.timestamp；
+        置信度从 observation 提取。
         """
         with self._lock:
             if self.target_base is None:
                 return None, 0.0, float('inf')
-            age = time.monotonic() - self.timestamp
+            if self._observation is not None:
+                age = self._observation.measurement_age
+            else:
+                age = time.monotonic() - self.timestamp
             if age > max_age:
                 return None, 0.0, age
             conf = self.confidence
@@ -263,6 +286,9 @@ class VisionThread:
         self.last_depth_ms = 0.0
         self.last_end_convert_ms = 0.0
         self.last_total_ms = 0.0
+        # 同步误差 telemetry：capture_time（采集时刻）到 published_time（写入缓存时刻）的漂移
+        self.last_pose_buffer_drift_ms = 0.0
+        self.last_pose_buffer_size = 0
         # pose_buffer 由 controller 拥有，_loop 通过 self.controller.pose_buffer 查询；
         # 保留此字段仅为向后兼容，不再由 FlowExecutor 注入。
         self.pose_buffer = None
@@ -380,6 +406,7 @@ class VisionThread:
             )
             confidence = object_position.get('confidence', 0.0)
             self._last_confidence = confidence
+            source = object_position.get('source', 'detection')
 
             target_end = np.array(end_coords[:3], dtype=np.float64)
             # 通过 controller.pose_buffer 查询采集时刻位姿（主路径）；
@@ -395,12 +422,52 @@ class VisionThread:
                         capture_time,
                     )
                     pose_at_capture = None
-            self.target_cache.update_from_detection(
-                target_end=target_end,
-                pose_at_capture=pose_at_capture,
-                confidence=confidence,
-                vision=self.vision,
-                measurement_time=capture_time,
+
+            # Prediction 路径：用 Kalman 预测值驱动伺服（Task 2）
+            if source == "prediction":
+                if pose_at_capture is None:
+                    # 无 pose 无法计算 target_base，跳过本轮（等价于目标丢失）
+                    self._lost_count += 1
+                    self.last_total_ms = (time.monotonic() - t_start) * 1000
+                    continue
+                target_base = self.vision.convert_to_base_coords(
+                    target_end, pose_at_capture
+                )
+                prediction_age = 0.0
+                covariance = None
+                kalman = getattr(self.vision, "kalman_3d", None)
+                if kalman is not None:
+                    prediction_age = float(getattr(kalman, "prediction_age", 0.0))
+                    if hasattr(kalman, "get_covariance"):
+                        covariance = kalman.get_covariance()
+                self.target_cache.update_from_prediction(
+                    target_base=target_base,
+                    confidence=confidence,
+                    prediction_age=prediction_age,
+                    covariance=covariance,
+                    measurement_time=capture_time,
+                )
+            else:
+                # Detection / smoothed 路径
+                self.target_cache.update_from_detection(
+                    target_end=target_end,
+                    pose_at_capture=pose_at_capture,
+                    confidence=confidence,
+                    vision=self.vision,
+                    measurement_time=capture_time,
+                    source=source,
+                )
+                # Task 6: D405 检测后同步 update Base Frame Kalman
+                if source == "smoothed" and getattr(self.vision, "kalman_3d_base", None) is not None:
+                    with self.target_cache._lock:
+                        tb = self.target_cache.target_base
+                    if tb is not None:
+                        self.vision.update_base_kalman(tb)
+            # 同步误差 telemetry：采集时刻到写入缓存的漂移 + 当前 pose_buffer 深度
+            published_time = time.perf_counter()
+            self.last_pose_buffer_drift_ms = (published_time - capture_time) * 1000.0
+            self.last_pose_buffer_size = (
+                len(self.controller.pose_buffer) if self.controller else 0
             )
             self.last_end_convert_ms = (time.monotonic() - t0) * 1000
 
@@ -473,6 +540,15 @@ class ServoThread:
         self.enable_feedforward = enable_feedforward
         self.max_iterations = max_iterations
         self.stop_on_converge = stop_on_converge
+        # Task 3: prediction_age gate — 预测超期则拒绝目标
+        self.prediction_age_gate = 0.5  # 秒
+        # Task 4: covariance gate — 位置协方差 trace 超限则拒绝目标
+        self.covariance_gate = 100.0    # mm²
+        # Task 5: prediction 时降速/限步长保护
+        self.prediction_max_step_ratio = 0.5
+        self.prediction_speed_ratio = 0.7
+        self.max_consecutive_predictions = 5
+        self._consecutive_predictions = 0
 
         self._consecutive_servo_fail = 0
         self._running = False
@@ -560,11 +636,44 @@ class ServoThread:
             return None
         return cmd_pos
 
+    def _apply_prediction_policy(self, observation, max_step, gain):
+        """Task 5: prediction 时降速/限步长 + 连续预测软停止。
+
+        - 非 prediction：_consecutive_predictions 归零，原样返回 (max_step, gain, False)
+        - prediction 且未超连续上限：缩减 max_step / gain，返回 (scaled_step, scaled_gain, False)
+        - prediction 且连续次数已达上限：返回 (max_step, gain, True) 表示应跳过本轮下发
+
+        Args:
+            observation: TargetObservation 或 None
+            max_step:    本轮自适应步长上限（mm）
+            gain:        本轮自适应增益
+
+        Returns:
+            (effective_max_step, effective_gain, should_skip)
+        """
+        is_prediction = observation is not None and observation.source == "prediction"
+        if not is_prediction:
+            self._consecutive_predictions = 0
+            return max_step, gain, False
+
+        self._consecutive_predictions += 1
+        if self._consecutive_predictions >= self.max_consecutive_predictions:
+            logger.info(" 预测超限，等待检测")
+            return max_step, gain, True
+
+        scaled_step = max_step * self.prediction_max_step_ratio
+        scaled_gain = gain * self.prediction_speed_ratio
+        return scaled_step, scaled_gain, False
+
     def _resolve_target_base(self, current_pose):
         """获取基座坐标系目标位置
 
         主路径: target_base (VisionThread 已在检测时刻用插值位姿预计算)
         Fallback: target_end + 最新 current_pose → convert_to_base_coords
+
+        新增 gate（Task 3 / Task 4）:
+        - prediction_age gate: source=="prediction" 且 prediction_age > prediction_age_gate → 拒绝
+        - covariance gate:     observation.covariance is not None 且 trace > covariance_gate → 拒绝
 
         Returns:
             (target_base, confidence, target_age, base_convert_ms)
@@ -574,6 +683,27 @@ class ServoThread:
             max_age=self.max_target_age
         )
         if target_base is not None:
+            # Task 3 / Task 4: prediction_age gate + covariance gate
+            observation = self.target_cache.read_observation()
+            if observation is not None:
+                if (
+                    observation.source == "prediction"
+                    and observation.prediction_age > self.prediction_age_gate
+                ):
+                    logger.info(
+                        " 预测超期拒绝: prediction_age=%.3fs > gate=%.3fs",
+                        observation.prediction_age, self.prediction_age_gate,
+                    )
+                    return None, 0.0, float('inf'), 0.0
+                if (
+                    observation.covariance is not None
+                    and float(np.trace(observation.covariance)) > self.covariance_gate
+                ):
+                    logger.info(
+                        " 协方差过大拒绝: trace=%.1f > gate=%.1f",
+                        float(np.trace(observation.covariance)), self.covariance_gate,
+                    )
+                    return None, 0.0, float('inf'), 0.0
             return target_base, confidence, target_age, 0.0
 
         # ── Fallback: target_end + 最新 current_pose → base_coords ──
@@ -677,6 +807,15 @@ class ServoThread:
             # ── 6. 计算指令位姿 ──
             gain = self._adaptive_gain(error_mm)
             max_step = self._adaptive_max_step(error_mm)
+            # Task 5: prediction 时降速/限步长 + 连续预测软停止
+            observation = self.target_cache.read_observation()
+            max_step, gain, should_skip = self._apply_prediction_policy(
+                observation, max_step, gain
+            )
+            if should_skip:
+                self.last_compute_ms = (time.monotonic() - t0) * 1000
+                self._sleep_to_next(t_iter_start)
+                continue
             cmd_pos = np.array(current_pose[:3]) + e * gain
 
             # 前馈补偿（默认关闭，需确认 kalman_3d.x[3:6] 为基座坐标系速度后方可启用）

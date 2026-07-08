@@ -114,6 +114,10 @@ class KalmanFilter3D:
         # Task 4: prediction is reliable only within the prediction gate
         return self.prediction_age <= self.prediction_gate
 
+    def get_covariance(self):
+        """Return a copy of the 3×3 position covariance block P[:3, :3]."""
+        return self.P[:3, :3].copy()
+
     def get_confidence(self):
         pos_var = np.trace(self.P[:3, :3])
         base = 1.0 / (1.0 + pos_var)

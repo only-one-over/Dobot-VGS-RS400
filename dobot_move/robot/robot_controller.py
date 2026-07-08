@@ -8,6 +8,7 @@ import time
 import re
 import socket
 import logging
+import inspect
 from pathlib import Path
 from contextlib import contextmanager
 from ..communication.modbus_server import DobotModbusServer, REG_CMD_STATUS, REG_MODE, STATUS_IDLE, STATUS_STANDBY, STATUS_RUNNING, STATUS_HOOK_OK, STATUS_HOOK_ERR, STATUS_ROBOT_ERR, MODE_AUTO, MODE_MANUAL, CMD_STOP, CMD_RESET, CMD_HOOK
@@ -28,6 +29,10 @@ from ..runtime.runtime_resilience import SingleInstanceLock
 logger = logging.getLogger(__name__)
 STATUS_DELAY_WAIT = STATUS_HOOK_OK
 _FEEDBACK_MAGIC = 0x123456789ABCDEF
+
+# 提钩杆类型常量（与 Modbus 40004 协议层一致）
+HOOK_TYPE_LOW = 0
+HOOK_TYPE_HIGH = 1
 
 
 class _ConnectionSupersededError(RuntimeError):
@@ -109,6 +114,17 @@ class DobotController:
         self._modbus_mode = 0  # MODE_AUTO
         self._modbus_program_runner = None
         self._modbus_program_readiness_checker = None
+        # PR 3: optional delegate that intercepts 40001 commands BEFORE
+        # the controller's default dispatch. Returns True to short-circuit
+        # the default handling. Used by RuntimeAgent's production state
+        # machine for cmd=0 (pause) / cmd=1 (reset) / cmd=3 (hook).
+        self._modbus_command_delegate = None
+        # PR 3: optional callback invoked when 40002 (mode) changes.
+        # Signature: (old_mode: int, new_mode: int) -> None.
+        self._modbus_on_mode_changed = None
+        # PR 5 Task 4: optional callback invoked when 40004 (hook_type)
+        # changes. Signature: (old_hook: int, new_hook: int) -> None.
+        self._modbus_on_hook_type_changed = None
         self._last_modbus_command = None
         self._last_modbus_command_time = 0.0
         self._last_fault_code = 0
@@ -936,7 +952,7 @@ class DobotController:
         # 计算反馈年龄
         feedback_age = 999.0
         if self.latest_feed_time > 0:
-            feedback_age = time.time() - self.latest_feed_time
+            feedback_age = time.monotonic() - self.latest_feed_time
 
         # 从反馈数据读取 ErrorStatus 和 RobotMode
         error_status = 0
@@ -1103,10 +1119,10 @@ class DobotController:
             sample_count = 3
             sample_interval = 0.02
             sample_timeout = 1.0
-        deadline = time.time() + sample_timeout
+        deadline = time.monotonic() + sample_timeout
         samples = []
 
-        while len(samples) < sample_count and time.time() <= deadline:
+        while len(samples) < sample_count and time.monotonic() <= deadline:
             snapshot = self.get_motion_feedback_snapshot(max_age=max_age)
             force = snapshot.get("actual_tcp_force")
             if snapshot.get("health") == "ok" and force is not None and len(force) >= 3:
@@ -1139,7 +1155,7 @@ class DobotController:
         """Read parsed TCP pose from the 30004 feedback cache."""
         if not self.is_connected:
             return None
-        now = time.time()
+        now = time.monotonic()
         with self.feed_lock:
             pose = list(self.latest_pose) if self.latest_pose is not None else None
             pose_time = self.latest_pose_time
@@ -1161,7 +1177,7 @@ class DobotController:
         return self.get_current_pose(max_retries=max_retries)
 
     def get_robot_mode_fast(self, max_age=0.3, fallback=True, dashboard_fallback_interval=None):
-        now = time.time()
+        now = time.monotonic()
         with self.feed_lock:
             mode = self.latest_robot_mode
             mode_time = self.latest_robot_mode_time
@@ -1210,7 +1226,7 @@ class DobotController:
         stale_warn_age = float(perf.get("feedback_stale_warn_age", 0.5))
         stale_fail_age = float(perf.get("feedback_stale_fail_age", 2.0))
 
-        now = time.time()
+        now = time.monotonic()
         with self.feed_lock:
             pose = list(self.latest_pose) if self.latest_pose is not None else None
             mode = self.latest_robot_mode
@@ -1261,7 +1277,7 @@ class DobotController:
         perf = get_performance_config()
         stale_fail_age = float(perf.get("feedback_stale_fail_age", 2.0))
 
-        now = time.time()
+        now = time.monotonic()
         with self.feed_lock:
             pose = list(self.latest_pose) if self.latest_pose is not None else None
             tcp_speed = list(self.latest_tcp_speed) if self.latest_tcp_speed is not None else None
@@ -1313,14 +1329,14 @@ class DobotController:
         speed_threshold = float(perf.get("motion_done_speed_threshold", 1.0))
         rotation_speed_threshold = float(perf.get("motion_done_rotation_speed_threshold", 1.0))
         pose_cache_max_age = float(perf.get("pose_cache_max_age", 0.3))
-        deadline = time.time() + max(0.1, float(timeout))
+        deadline = time.monotonic() + max(0.1, float(timeout))
         poll_interval = max(0.01, float(poll_interval))
         last_event = {
             "post_robot_mode": None,
             "post_error_status": None,
         }
 
-        while time.time() <= deadline:
+        while time.monotonic() <= deadline:
             snapshot = self.get_motion_feedback_snapshot(max_age=pose_cache_max_age)
             state = self.get_motion_safety_state()
             robot_mode = snapshot.get("robot_mode")
@@ -1428,7 +1444,7 @@ class DobotController:
                     timeout, poll_interval, settle_time,
                     "absolute" if target_pose is not None else "relative")
 
-        start_time = time.time()
+        start_time = time.monotonic()
         if settle_time > 0:
             time.sleep(settle_time)
 
@@ -1436,13 +1452,13 @@ class DobotController:
         self._motion_done_stable_count = 0
         _feedback_stale_logged = False
 
-        while time.time() - start_time < timeout:
+        while time.monotonic() - start_time < timeout:
             if stop_checker is not None and stop_checker():
                 logger.info("运动等待被外部打断")
                 return False
 
             # --- Settle time guard ---
-            if self._motion_command_sent_time > 0 and time.time() - self._motion_command_sent_time < settle_time:
+            if self._motion_command_sent_time > 0 and time.monotonic() - self._motion_command_sent_time < settle_time:
                 time.sleep(poll_interval)
                 continue
 
@@ -1602,7 +1618,7 @@ class DobotController:
 
             # --- Dashboard fallback: only when 30004 feedback is NOT fresh ---
             if snapshot_health != "ok":
-                now = time.time()
+                now = time.monotonic()
                 feedback_age = now - snapshot_timestamp if snapshot_timestamp > 0 else 999
 
                 # Log feedback disconnect
@@ -1622,7 +1638,7 @@ class DobotController:
                         self._last_motion_completion_reason = "motion_done"
                         return True
                     elif robot_mode in (7, 8):
-                        elapsed = time.time() - start_time
+                        elapsed = time.monotonic() - start_time
                         elapsed_second = int(elapsed)
                         if elapsed_second != last_running_log_second and elapsed_second % 2 == 0:
                             logger.debug("运行中... 已耗时: %.1f秒", elapsed)
@@ -1809,7 +1825,7 @@ class DobotController:
             ids = self.parse_response_ids(response)
             self._last_command_id = ids[1] if len(ids) > 1 else None
 
-        self._motion_command_sent_time = time.time()
+        self._motion_command_sent_time = time.monotonic()
         self._has_seen_motion_state = False
 
         _wait_start = time.perf_counter()
@@ -1954,7 +1970,7 @@ class DobotController:
         ids = self.parse_response_ids(response)
         self._last_command_id = ids[1] if len(ids) > 1 else None
 
-        self._motion_command_sent_time = time.time()
+        self._motion_command_sent_time = time.monotonic()
         self._has_seen_motion_state = False
 
         estimated_time = 10
@@ -2096,7 +2112,7 @@ class DobotController:
         ids = self.parse_response_ids(response)
         self._last_command_id = ids[1] if len(ids) > 1 else None
 
-        self._motion_command_sent_time = time.time()
+        self._motion_command_sent_time = time.monotonic()
         self._has_seen_motion_state = False
 
         linear_distance = math.sqrt(offsets[0] ** 2 + offsets[1] ** 2 + offsets[2] ** 2)
@@ -2198,7 +2214,7 @@ class DobotController:
 
         # wait=True: same as move_relative
         self._last_command_id = command_id
-        self._motion_command_sent_time = time.time()
+        self._motion_command_sent_time = time.monotonic()
         self._has_seen_motion_state = False
         linear_distance = math.sqrt(offsets[0] ** 2 + offsets[1] ** 2 + offsets[2] ** 2)
         angular_distance = max(abs(offsets[3]), abs(offsets[4]), abs(offsets[5]))
@@ -2318,7 +2334,7 @@ class DobotController:
             self._reset_feedback_cache_locked()
 
     def _store_feedback_packet(self, result):
-        now = time.time()
+        now = time.monotonic()
         pose = self._extract_pose_from_feed_data(result)
         robot_mode = self._extract_robot_mode_from_feed_data(result)
         tcp_speed = self._extract_tcp_speed_from_feed_data(result)
@@ -2428,7 +2444,12 @@ class DobotController:
             logger.info(" Modbus服务已在运行")
             return True
 
-        self.modbus_server = DobotModbusServer(on_command_callback=self._on_modbus_command, slave_id=slave_id)
+        self.modbus_server = DobotModbusServer(
+            on_command_callback=self._on_modbus_command,
+            on_mode_changed_callback=self._modbus_on_mode_changed,
+            on_hook_type_changed_callback=self._modbus_on_hook_type_changed,
+            slave_id=slave_id,
+        )
         result = self.modbus_server.start(host="0.0.0.0", port=port)
         return result
 
@@ -2438,10 +2459,45 @@ class DobotController:
             self.modbus_server.stop()
             self.modbus_server = None
 
-    def set_modbus_program_runner(self, runner, readiness_checker=None):
-        """Register flow start and side-effect-free readiness callbacks."""
+    def set_modbus_program_runner(self, runner, readiness_checker=None, command_delegate=None):
+        """Register flow start and side-effect-free readiness callbacks.
+
+        PR 3: ``command_delegate`` is an optional callable with signature
+        ``(cmd: int, mode: int, hook_type: int) -> bool`` invoked at the
+        top of :meth:`_on_modbus_command`. Returning ``True`` short-
+        circuits the controller's default dispatch so the runtime
+        production state machine can fully own 40001=0/1/3 handling.
+        """
         self._modbus_program_runner = runner
         self._modbus_program_readiness_checker = readiness_checker
+        if command_delegate is not None:
+            self._modbus_command_delegate = command_delegate
+
+    def set_modbus_mode_changed_callback(self, callback):
+        """Register a callback invoked when 40002 (mode) changes.
+
+        PR 3: used by RuntimeAgent to detect 40002 0→1 (manual offline)
+        and 1→0 (re-online) transitions. Signature:
+        ``(old_mode: int, new_mode: int) -> None``.
+        """
+        self._modbus_on_mode_changed = callback
+        # If the server is already running, patch its callback too so
+        # the registration takes effect immediately.
+        if self.modbus_server is not None:
+            self.modbus_server._on_mode_changed = callback
+
+    def set_modbus_hook_type_changed_callback(self, callback):
+        """Register a callback invoked when 40004 (hook_type) changes.
+
+        PR 5 Task 4: used by RuntimeAgent to emit a PLC diagnostic log
+        whenever the PLC changes 40004, even when no production task is
+        running. Signature: ``(old_hook: int, new_hook: int) -> None``.
+        """
+        self._modbus_on_hook_type_changed = callback
+        # If the server is already running, patch its callback too so
+        # the registration takes effect immediately.
+        if self.modbus_server is not None:
+            self.modbus_server._on_hook_type_changed = callback
 
     def abort_active_flow_for_disconnect(self, reason):
         """Stop the current flow immediately and send robot Stop off-thread."""
@@ -2653,16 +2709,32 @@ class DobotController:
             except Exception:
                 logger.exception("运行时恢复锁清除回调失败")
 
-    def _on_modbus_command(self, cmd, mode=0):
+    def _on_modbus_command(self, cmd, mode=MODE_AUTO, hook_type=HOOK_TYPE_LOW):
         """Dispatch 40001 according to flow context.
 
         During normal flow execution only 0 is accepted. During a delay wait,
         0 stops and 1 releases the delay. Outside a flow, 1 resets and 3 starts.
+        hook_type 来自 40004 寄存器，仅转发给 Runtime callback，不在此决定 flow_id。
         """
-        logger.info("收到Modbus命令: cmd=%d, mode=%d", cmd, mode)
+        logger.info("收到Modbus命令: cmd=%d, mode=%d, hook_type=%d", cmd, mode, hook_type)
         self._modbus_mode = mode
         self._last_modbus_command = int(cmd)
-        self._last_modbus_command_time = time.time()
+        self._last_modbus_command_time = time.monotonic()
+        # PR 3: delegate to the runtime production state machine first.
+        # The delegate returns True when it fully handled the command
+        # (e.g. cmd=3 in auto mode always goes through the state machine;
+        # cmd=0 only when state=RUNNING; cmd=1 only when state is
+        # HOLDING_HOOK/PAUSED/ERROR/MANUAL_OFFLINE). Returning False
+        # falls through to the controller's default dispatch below.
+        delegate = self._modbus_command_delegate
+        if delegate is not None:
+            try:
+                handled = bool(delegate(cmd, mode, hook_type))
+            except Exception:
+                logger.exception("modbus command delegate raised; falling through to default handling")
+                handled = False
+            if handled:
+                return
         if self._runtime_recovery_required:
             if cmd == CMD_STOP:
                 self._modbus_stop_immediate(mode=mode)
@@ -2706,7 +2778,7 @@ class DobotController:
             logger.info("手动模式下忽略Modbus命令: cmd=%d", cmd)
             return
         if cmd == CMD_HOOK:
-            self._modbus_run_edited_program(mode=mode)
+            self._modbus_run_edited_program(mode=mode, hook_type=hook_type)
             return
         if not self.is_connected:
             logger.info("机械臂未连接，仅记录命令不执行: cmd=%d, mode=%d", cmd, mode)
@@ -2835,7 +2907,7 @@ class DobotController:
 
         return cleanup_ok
 
-    def _modbus_run_edited_program(self, mode=MODE_AUTO):
+    def _modbus_run_edited_program(self, mode=MODE_AUTO, hook_type=HOOK_TYPE_LOW):
         with self._modbus_exec_lock:
             modbus_motion_busy = self._modbus_exec_thread is not None and self._modbus_exec_thread.is_alive()
         if modbus_motion_busy:
@@ -2865,7 +2937,7 @@ class DobotController:
         self._modbus_hook_status = 1
         self._write_modbus_status(STATUS_RUNNING, mode=mode)
         if not self._modbus_dispatch_motion(
-            lambda: self._prepare_and_start_modbus_program(runner, mode),
+            lambda: self._prepare_and_start_modbus_program(runner, mode, hook_type),
             "执行流程准备",
         ):
             self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
@@ -2884,7 +2956,7 @@ class DobotController:
         message = str(getattr(result, "message", "设备未就绪"))
         return ready, message
 
-    def _prepare_and_start_modbus_program(self, runner, mode):
+    def _prepare_and_start_modbus_program(self, runner, mode, hook_type=HOOK_TYPE_LOW):
         if not self.ensure_robot_ready_for_motion(auto_enable=True):
             message = self.last_error or "机器人未就绪"
             logger.error("Modbus流程后台准备失败: %s", message)
@@ -2905,7 +2977,7 @@ class DobotController:
             return
 
         try:
-            accepted = bool(runner())
+            accepted = bool(self._invoke_program_runner(runner, hook_type))
         except Exception as e:
             logger.error("Modbus执行流程runner异常: %s", e)
             self.record_alarm("Modbus执行流程", "RUNNER_EXCEPTION", "故障", "运动编辑流程runner异常", raw=e)
@@ -2917,6 +2989,22 @@ class DobotController:
             self.record_alarm("Modbus执行流程", "REJECTED", "故障", "运动编辑流程请求被拒绝")
             self._write_modbus_status(STATUS_HOOK_ERR, mode=mode)
             return
+
+    @staticmethod
+    def _invoke_program_runner(runner, hook_type):
+        """调用运动编辑流程 runner，当 runner 签名接受 hook_type 时转发钩子类型。
+
+        PR 1 协议层：仅转发 hook_type，不在此决定 low_hook/high_hook flow_id。
+        旧版 runner（无 hook_type 参数）保持无参调用以维持向后兼容。
+        """
+        try:
+            sig = inspect.signature(runner)
+        except (TypeError, ValueError):
+            return runner()
+        for param in sig.parameters.values():
+            if param.name == "hook_type" or param.kind == inspect.Parameter.VAR_KEYWORD:
+                return runner(hook_type=hook_type)
+        return runner()
 
     def _modbus_move_initial(self):
         """Move to initial_point for external 40001=1 reset command, then report 40001=2."""

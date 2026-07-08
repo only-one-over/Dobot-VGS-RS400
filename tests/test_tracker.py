@@ -134,7 +134,7 @@ def test_smoothed_position_keeps_model_score_as_confidence():
     assert result["confidence"] == 0.87
     assert result["detection_score"] == 0.87
     assert result["tracking_confidence"] < 0.01
-    assert result["source"] == "kalman_smoothed"
+    assert result["source"] == "smoothed"
 
 
 def _minimal_vision():

@@ -127,7 +127,7 @@ def test_modbus_wire_address_zero_hook_triggers_command_with_mode():
     modbus_server, _ = _real_modules()
     calls = []
     server = modbus_server.DobotModbusServer(
-        on_command_callback=lambda cmd, mode=0: calls.append((cmd, mode))
+        on_command_callback=lambda cmd, mode=0, hook_type=0: calls.append((cmd, mode))
     )
 
     asyncio.run(
@@ -148,7 +148,7 @@ def test_modbus_display_address_hook_is_still_accepted():
     modbus_server, _ = _real_modules()
     calls = []
     server = modbus_server.DobotModbusServer(
-        on_command_callback=lambda cmd, mode=0: calls.append((cmd, mode))
+        on_command_callback=lambda cmd, mode=0, hook_type=0: calls.append((cmd, mode))
     )
 
     asyncio.run(
@@ -169,7 +169,7 @@ def test_modbus_wire_address_zero_reset_triggers_command_with_mode():
     modbus_server, _ = _real_modules()
     calls = []
     server = modbus_server.DobotModbusServer(
-        on_command_callback=lambda cmd, mode=0: calls.append((cmd, mode))
+        on_command_callback=lambda cmd, mode=0, hook_type=0: calls.append((cmd, mode))
     )
 
     asyncio.run(
@@ -190,7 +190,7 @@ def test_modbus_wire_address_zero_status_2_does_not_trigger_command():
     modbus_server, _ = _real_modules()
     calls = []
     server = modbus_server.DobotModbusServer(
-        on_command_callback=lambda cmd, mode=0: calls.append((cmd, mode))
+        on_command_callback=lambda cmd, mode=0, hook_type=0: calls.append((cmd, mode))
     )
 
     asyncio.run(
@@ -211,7 +211,7 @@ def test_internal_status_write_2_does_not_trigger_initial_command():
     modbus_server, _ = _real_modules()
     calls = []
     server = modbus_server.DobotModbusServer(
-        on_command_callback=lambda cmd, mode=0: calls.append((cmd, mode))
+        on_command_callback=lambda cmd, mode=0, hook_type=0: calls.append((cmd, mode))
     )
     server._mark_internal_status_write(0, [modbus_server.STATUS_STANDBY, modbus_server.MODE_AUTO])
 
@@ -233,7 +233,7 @@ def test_internal_status_write_0_does_not_trigger_stop_command():
     modbus_server, _ = _real_modules()
     calls = []
     server = modbus_server.DobotModbusServer(
-        on_command_callback=lambda cmd, mode=0: calls.append((cmd, mode))
+        on_command_callback=lambda cmd, mode=0, hook_type=0: calls.append((cmd, mode))
     )
     server._mark_internal_status_write(0, [modbus_server.STATUS_IDLE, modbus_server.MODE_AUTO])
 

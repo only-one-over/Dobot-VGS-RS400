@@ -40,7 +40,15 @@ from ..config.config_manager import (
 )
 from ..flow.flow_library import FlowLibrary, required_camera_types
 from ..flow.flow_readiness import FlowReadinessResult, check_flow_readiness
-from ..communication.modbus_server import STATUS_HOOK_ERR, STATUS_ROBOT_ERR
+from ..communication.modbus_server import (
+    CMD_HOOK,
+    CMD_RESET,
+    CMD_STOP,
+    MODE_AUTO,
+    MODE_MANUAL,
+    STATUS_HOOK_ERR,
+    STATUS_ROBOT_ERR,
+)
 from ..robot.robot_controller import DobotController
 from ..runtime.runtime_resilience import (
     RuntimeState,
@@ -62,6 +70,20 @@ from ..runtime.runtime_publication import (
     PublicationError,
     RuntimePublicationStore,
 )
+from ..runtime.runtime_contract import (
+    COMMAND_SPECS,
+    validate_payload,
+)
+from ..runtime.production_state import (
+    ERROR_STATES,
+    MODBUS_STATUS_MAP,
+    ProductionState,
+)
+from ..flow.flow_result import FlowResult
+from ..runtime.production_context import ProductionTaskContext
+from ..runtime.production_flow_router import ProductionFlowRouter
+from ..runtime.recovery_policy import RecoveryPolicy
+from ..runtime.reset_strategy import ResetStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +198,10 @@ class RobotConnectionSupervisor:
     _connect_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _connect_generation: int = field(default=0, init=False, repr=False)
     _shutting_down: bool = field(default=False, init=False, repr=False)
+    # PR 3: when True, the supervisor skips request_connect in step() so
+    # the runtime honours PLC 40002=1 (manual offline). Cleared by the
+    # runtime agent when 40002=0 + 40001=1 triggers re-online.
+    manual_offline: bool = False
 
     def _set_state(self, state: str) -> None:
         if self.state != state:
@@ -285,6 +311,11 @@ class RobotConnectionSupervisor:
     def step(self, now: Optional[float] = None) -> str:
         now = time.time() if now is None else now
         try:
+            # PR 3: honour manual offline — do not attempt reconnection
+            # while the PLC has signalled 40002=1. The runtime agent
+            # clears this flag when 40002=0 + 40001=1 re-online fires.
+            if self.manual_offline and not self.controller.is_connected:
+                return self.state
             if not self.controller.is_connected:
                 return self.request_connect(now)
 
@@ -369,6 +400,11 @@ class RuntimeProgramRunner:
         self.task_mode: Optional[str] = None
         self.last_task_result: Optional[bool] = None
         self.last_task_error = ""
+        # PR 3: optional callback invoked from _run_once's finally block
+        # after a production task finishes (success or failure). The
+        # runtime agent uses this to transition into HOLDING_HOOK on
+        # success or FLOW_ERROR on failure. Signature: (success: bool) -> None.
+        self.on_production_finished = None
 
     def __call__(self) -> bool:
         request = self.build_request(mode="production")
@@ -415,6 +451,17 @@ class RuntimeProgramRunner:
             config=config,
             revision=revision,
         )
+
+    def build_production_request(self, flow_id: str) -> RuntimeExecutionRequest:
+        """Build a production-mode execution request for ``flow_id``.
+
+        PR 3 Task 5: thin wrapper over :meth:`build_request` that fixes
+        ``mode="production"`` so callers (production state machine) don't
+        have to repeat the mode literal. ``task_mode`` is set to
+        ``"production"`` by :meth:`start_request` based on
+        ``request.mode``, which already coexists with ``"debug"``.
+        """
+        return self.build_request(mode="production", flow_id=flow_id)
 
     def start_request(self, request: RuntimeExecutionRequest) -> bool:
         with self._lock:
@@ -671,12 +718,13 @@ class RuntimeProgramRunner:
             "检查阻塞模块和设备通信，执行复位后再启动",
         )
 
-    def _run_once(self, request: RuntimeExecutionRequest | None = None) -> None:
+    def _run_once(self, request: RuntimeExecutionRequest | None = None) -> Optional[FlowResult]:
         success = False
         failure_status = STATUS_HOOK_ERR
         task_mode = request.mode if request is not None else "production"
         flow_worker = None
         flow = None
+        primary_result: Optional[FlowResult] = None
         try:
             from ..flow.flow_executor import FlowExecutor, validate_grasp_flow_modules
 
@@ -740,7 +788,7 @@ class RuntimeProgramRunner:
                 last_error="",
             )
 
-            finished: list[bool] = []
+            finished: list[FlowResult] = []
             self.controller._user_index = int(config_snapshot.get("user_index", 0))
             self.controller._tool_index = int(config_snapshot.get("tool_index", 0))
             self._pause_ref = [False]
@@ -753,7 +801,10 @@ class RuntimeProgramRunner:
             )
             self._active_flow = flow
             flow.on_log = lambda msg: logger.info("runtime flow: %s", msg)
-            flow.on_finished = lambda ok: finished.append(bool(ok))
+            # PR 4: on_finished now receives a FlowResult; capture the
+            # whole object so the production state machine can classify
+            # the failure (vision_process / robot / camera / flow).
+            flow.on_finished = lambda result: finished.append(result)
             module_deadline = [time.monotonic() + module_timeout_seconds(modules[0])] if modules else [float("inf")]
 
             def on_progress(current, total, name):
@@ -812,14 +863,40 @@ class RuntimeProgramRunner:
                     self.orphaned_flow = True
                     logger.critical("timed-out flow thread did not exit after stop request")
                 self._transition(RuntimeState.DEGRADED, last_error=timeout_reason)
-                return
+                # PR 4: synthesise a non-recoverable FlowResult so the
+                # production callback can still classify a timeout.
+                primary_result = FlowResult.failure(
+                    code="FLOW_TIMEOUT",
+                    message=timeout_reason,
+                    failure_kind="flow",
+                    recoverable=False,
+                )
+                return primary_result
 
-            success = bool(finished[-1]) if finished else False
+            primary_result = finished[-1] if finished else None
+            if primary_result is None:
+                # Flow ended without invoking on_finished (e.g. validation
+                # short-circuit). Treat as non-recoverable flow failure.
+                primary_result = FlowResult.failure(
+                    code="NO_RESULT",
+                    message="flow ended without invoking on_finished",
+                    failure_kind="flow",
+                    recoverable=False,
+                )
+            success = bool(primary_result.success)
             self.last_task_result = success
         except Exception as e:
             self.last_task_error = str(e)
             logger.exception("runtime flow runner failed")
             self.controller.record_alarm("Runtime流程", "EXCEPTION", "故障", "后台流程执行异常", raw=e)
+            # PR 4: synthesise a non-recoverable FlowResult for exceptions
+            # raised by the runner itself (not by the flow's modules).
+            primary_result = FlowResult.failure(
+                code="RUNNER_EXCEPTION",
+                message=str(e),
+                failure_kind="flow",
+                recoverable=False,
+            )
         finally:
             self._active_flow = None
             self._pause_ref = None
@@ -856,6 +933,90 @@ class RuntimeProgramRunner:
                     success,
                     failure_status=failure_status,
                 )
+            # PR 3 / PR 4: notify the production state machine of task
+            # completion. The callback receives the structured FlowResult
+            # so it can classify the failure (vision_process / robot /
+            # camera / flow) and decide whether to dispatch the
+            # error-recovery hook.
+            if task_mode == "production":
+                callback = self.on_production_finished
+                if callback is not None:
+                    # If the runner returned early (validation / readiness
+                    # failure) without synthesising a FlowResult, build a
+                    # generic non-recoverable one here so the callback
+                    # always receives a well-formed result.
+                    result_to_dispatch = primary_result
+                    if result_to_dispatch is None:
+                        result_to_dispatch = FlowResult.failure(
+                            code="RUNNER_EARLY_RETURN",
+                            message=self.last_task_error or "flow runner returned early",
+                            failure_kind="flow",
+                            recoverable=False,
+                        )
+                    try:
+                        callback(result_to_dispatch)
+                    except Exception:
+                        logger.exception("on_production_finished callback raised")
+        return primary_result
+
+    def run_recovery_sync(self, request: RuntimeExecutionRequest) -> FlowResult:
+        """PR 4 Task 6 — run a recovery flow synchronously (no new thread).
+
+        Executes the recovery flow's modules in the CURRENT thread,
+        returning the structured :class:`FlowResult`. This is the
+        serial-execution path used by the production state machine's
+        ``ERROR_RECOVERY`` state.
+
+        Deliberately does NOT:
+          * dispatch :attr:`on_production_finished` (anti-recursion);
+          * call ``mark_modbus_program_finished`` (preserve original
+            error code on 40001);
+          * transition ``RuntimeState`` (caller owns state).
+        """
+        from ..flow.flow_executor import FlowExecutor, validate_grasp_flow_modules
+
+        config_snapshot = request.config
+        modules = request.modules
+        errors = validate_grasp_flow_modules(modules)
+        if errors:
+            message = "; ".join(errors)
+            logger.error("recovery flow validation failed: %s", message)
+            self.controller.record_alarm(
+                "Recovery流程", "VALIDATION_FAILED", "故障", message
+            )
+            return FlowResult.failure(
+                code="RECOVERY_VALIDATION_FAILED",
+                message=message,
+                failure_kind="flow",
+                recoverable=False,
+            )
+
+        self._pause_ref = [False]
+        flow = FlowExecutor(
+            self.controller,
+            self.vision_d435i,
+            self.vision_d405,
+            modules,
+            self._pause_ref,
+        )
+        self._active_flow = flow
+        flow.on_log = lambda msg: logger.info("recovery flow: %s", msg)
+        # on_finished is left unset — flow.run() returns the FlowResult
+        # directly and we do not want to re-enter the production callback.
+        try:
+            with use_config_snapshot(config_snapshot):
+                return flow.run()
+        except Exception as e:
+            logger.exception("recovery flow runner raised")
+            return FlowResult.failure(
+                code="RECOVERY_EXCEPTION",
+                message=str(e),
+                failure_kind="flow",
+                recoverable=False,
+            )
+        finally:
+            self._active_flow = None
+            self._pause_ref = None
 
 
 class DobotRuntimeAgent:
@@ -987,6 +1148,68 @@ class DobotRuntimeAgent:
             auth_token=self.ipc_auth_token,
             stop_port=self.ipc_stop_port,
         )
+        # PR-C Task 2: alarm_history alias for the controller's instance so
+        # ``_ipc_clear_alarm_history`` can clear the same backing file the
+        # controller writes to via ``record_alarm``. Defensive: some test
+        # stubs don't expose ``alarm_history``.
+        self.alarm_history = getattr(self.controller, "alarm_history", None)
+        # PR-C Task 6: handlers dict is an instance attribute so
+        # ``_ipc_get_status`` can advertise ``capabilities``.
+        self._handlers: dict[str, Any] = self._build_ipc_handlers()
+        # PR 3: production state machine. ``flow_router`` is built from
+        # the published flow_library's ``flow_roles`` mapping (PR 2);
+        # ``reset_strategy`` is stateless and shared. ``production_state``
+        # starts at IDLE and is advanced through STANDBY → RUNNING →
+        # HOLDING_HOOK → RESETTING → STANDBY by Modbus commands.
+        self.production_state: ProductionState = ProductionState.IDLE
+        self.production_task: Optional[ProductionTaskContext] = None
+        self.manual_offline: bool = False
+        self.reset_strategy: ResetStrategy = ResetStrategy()
+        # PR 4: recovery policy decides whether the error-recovery hook
+        # may run after a primary flow failure. Stateless and shared.
+        self.recovery_policy: RecoveryPolicy = RecoveryPolicy()
+        try:
+            _publication_for_roles = self.publication_store.snapshot()
+            _library_for_roles = FlowLibrary(
+                _publication_for_roles["flow_library"],
+                path="published-flow.json",
+            )
+            self.flow_router: ProductionFlowRouter = ProductionFlowRouter(
+                _library_for_roles.flow_roles
+            )
+        except Exception:
+            logger.exception("failed to build ProductionFlowRouter from publication; using empty roles")
+            self.flow_router = ProductionFlowRouter({})
+        # Wire the program_runner's production-finished callback so the
+        # state machine learns when a production task completes.
+        self.program_runner.on_production_finished = self._on_production_flow_finished
+        # Register the modbus command delegate + mode-changed callback so
+        # the state machine owns 40001=0/1/3 and 40002 0↔1 transitions.
+        # Defensive: the controller may be a test stub that doesn't
+        # expose ``set_modbus_program_runner`` / ``set_modbus_mode_changed_callback``.
+        try:
+            self.controller.set_modbus_program_runner(
+                self._run_program_from_modbus,
+                readiness_checker=self._modbus_main_flow_readiness,
+                command_delegate=self._on_modbus_command_delegate,
+            )
+        except TypeError:
+            # Older signature without command_delegate — fall back to
+            # the legacy two-arg form so non-PR-3 tests still work.
+            self.controller.set_modbus_program_runner(
+                self._run_program_from_modbus,
+                readiness_checker=self._modbus_main_flow_readiness,
+            )
+        if hasattr(self.controller, "set_modbus_mode_changed_callback"):
+            self.controller.set_modbus_mode_changed_callback(self._on_mode_changed)
+        # PR 5 Task 4: register the 40004 (hook_type) change callback so
+        # the runtime emits a diagnostic log whenever the PLC changes
+        # 40004, even when no production task is running. Defensive: the
+        # controller may be a test stub that doesn't expose the setter.
+        if hasattr(self.controller, "set_modbus_hook_type_changed_callback"):
+            self.controller.set_modbus_hook_type_changed_callback(
+                self._on_hook_type_changed
+            )
 
     def _refresh_startup_requirements(self, force=False) -> None:
         publication = self.publication_store.snapshot()
@@ -1110,7 +1333,28 @@ class DobotRuntimeAgent:
         command: str,
         data: dict[str, Any],
     ) -> dict[str, Any]:
-        handlers = {
+        handler = self._handlers.get(command)
+        if handler is None:
+            raise IpcCommandError(
+                "UNKNOWN_COMMAND",
+                f"不支持的命令: {command}",
+            )
+        # PR-C Task 1: validate payload against COMMAND_SPECS before dispatch.
+        ok, reason = validate_payload(command, data)
+        if not ok:
+            raise IpcCommandError(
+                "INVALID_CONFIG",
+                f"{command}: {reason}",
+            )
+        return handler(data)
+
+    def _build_ipc_handlers(self) -> dict[str, Any]:
+        """Build the canonical command → handler mapping.
+
+        Stored as ``self._handlers`` so :meth:`_ipc_get_status` can expose
+        the supported command list as ``capabilities`` (PR-C Task 6).
+        """
+        return {
             "ping": self._ipc_ping,
             "get_status": self._ipc_get_status,
             "enter_maintenance": self._ipc_enter_maintenance,
@@ -1122,6 +1366,7 @@ class DobotRuntimeAgent:
             "get_current_pose": self._ipc_get_current_pose,
             "get_runtime_logs": self._ipc_get_runtime_logs,
             "start_debug_flow": self._ipc_start_debug_flow,
+            "start_production_flow": self._ipc_start_production_flow,
             "run_step": self._ipc_run_step,
             "move_to_point": self._ipc_move_to_point,
             "pause_debug_flow": self._ipc_pause_debug_flow,
@@ -1135,14 +1380,18 @@ class DobotRuntimeAgent:
             "get_visual_servo_telemetry": self._ipc_get_visual_servo_telemetry,
             "stop_current_task": self._ipc_stop_current_task,
             "safe_stop": self._ipc_safe_stop,
+            # PR-C Task 2: hardware-facing handlers.
+            "enable_robot": self._ipc_enable_robot,
+            "disable_robot": self._ipc_disable_robot,
+            "clear_alarms": self._ipc_clear_alarms,
+            "connect_robot": self._ipc_connect_robot,
+            "set_collision_level": self._ipc_set_collision_level,
+            "connect_camera": self._ipc_connect_camera,
+            "disconnect_camera": self._ipc_disconnect_camera,
+            "start_modbus": self._ipc_start_modbus,
+            "stop_modbus": self._ipc_stop_modbus,
+            "clear_alarm_history": self._ipc_clear_alarm_history,
         }
-        handler = handlers.get(command)
-        if handler is None:
-            raise IpcCommandError(
-                "UNKNOWN_COMMAND",
-                f"不支持的命令: {command}",
-            )
-        return handler(data)
 
     def _ipc_ping(self, _data=None) -> dict[str, Any]:
         return {
@@ -1183,6 +1432,9 @@ class DobotRuntimeAgent:
             "publication": self.publication_store.status(),
             "current_task_revision": flow.get("current_revision"),
             "next_task_revision": self.publication_store.status()["revision"],
+            # PR-C Task 6: advertise supported commands so the GUI can
+            # gray out buttons whose command isn't available.
+            "capabilities": list(self._handlers.keys()),
         }
 
     def _ipc_enter_maintenance(self, _data=None) -> dict[str, Any]:
@@ -1422,6 +1674,12 @@ class DobotRuntimeAgent:
         }
 
     def _ipc_start_debug_flow(self, data=None) -> dict[str, Any]:
+        # PR-C Task 5.4: reject debug flow while a production task is running.
+        if self.program_runner.task_mode == "production":
+            raise IpcCommandError(
+                "RUNTIME_BUSY",
+                "生产流程运行中，无法启动调试流程",
+            )
         data = data or {}
         try:
             request = self.program_runner.build_request(
@@ -1683,6 +1941,142 @@ class DobotRuntimeAgent:
             "error": error_msg,
         }
 
+    # -- PR-C Task 2: hardware-facing IPC handlers -------------------------
+
+    def _ipc_enable_robot(self, _data=None) -> dict[str, Any]:
+        self.controller.enable_robot()
+        return {"enabled": True}
+
+    def _ipc_disable_robot(self, _data=None) -> dict[str, Any]:
+        self.controller.disable_robot()
+        return {"enabled": False}
+
+    def _ipc_clear_alarms(self, _data=None) -> dict[str, Any]:
+        self.controller.clear_error()
+        return {"cleared": True}
+
+    def _ipc_connect_robot(self, data=None) -> dict[str, Any]:
+        data = data or {}
+        ip = str(data.get("ip", "")).strip()
+        if ip and hasattr(self.controller, "set_robot_ip"):
+            self.controller.set_robot_ip(ip)
+        connected = bool(self.controller.connect())
+        if not connected:
+            raise IpcCommandError(
+                "ROBOT_NOT_CONNECTED",
+                self.controller.last_error or "connect failed",
+            )
+        return {"connected": True}
+
+    def _ipc_set_collision_level(self, data=None) -> dict[str, Any]:
+        data = data or {}
+        level = int(data.get("level"))
+        self.controller.set_collision_level(level)
+        return {"level": level}
+
+    def _ipc_connect_camera(self, data=None) -> dict[str, Any]:
+        data = data or {}
+        camera_type = str(data.get("camera_type", "")).strip()
+        if camera_type not in ("D435i", "D405"):
+            raise IpcCommandError(
+                "INVALID_CONFIG",
+                f"Unsupported camera type: {camera_type}",
+            )
+        # ``_ensure_camera`` is the canonical path used by the program runner
+        # and startup supervisor; reuse it so the camera is registered in
+        # ``program_runner.vision_d435i`` / ``vision_d405``.
+        if not self.program_runner._ensure_camera(camera_type):
+            raise IpcCommandError(
+                "CAMERA_NOT_READY",
+                f"{camera_type} camera connection failed",
+            )
+        return {"connected": True, "camera_type": camera_type}
+
+    def _ipc_disconnect_camera(self, data=None) -> dict[str, Any]:
+        data = data or {}
+        camera_type = str(data.get("camera_type", "")).strip()
+        if camera_type not in ("D435i", "D405"):
+            raise IpcCommandError(
+                "INVALID_CONFIG",
+                f"Unsupported camera type: {camera_type}",
+            )
+        attr = "vision_d405" if camera_type == "D405" else "vision_d435i"
+        lock = self.program_runner._camera_locks[camera_type]
+        with lock:
+            vision = getattr(self.program_runner, attr)
+            if vision is not None:
+                try:
+                    vision.close()
+                except Exception:
+                    logger.exception("runtime failed to close %s camera", camera_type)
+                setattr(self.program_runner, attr, None)
+        return {"disconnected": True, "camera_type": camera_type}
+
+    def _ipc_start_modbus(self, _data=None) -> dict[str, Any]:
+        ok = bool(
+            self.controller.start_modbus(
+                port=self.modbus_port,
+                slave_id=self.modbus_slave_id,
+            )
+        )
+        if not ok:
+            raise IpcCommandError(
+                "INTERNAL_ERROR",
+                "Modbus server start failed",
+            )
+        return {"running": True}
+
+    def _ipc_stop_modbus(self, _data=None) -> dict[str, Any]:
+        try:
+            self.controller.stop_modbus()
+        except Exception as exc:
+            raise IpcCommandError("INTERNAL_ERROR", str(exc)) from exc
+        return {"running": False}
+
+    def _ipc_clear_alarm_history(self, _data=None) -> dict[str, Any]:
+        if self.alarm_history is not None:
+            self.alarm_history.clear()
+        return {"cleared": True}
+
+    # -- PR-C Task 5: Production flow handler ------------------------------
+
+    def _start_production_request(self, request: RuntimeExecutionRequest) -> dict[str, Any]:
+        """Start a production flow request with mutual-exclusion guard.
+
+        Mirrors :meth:`_start_debug_request` but skips the maintenance-mode
+        requirement (production is triggered by Modbus / IPC, not debug UI).
+        """
+        if self.program_runner.task_mode == "debug":
+            raise IpcCommandError(
+                "RUNTIME_BUSY",
+                "调试流程运行中，无法启动生产流程",
+            )
+        if not self.program_runner.start_request(request):
+            raise IpcCommandError(
+                "TASK_ALREADY_RUNNING",
+                "Another Runtime task is already running",
+            )
+        return {
+            "accepted": True,
+            "task_id": request.task_id,
+            "flow_id": request.flow_id,
+            "flow_name": request.flow_name,
+            "revision": request.revision,
+        }
+
+    def _ipc_start_production_flow(self, data=None) -> dict[str, Any]:
+        data = data or {}
+        try:
+            request = self.program_runner.build_request(
+                mode="production",
+                flow_id=data.get("flow_id"),
+            )
+        except KeyError as exc:
+            raise IpcCommandError("FLOW_NOT_FOUND", str(exc)) from exc
+        except ValueError as exc:
+            raise IpcCommandError("INVALID_CONFIG", str(exc)) from exc
+        return self._start_production_request(request)
+
     def _modbus_main_flow_readiness(self):
         with self._maintenance_lock:
             if self.maintenance_mode:
@@ -1702,11 +2096,600 @@ class DobotRuntimeAgent:
         return bool(modbus_thread is not None and modbus_thread.is_alive())
 
     def _run_program_from_modbus(self) -> bool:
+        """Modbus 40001=3 production trigger.
+
+        PR-C Task 5.3: routes through the production-flow path so the
+        debug/production mutual-exclusion guard applies uniformly. Returns
+        ``True`` when a production task was accepted, ``False`` otherwise.
+
+        PR 3: retained as a backward-compat entry point. The state machine
+        now routes cmd=3 through :meth:`_handle_hook_command` via the
+        command delegate; this method is only reached when no delegate is
+        registered (e.g. legacy tests).
+        """
         with self._maintenance_lock:
             if self.maintenance_mode:
                 logger.warning("维护模式下拒绝Modbus生产流程")
                 return False
-        return self.program_runner()
+        # PR-C Task 5: reject when a debug flow owns the runner.
+        if self.program_runner.task_mode == "debug":
+            logger.warning("调试流程运行中，拒绝Modbus生产流程")
+            return False
+        try:
+            request = self.program_runner.build_request(mode="production")
+        except Exception:
+            logger.exception("Modbus production build_request failed")
+            return False
+        return self.program_runner.start_request(request)
+
+    # ------------------------------------------------------------------
+    # PR 3 — Production state machine
+    # ------------------------------------------------------------------
+
+    def _set_production_state(
+        self,
+        new_state: ProductionState,
+        reason: str = "",
+    ) -> None:
+        """Transition the production state machine to ``new_state``.
+
+        Logs the transition and writes the PLC-facing 40001 status code
+        (via :data:`MODBUS_STATUS_MAP`) when the new state has a mapping.
+        States without a mapping (``MANUAL_OFFLINE`` / ``RESETTING`` /
+        ``ERROR_RECOVERY``) skip the 40001 write — the caller is
+        responsible for any PLC signal in those transitions.
+
+        PR 5 Task 3: emits a structured transition log that includes the
+        ``task_id`` (when a task is active) so operators can correlate
+        state changes with production tasks in the log stream.
+        """
+        old_state = self.production_state
+        if old_state == new_state:
+            return
+        task = self.production_task
+        task_id = task.task_id if task is not None else None
+        logger.info(
+            "ProductionState transition: %s → %s (reason=%s, task_id=%s)",
+            old_state.value,
+            new_state.value,
+            reason or "",
+            task_id,
+        )
+        self.production_state = new_state
+        if task is not None:
+            task.state = new_state.value
+        status_code = MODBUS_STATUS_MAP.get(new_state)
+        if status_code is not None:
+            try:
+                self.controller._write_modbus_status(status_code, mode=MODE_AUTO)
+            except Exception:
+                logger.exception("failed to write 40001 for new production state")
+
+    def _write_production_40001(self, value: int) -> None:
+        """Force-write a specific value to 40001 (e.g. 4 for RUNNING)."""
+        try:
+            self.controller._write_modbus_status(value, mode=MODE_AUTO)
+        except Exception:
+            logger.exception("failed to write 40001=%d", value)
+
+    # ------------------------------------------------------------------
+    # PR 5 Task 4 — PLC diagnostic logging
+    # ------------------------------------------------------------------
+
+    # 40001 command value → human-readable name for diagnostic logs.
+    _CMD_NAME_MAP: dict[int, str] = {
+        0: "pause",
+        1: "reset",
+        2: "standby",
+        3: "start_hook",
+        4: "running",
+        5: "holding_hook",
+        110: "flow_error",
+        111: "robot_error",
+        112: "camera_error",
+    }
+
+    # 40002 mode value → human-readable name for diagnostic logs.
+    _MODE_NAME_MAP: dict[int, str] = {0: "auto", 1: "manual"}
+
+    # 40004 hook_type value → human-readable name for diagnostic logs.
+    _HOOK_TYPE_NAME_MAP: dict[int, str] = {0: "low_hook", 1: "high_hook"}
+
+    def _log_plc_diagnostic_40001(
+        self, cmd: int, mode: int, hook_type: int
+    ) -> None:
+        """PR 5 Task 4 — emit a diagnostic log for a 40001 command write.
+
+        Format::
+
+            PLC diagnostic: 40001={cmd} (cmd={cmd_name}, mode={mode_name},
+            hook_type={hook_type_name}, task_id={task_id})
+        """
+        task = self.production_task
+        task_id = task.task_id if task is not None else None
+        logger.info(
+            "PLC diagnostic: 40001=%d (cmd=%s, mode=%s, hook_type=%s, task_id=%s)",
+            int(cmd),
+            self._CMD_NAME_MAP.get(int(cmd), str(cmd)),
+            self._MODE_NAME_MAP.get(int(mode), str(mode)),
+            self._HOOK_TYPE_NAME_MAP.get(int(hook_type), str(hook_type)),
+            task_id,
+        )
+
+    def _on_mode_changed(self, old_mode: int, new_mode: int) -> None:
+        """40002 mode-change handler (PR 3 Task 10 + Task 11).
+
+        * 0 → 1: manual offline — terminate flow, stop, close robot,
+          set ``manual_offline=True``, transition to MANUAL_OFFLINE.
+        * 1 → 0: re-online is deferred until 40001=1 arrives (handled
+          in :meth:`_handle_reset_command`).
+
+        PR 5 Task 4: emits a PLC diagnostic log for every 40002 change.
+        """
+        logger.info(
+            "PLC diagnostic: 40002 mode %s → %s (old=%s, new=%s, task_id=%s)",
+            self._MODE_NAME_MAP.get(int(old_mode), str(old_mode)),
+            self._MODE_NAME_MAP.get(int(new_mode), str(new_mode)),
+            int(old_mode),
+            int(new_mode),
+            self.production_task.task_id if self.production_task else None,
+        )
+        if old_mode == MODE_AUTO and new_mode == MODE_MANUAL:
+            self._enter_manual_offline()
+        elif old_mode == MODE_MANUAL and new_mode == MODE_AUTO:
+            logger.info(
+                "40002 1→0：等待 40001=1 触发重新上线 (state=%s)",
+                self.production_state.value,
+            )
+
+    def _on_hook_type_changed(self, old_hook: int, new_hook: int) -> None:
+        """PR 5 Task 4 — 40004 (hook_type) change diagnostic handler.
+
+        Invoked by the Modbus server whenever 40004 changes, regardless
+        of whether a production task is running. The running task's
+        ``hook_type`` is NOT modified here (per PR 3 latching rule);
+        the log simply records the PLC-side change for diagnostics.
+        """
+        task = self.production_task
+        task_id = task.task_id if task is not None else None
+        latched = int(task.hook_type) if task is not None else None
+        logger.info(
+            "PLC diagnostic: 40004 hook_type %s → %s (old=%d, new=%d, "
+            "task_id=%s, latched_hook_type=%s)",
+            self._HOOK_TYPE_NAME_MAP.get(int(old_hook), str(old_hook)),
+            self._HOOK_TYPE_NAME_MAP.get(int(new_hook), str(new_hook)),
+            int(old_hook),
+            int(new_hook),
+            task_id,
+            latched,
+        )
+
+    def _on_modbus_command_delegate(
+        self,
+        cmd: int,
+        mode: int,
+        hook_type: int,
+    ) -> bool:
+        """PR 3 command delegate — owns 40001 dispatch in auto mode.
+
+        Returns ``True`` when the command was fully handled by the state
+        machine; ``False`` lets the controller's default dispatch run.
+
+        PR 5 Task 4: emits a PLC diagnostic log for every 40001 command
+        so operators can audit PLC ↔ runtime interactions.
+        """
+        # PR 5 Task 4: diagnostic log for 40001 commands.
+        self._log_plc_diagnostic_40001(cmd, mode, hook_type)
+        # Manual mode commands always fall through to the controller's
+        # default handling (which ignores them).
+        if mode != MODE_AUTO:
+            return False
+        # RESETTING is a transient state — reject all commands except
+        # 40001=0 (hard stop) which falls through to the controller.
+        if self.production_state == ProductionState.RESETTING:
+            if cmd == CMD_STOP:
+                return False  # let the controller stop immediately
+            logger.warning(
+                "RESETTING 状态下忽略 40001=%d（复位进行中）",
+                cmd,
+            )
+            return True
+        if cmd == CMD_HOOK:
+            self._handle_hook_command(hook_type)
+            return True
+        if cmd == CMD_STOP:
+            return self._handle_pause_command()
+        if cmd == CMD_RESET:
+            return self._handle_reset_command()
+        return False
+
+    def _handle_hook_command(self, hook_type: int) -> None:
+        """40001=3 dispatch — state-dependent hook command handling.
+
+        * PAUSED → resume current task
+        * RUNNING → ignore duplicate command (log only)
+        * HOLDING_HOOK → reject command (log only)
+        * STANDBY / IDLE → start a new task
+        * other states → reject command
+        """
+        state = self.production_state
+        if state == ProductionState.PAUSED:
+            self._resume_current_task()
+            return
+        if state == ProductionState.RUNNING:
+            logger.info("40001=3 收到但 state=RUNNING，忽略重复命令")
+            return
+        if state == ProductionState.HOLDING_HOOK:
+            logger.warning("40001=3 在 HOLDING_HOOK 状态下被拒绝（请先 40001=1 复位）")
+            return
+        if state in (ProductionState.STANDBY, ProductionState.IDLE):
+            self.start_new_task(hook_type)
+            return
+        logger.warning(
+            "40001=3 在 state=%s 下被拒绝",
+            state.value,
+        )
+
+    def start_new_task(self, hook_type: int) -> None:
+        """Create a ProductionTaskContext and start the primary flow.
+
+        PR 3 Task 6.4 + Task 7: ``hook_type`` is latched into the
+        :class:`ProductionTaskContext` at creation time. Mid-run 40004
+        changes do NOT modify the running task (see
+        :meth:`_on_modbus_command_delegate`).
+        """
+        with self._maintenance_lock:
+            if self.maintenance_mode:
+                logger.warning("维护模式下拒绝启动新生产任务")
+                return
+        if self.program_runner.task_mode == "debug":
+            logger.warning("调试流程运行中，拒绝启动新生产任务")
+            return
+        try:
+            primary_flow_id = self.flow_router.resolve_primary(hook_type)
+            recovery_flow_id = self.flow_router.resolve_recovery()
+        except ValueError as exc:
+            logger.error("无法解析生产流程: %s", exc)
+            self._set_production_state(
+                ProductionState.FLOW_ERROR,
+                reason=f"flow resolve failed: {exc}",
+            )
+            return
+        try:
+            request = self.program_runner.build_production_request(primary_flow_id)
+        except Exception:
+            logger.exception("build_production_request failed")
+            self._set_production_state(
+                ProductionState.FLOW_ERROR,
+                reason="build_production_request failed",
+            )
+            return
+        if not self.program_runner.start_request(request):
+            logger.warning("program_runner.start_request 拒绝了新任务")
+            return
+        # Task accepted — latch the context and advance state.
+        self.production_task = ProductionTaskContext.create(
+            hook_type=hook_type,
+            primary_flow_id=primary_flow_id,
+            recovery_flow_id=recovery_flow_id,
+            state=ProductionState.RUNNING.value,
+        )
+        self._set_production_state(
+            ProductionState.RUNNING,
+            reason=f"task_id={self.production_task.task_id} hook={hook_type}",
+        )
+
+    def _resume_current_task(self) -> None:
+        """40001=3 in PAUSED — resume the paused task (PR 3 Task 9)."""
+        task = self.production_task
+        if task is None:
+            logger.warning("40001=3 PAUSED 但无 production_task；回退到 STANDBY")
+            self._set_production_state(ProductionState.STANDBY)
+            return
+        # Resume the FlowExecutor + robot motion. ``program_runner.resume``
+        # returns False when there's no active flow (e.g. the flow exited
+        # while paused); we still advance state to RUNNING so the next
+        # 40001=0 can pause again.
+        try:
+            self.program_runner.resume()
+        except Exception:
+            logger.exception("program_runner.resume raised during PAUSED -> RUNNING")
+        try:
+            self.controller.continue_motion()
+        except Exception:
+            logger.exception("controller.continue_motion raised during PAUSED -> RUNNING")
+        # Do NOT create a new task_id; do NOT re-read 40004.
+        self._set_production_state(
+            ProductionState.RUNNING,
+            reason=f"resumed task_id={task.task_id}",
+        )
+
+    def _handle_pause_command(self) -> bool:
+        """40001=0 in auto mode — pause when RUNNING (PR 3 Task 8).
+
+        Returns ``True`` when the state machine handled the pause (state
+        was RUNNING); ``False`` to fall through to the controller's
+        default stop+clear-faults path (used when not in RUNNING state).
+        """
+        if self.production_state != ProductionState.RUNNING:
+            return False
+        task = self.production_task
+        # Pause the FlowExecutor (sets _pause_ref[0] = True) and the
+        # robot motion. Preserve ProductionTaskContext — do NOT clear
+        # it, do NOT stop_event.set().
+        try:
+            self.program_runner.pause()
+        except Exception:
+            logger.exception("program_runner.pause raised during RUNNING -> PAUSED")
+        try:
+            self.controller.pause()
+        except Exception:
+            logger.exception("controller.pause raised during RUNNING -> PAUSED")
+        if task is not None and self.program_runner.current_module_index is not None:
+            task.paused_at_step = int(self.program_runner.current_module_index)
+        self._set_production_state(
+            ProductionState.PAUSED,
+            reason=f"paused task_id={task.task_id}" if task else "paused",
+        )
+        return True
+
+    def _handle_reset_command(self) -> bool:
+        """40001=1 — state-aware reset via ResetStrategy (PR 3 Task 13).
+
+        Returns ``True`` when the state machine owns this reset (state is
+        HOLDING_HOOK / PAUSED / ERROR_STATES / MANUAL_OFFLINE); ``False``
+        to fall through to the controller's default ``_modbus_move_initial``
+        path (used for IDLE / STANDBY).
+        """
+        state = self.production_state
+        if state == ProductionState.MANUAL_OFFLINE:
+            # Re-online flow is triggered separately via 40002=0 + 40001=1.
+            # When we reach here, 40002 has already flipped back to 0; run
+            # the re-online sequence.
+            self._handle_reonline()
+            return True
+        if state not in (
+            ProductionState.HOLDING_HOOK,
+            ProductionState.PAUSED,
+            *ERROR_STATES,
+        ):
+            return False
+        # Enter RESETTING; prohibit other commands until reset completes.
+        self._set_production_state(
+            ProductionState.RESETTING,
+            reason=f"reset from {state.value}",
+        )
+        try:
+            success = self.reset_strategy.execute(
+                source_state=state,
+                controller=self.controller,
+                program_runner=self.program_runner,
+            )
+        except Exception:
+            logger.exception("ResetStrategy.execute raised")
+            success = False
+        if success:
+            self.production_task = None
+            self._set_production_state(
+                ProductionState.STANDBY,
+                reason="reset complete",
+            )
+            self._write_production_40001(2)  # STATUS_STANDBY
+        else:
+            self._set_production_state(
+                ProductionState.FLOW_ERROR,
+                reason="reset failed",
+            )
+            self._write_production_40001(110)  # STATUS_HOOK_ERR
+        return True
+
+    def _enter_manual_offline(self) -> None:
+        """PR 3 Task 10 — 40002 0→1 manual offline sequence."""
+        logger.warning("进入手动下线流程 (40002 0→1)")
+        # Terminate any active flow.
+        try:
+            self.program_runner.stop()
+        except Exception:
+            logger.exception("program_runner.stop failed during manual offline")
+        # Stop robot motion.
+        try:
+            if self.controller.dashboard is not None:
+                self.controller.dashboard.Stop()
+        except Exception:
+            logger.exception("dashboard.Stop failed during manual offline")
+        # Clear the production task context.
+        self.production_task = None
+        # Close the robot connection.
+        try:
+            self.controller.close_robot_transport()
+        except Exception:
+            logger.exception("close_robot_transport failed during manual offline")
+        # Disable supervisor reconnection.
+        self.manual_offline = True
+        self.supervisor.manual_offline = True
+        self._set_production_state(
+            ProductionState.MANUAL_OFFLINE,
+            reason="40002 0→1",
+        )
+
+    def _handle_reonline(self) -> None:
+        """PR 3 Task 11 — 40002=0 + 40001=1 re-online sequence."""
+        logger.info("重新上线流程 (MANUAL_OFFLINE + 40002=0 + 40001=1)")
+        self.manual_offline = False
+        self.supervisor.manual_offline = False
+        # Trigger an immediate reconnect attempt.
+        try:
+            self.supervisor.request_connect()
+        except Exception:
+            logger.exception("supervisor.request_connect failed during re-online")
+        # Once connected: ClearError + EnableRobot + ResetStrategy +
+        # standby + 40001=2. The reset strategy runs synchronously; if
+        # the robot isn't connected yet, the strategy's motion calls
+        # will fail gracefully and we transition to FLOW_ERROR.
+        if not self.controller.is_connected:
+            logger.warning(
+                "重新上线时机器人未连接；复位推迟到下次 supervisor 连接成功"
+            )
+            return
+        try:
+            self.reset_strategy.execute(
+                source_state=ProductionState.MANUAL_OFFLINE,
+                controller=self.controller,
+                program_runner=self.program_runner,
+            )
+        except Exception:
+            logger.exception("ResetStrategy.execute failed during re-online")
+        self._set_production_state(
+            ProductionState.STANDBY,
+            reason="re-online complete",
+        )
+        self._write_production_40001(2)  # STATUS_STANDBY
+
+    def _on_production_flow_finished(self, result: FlowResult) -> None:
+        """PR 3 / PR 4 — program_runner completion callback.
+
+        On success: transition to HOLDING_HOOK (40001=5).
+
+        On failure: classify by ``result.failure_kind`` and decide
+        whether the error-recovery hook may run:
+
+          * ``robot``         → ROBOT_ERROR (40001=111), never recover.
+          * ``camera``        → CAMERA_ERROR (40001=112), recover if
+                                 policy allows and recovery flow does
+                                 not need the failed camera.
+          * ``vision_process``/``flow``/``protocol``/other
+                              → FLOW_ERROR (40001=110), recover if
+                                 policy allows.
+
+        Recovery (when allowed) runs synchronously via
+        :meth:`RuntimeProgramRunner.run_recovery_sync` in the SAME
+        orchestration context — no new async Runner. Recovery success
+        does NOT clear the original error code: the final state is
+        still FLOW_ERROR (110) / CAMERA_ERROR (112).
+
+        Anti-recursion: if ``production_task.recovery_started`` is
+        already ``True``, recovery is skipped and the final error
+        state is entered directly.
+        """
+        if self.production_state != ProductionState.RUNNING:
+            logger.info(
+                "production flow finished but state=%s; ignoring completion callback",
+                self.production_state.value,
+            )
+            return
+
+        # ---- Success path ------------------------------------------------
+        if result.success:
+            self._set_production_state(
+                ProductionState.HOLDING_HOOK,
+                reason="primary flow success",
+            )
+            # 40001=5 (STATUS_HOOK_OK) is written by
+            # mark_modbus_program_finished; reaffirm to be safe.
+            self._write_production_40001(5)
+            return
+
+        # ---- Failure path: classify by failure_kind ----------------------
+        task = self.production_task
+        failure_kind = (result.failure_kind or "flow").strip() or "flow"
+        # Record failure info on the task context for diagnostics / reset.
+        if task is not None:
+            task.failure_code = result.code
+            task.failure_kind = failure_kind
+
+        # 111 — robot fault: never attempt recovery.
+        if failure_kind == "robot":
+            self._set_production_state(
+                ProductionState.ROBOT_ERROR,
+                reason=f"robot failure: code={result.code}",
+            )
+            # 40001=111 is written by _set_production_state via
+            # MODBUS_STATUS_MAP.
+            return
+
+        # 110 / 112 — flow or camera failure: pick the final state now
+        # so we know where to land after recovery (or if we skip it).
+        if failure_kind == "camera":
+            final_state = ProductionState.CAMERA_ERROR
+        else:
+            final_state = ProductionState.FLOW_ERROR
+
+        # Anti-recursion: never trigger recovery twice for the same task.
+        if task is not None and task.recovery_started:
+            logger.warning(
+                "recovery_already_started: skipping recovery for failure_kind=%s code=%s",
+                failure_kind,
+                result.code,
+            )
+            self._set_production_state(
+                final_state,
+                reason=f"recovery already attempted (code={result.code})",
+            )
+            return
+
+        # Consult the recovery policy.
+        try:
+            can_recover = self.recovery_policy.can_recover(result, self.controller)
+        except Exception:
+            logger.exception("RecoveryPolicy.can_recover raised; treating as non-recoverable")
+            can_recover = False
+
+        if not can_recover:
+            self._set_production_state(
+                final_state,
+                reason=f"non-recoverable: code={result.code} kind={failure_kind}",
+            )
+            return
+
+        # ---- Enter ERROR_RECOVERY and run the hook synchronously --------
+        if task is not None:
+            task.recovery_started = True
+        self._set_production_state(
+            ProductionState.ERROR_RECOVERY,
+            reason=f"recovery for {failure_kind}: code={result.code}",
+        )
+
+        recovery_flow_id = task.recovery_flow_id if task is not None else None
+        recovery_result: Optional[FlowResult] = None
+        if recovery_flow_id:
+            try:
+                recovery_request = self.program_runner.build_production_request(
+                    recovery_flow_id
+                )
+            except Exception:
+                logger.exception("build_production_request failed for recovery flow")
+                recovery_request = None
+            if recovery_request is not None:
+                try:
+                    recovery_result = self.program_runner.run_recovery_sync(
+                        recovery_request
+                    )
+                except Exception:
+                    logger.exception("run_recovery_sync raised")
+                    recovery_result = None
+        else:
+            logger.warning("no recovery_flow_id on task; skipping recovery execution")
+
+        recovery_ok = bool(recovery_result.success) if recovery_result is not None else False
+        logger.info(
+            "recovery completed: success=%s; original failure_kind=%s code=%s",
+            recovery_ok,
+            failure_kind,
+            result.code,
+        )
+
+        # Task 8: recovery success does NOT change the final error code.
+        # The runtime still lands in FLOW_ERROR (110) / CAMERA_ERROR (112)
+        # so the PLC sees the original failure. Only the task state
+        # advances; 40001 is written by _set_production_state via
+        # MODBUS_STATUS_MAP.
+        self._set_production_state(
+            final_state,
+            reason=(
+                f"recovery success={recovery_ok}; "
+                f"original failure_kind={failure_kind} code={result.code}"
+            ),
+        )
 
     def _validate_publication_inputs(
         self,
@@ -1800,6 +2783,79 @@ class DobotRuntimeAgent:
             logger.error(self.last_error)
         return ok
 
+    # ------------------------------------------------------------------
+    # PR 5 — Production telemetry (Health JSON production field)
+    # ------------------------------------------------------------------
+
+    # Chinese display names for hook_type values. ``None`` maps to ``None``.
+    _HOOK_NAME_MAP: dict[int, str] = {0: "低钩子", 1: "高钩子"}
+
+    def _build_production_telemetry(self) -> dict[str, Any]:
+        """Build the ``production`` field for the Runtime Health JSON.
+
+        PR 5 Task 1: exposes the production state machine's current
+        context (state / task_id / hook_type / hook_name / flow_role /
+        flow_id / recovery_started / failure_code) so the GUI Dashboard
+        and external monitors can render live production telemetry.
+
+        When no task is active (``production_task is None``) the field
+        still reports ``state`` (which mirrors ``production_state``) but
+        every task-specific field is ``None``.
+        """
+        task = self.production_task
+        state_value = self.production_state.value
+        if task is None:
+            return {
+                "state": state_value,
+                "task_id": None,
+                "hook_type": None,
+                "hook_name": None,
+                "flow_role": None,
+                "flow_id": None,
+                "recovery_started": None,
+                "failure_code": None,
+            }
+        # Determine the currently-active flow_id and its role. When
+        # recovery has started, the active flow is the recovery flow;
+        # otherwise it's the primary flow latched at task creation.
+        if task.recovery_started and task.recovery_flow_id:
+            active_flow_id = task.recovery_flow_id
+            active_flow_role: Optional[str] = "error_recovery"
+        else:
+            active_flow_id = task.primary_flow_id
+            active_flow_role = self._reverse_lookup_flow_role(
+                task.primary_flow_id
+            )
+        return {
+            "state": state_value,
+            "task_id": task.task_id,
+            "hook_type": int(task.hook_type),
+            "hook_name": self._HOOK_NAME_MAP.get(int(task.hook_type)),
+            "flow_role": active_flow_role,
+            "flow_id": active_flow_id,
+            "recovery_started": bool(task.recovery_started),
+            "failure_code": task.failure_code,
+        }
+
+    def _reverse_lookup_flow_role(self, flow_id: Optional[str]) -> Optional[str]:
+        """Reverse-lookup the flow_role for ``flow_id`` from ``flow_router``.
+
+        Returns ``"low_hook"`` / ``"high_hook"`` / ``"error_recovery"`` when
+        ``flow_id`` matches one of the router's role bindings, otherwise
+        ``None`` (e.g. the router has no roles configured, or the flow
+        was started outside the role mapping).
+        """
+        if not flow_id:
+            return None
+        try:
+            roles = self.flow_router.flow_roles
+        except Exception:
+            return None
+        for role, fid in roles.items():
+            if fid == flow_id:
+                return role
+        return None
+
     def build_health_payload(self) -> dict[str, Any]:
         try:
             feedback = self.controller.get_feedback_health()
@@ -1872,6 +2928,7 @@ class DobotRuntimeAgent:
                 "load_error": self.publication_store.load_error,
             },
             "flow": runner,
+            "production": self._build_production_telemetry(),
             "startup_connection": {
                 **self.startup_connection.snapshot(),
                 "main_flow_id": self._startup_main_flow_id,
@@ -1952,10 +3009,31 @@ class DobotRuntimeAgent:
                 last_error=self.last_error,
             )
         self._state_initialized = True
-        self.controller.set_modbus_program_runner(
-            self._run_program_from_modbus,
-            readiness_checker=self._modbus_main_flow_readiness,
-        )
+        # PR 3: re-register the runner with the command delegate so the
+        # production state machine owns 40001=0/1/3 dispatch. The
+        # ``__init__`` already does this, but ``run()`` may be called
+        # after a controller swap, so re-register defensively.
+        try:
+            self.controller.set_modbus_program_runner(
+                self._run_program_from_modbus,
+                readiness_checker=self._modbus_main_flow_readiness,
+                command_delegate=self._on_modbus_command_delegate,
+            )
+        except TypeError:
+            self.controller.set_modbus_program_runner(
+                self._run_program_from_modbus,
+                readiness_checker=self._modbus_main_flow_readiness,
+            )
+        if hasattr(self.controller, "set_modbus_mode_changed_callback"):
+            self.controller.set_modbus_mode_changed_callback(self._on_mode_changed)
+        # PR 5 Task 4: register the 40004 (hook_type) change callback so
+        # the runtime emits a diagnostic log whenever the PLC changes
+        # 40004, even when no production task is running. Defensive: the
+        # controller may be a test stub that doesn't expose the setter.
+        if hasattr(self.controller, "set_modbus_hook_type_changed_callback"):
+            self.controller.set_modbus_hook_type_changed_callback(
+                self._on_hook_type_changed
+            )
         if not self.stop_event.is_set() and not self.ipc_server.start():
             self.last_error = (
                 f"Runtime IPC启动失败: {self.ipc_server.last_error}"

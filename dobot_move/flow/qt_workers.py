@@ -72,7 +72,12 @@ class FlowThread(QThread):
         )
         # Wire callbacks to Qt signals
         self._executor.on_log = self.flow_log.emit
-        self._executor.on_finished = self.flow_finished.emit
+        # PR 4: FlowExecutor.on_finished now receives a FlowResult; the
+        # Qt signal still carries a plain bool for backward compatibility
+        # with GUI consumers that connected to flow_finished(bool).
+        self._executor.on_finished = lambda result: self.flow_finished.emit(
+            bool(result.success)
+        )
         self._executor.on_progress = self.flow_module_progress.emit
 
     def run(self):

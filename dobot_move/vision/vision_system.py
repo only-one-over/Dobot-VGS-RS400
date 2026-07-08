@@ -80,7 +80,8 @@ class FramePacket:
     timestamp: float
     color_image: object  # numpy ndarray
     depth_image: object  # numpy ndarray
-    capture_time: float = 0.0  # perf_counter 时间戳，记录帧数据拷贝完成时刻
+    capture_time: float = 0.0  # perf_counter 时间戳，记录 wait_for_frames 返回时刻
+    frame_timestamp_ms: float = 0.0  # RealSense 原始帧时间戳 (ms)
 
 
 DEFAULT_PERFORMANCE_CONFIG = {
@@ -222,10 +223,20 @@ class VisionSystem:
             self.tracked_target_id = None
 
         if self.enable_kalman:
+            # TODO: 弃用 — kalman_3d 在 Camera Frame 滤波，跨帧比较不一致，
+            # D405 路径将逐步迁移到 kalman_3d_base（Base Frame）。保留以兼容。
             self.kalman_3d = KalmanFilter3D(dt=1.0/30, process_noise=1.0, measurement_noise=5.0)
             logger.info("✅ 3D 卡尔曼滤波器已初始化")
         else:
             self.kalman_3d = None
+
+        # Task 6: D405 专用 Base Frame Kalman 滤波器（逐步迁移）
+        self.kalman_3d_base = None
+        if camera_type == "D405" and self.enable_kalman:
+            self.kalman_3d_base = KalmanFilter3D(
+                dt=1.0/30, process_noise=1.0, measurement_noise=5.0,
+            )
+            logger.info("✅ Base Frame 3D 卡尔曼滤波器已初始化 (D405)")
 
         if self.enable_depth_filter:
             self.depth_processor = DepthProcessor(
@@ -782,12 +793,20 @@ class VisionSystem:
         depth_frame, color_frame = self.capture_frames()
         if depth_frame is None or color_frame is None:
             return None
+        # capture_time 前移：wait_for_frames 返回后立即记录，避免 numpy 拷贝耗时引入漂移
+        capture_time = time.perf_counter()
+        frame_ts_ms = 0.0
+        try:
+            frame_ts_ms = float(depth_frame.get_timestamp())
+        except Exception:
+            frame_ts_ms = 0.0
         return FramePacket(
             seq=seq,
             timestamp=time.time(),
             color_image=np.asanyarray(color_frame.get_data()).copy(),
             depth_image=np.asanyarray(depth_frame.get_data()).copy(),
-            capture_time=time.perf_counter(),
+            capture_time=capture_time,
+            frame_timestamp_ms=frame_ts_ms,
         )
 
     @property
@@ -1280,7 +1299,7 @@ class VisionSystem:
                 'camera_coords': target['camera_coords'],
                 'smoothed': True,
                 'confidence': target.get('confidence', 0.0),
-                'source': 'kalman_predict',
+                'source': 'prediction',
             })
 
         detections_for_calc = [{
@@ -1302,7 +1321,7 @@ class VisionSystem:
                     'camera_coords': predicted.tolist(),
                     'smoothed': True,
                     'confidence': self.kalman_3d.get_confidence(),
-                    'source': 'kalman_predict',
+                    'source': 'prediction',
                 })
             return None
 
@@ -1317,7 +1336,7 @@ class VisionSystem:
             result['confidence'] = detection_score
             result['detection_score'] = detection_score
             result['tracking_confidence'] = self.kalman_3d.get_confidence()
-            result['source'] = 'kalman_smoothed'
+            result['source'] = 'smoothed'
             result['raw_coords'] = observed
             return self._reject_camera_z_over_limit(result)
 
@@ -1325,14 +1344,26 @@ class VisionSystem:
         raw_result['confidence'] = detection_score if detection_score > 0 else 1.0
         raw_result['detection_score'] = detection_score
         raw_result['tracking_confidence'] = 0.0
-        raw_result['source'] = 'direct'
+        raw_result['source'] = 'detection'
         return self._reject_camera_z_over_limit(raw_result)
+
+    def update_base_kalman(self, target_base):
+        """同步更新 Base Frame Kalman 滤波器（仅 D405 启用）。
+
+        用 target_base（基座坐标系位置）作为观测更新 kalman_3d_base，
+        用于逐步将 D405 滤波从 Camera Frame 迁移到 Base Frame。
+        """
+        if self.kalman_3d_base is None:
+            return
+        self.kalman_3d_base.update(np.asarray(target_base)[:3])
 
     def reset_tracking(self):
         if self.tracker is not None:
             self.tracker.reset()
         if self.kalman_3d is not None:
             self.kalman_3d.reset()
+        if self.kalman_3d_base is not None:
+            self.kalman_3d_base.reset()
         self.tracked_target_id = None
         self.last_valid_position = None
         self._kalman_last_time = None

@@ -12,6 +12,7 @@ if "pyrealsense2" not in sys.modules:
     sys.modules["pyrealsense2"] = types.ModuleType("pyrealsense2")
 
 from dobot_move.flow.flow_executor import FlowExecutor
+from dobot_move.flow.flow_result import FlowResult
 
 
 class _DelayController:
@@ -66,7 +67,11 @@ def test_flow_executor_callbacks_invoke_on_log_and_on_finished():
 
     executor.run()
 
-    assert finished == [True]
+    # PR 4: on_finished now receives a FlowResult instead of a bool.
+    assert len(finished) == 1
+    assert isinstance(finished[0], FlowResult)
+    assert finished[0].success is True
+    assert finished[0].code == "OK"
     assert any("流程" in msg or "模块" in msg for msg in logs)
     assert controller.released is True
 

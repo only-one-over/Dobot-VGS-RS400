@@ -63,7 +63,7 @@ def test_offline_returns_failure_without_sending():
         (facade.connect_camera, ("D435i",)),
         (facade.disconnect_camera, ("D405",)),
         (facade.camera_test, ("D435i",)),
-        (facade.run_step, ({"type": "move"},)),
+        (facade.run_step, ("flow1", 0)),
     ):
         success, msg = method(*args)
         assert success is False

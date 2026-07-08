@@ -133,6 +133,11 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self._ipc_request_threads = set()
         self._ipc_pending_commands = set()
         self._alarm_history = AlarmHistory()
+        # PR-C Task 6: runtime capabilities cache. Populated from the
+        # ``get_status`` IPC response; empty list means "not yet fetched"
+        # (treated as "all supported" to avoid false-disabling on legacy
+        # Runtime builds that don't advertise capabilities).
+        self._runtime_capabilities: list[str] = []
         
         self._load_grasp_flow_modules()
         
@@ -150,6 +155,10 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         
         self.init_ui()
         self._start_status_timer()
+        # PR-C Task 6.2: fetch Runtime capabilities once the UI is live so
+        # unsupported buttons get gated. Sent quietly so it doesn't pollute
+        # the debug panel on every startup.
+        self._refresh_runtime_capabilities()
         if HANDEYE_AVAILABLE:
             self._load_calib_matrix("D435i")
         self.statusBar().showMessage("正在初始化状态监控...")
@@ -275,10 +284,50 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         right_actions.addWidget(self.emergency_stop_btn, 0, Qt.AlignmentFlag.AlignCenter)
         
         status_layout.addLayout(right_actions)
-        
+
         status_group.setLayout(status_layout)
         main_layout.addWidget(status_group)
-        
+
+        # ── PR 5 Task 2: 生产上下文仪表盘 ──
+        production_group = QGroupBox("生产上下文")
+        production_group.setObjectName("productionContextPanel")
+        production_layout = QGridLayout()
+        production_layout.setSpacing(6)
+        production_layout.setContentsMargins(12, 8, 12, 8)
+
+        # 生产状态 / 钩子类型 / 当前程序 / 当前步骤 / PLC状态 / 模式 / task_id
+        self.prod_state_label = QLabel("空闲")
+        self.prod_hook_label = QLabel("---")
+        self.prod_flow_label = QLabel("---")
+        self.prod_step_label = QLabel("---")
+        self.prod_plc_label = QLabel("40001=---")
+        self.prod_mode_label = QLabel("---")
+        self.prod_task_id_label = QLabel("---")
+        self.prod_task_id_label.setStyleSheet(
+            "font-family: monospace; font-size: 11px; color: #64748b;"
+        )
+
+        rows = [
+            ("生产状态:", self.prod_state_label),
+            ("钩子类型:", self.prod_hook_label),
+            ("当前程序:", self.prod_flow_label),
+            ("当前步骤:", self.prod_step_label),
+            ("PLC状态:", self.prod_plc_label),
+            ("模式:", self.prod_mode_label),
+            ("task_id:", self.prod_task_id_label),
+        ]
+        for row_idx, (title, value_label) in enumerate(rows):
+            title_label = QLabel(title)
+            title_label.setStyleSheet(
+                "color: #94a3b8; font-size: 11px;"
+            )
+            value_label.setMinimumWidth(120)
+            production_layout.addWidget(title_label, row_idx, 0)
+            production_layout.addWidget(value_label, row_idx, 1)
+
+        production_group.setLayout(production_layout)
+        main_layout.addWidget(production_group)
+
         # ── 左侧导航 + 右侧内容 ──
         content_layout = QHBoxLayout()
         content_layout.setSpacing(0)
@@ -380,16 +429,23 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         flow_select_layout.addWidget(self.edit_flow_combo, 1)
         self.new_flow_btn = QPushButton("新建")
         self.new_flow_btn.clicked.connect(self.create_flow)
+        # PR 2: production flow roles are locked to three fixed flows.
+        # Hide the new/rename/duplicate/delete flow buttons; editing
+        # step content remains available.
+        self.new_flow_btn.setVisible(False)
         flow_select_layout.addWidget(self.new_flow_btn)
         self.rename_flow_btn = QPushButton("重命名")
         self.rename_flow_btn.clicked.connect(self.rename_flow)
+        self.rename_flow_btn.setVisible(False)
         flow_select_layout.addWidget(self.rename_flow_btn)
         self.duplicate_flow_btn = QPushButton("复制")
         self.duplicate_flow_btn.clicked.connect(self.duplicate_flow)
+        self.duplicate_flow_btn.setVisible(False)
         flow_select_layout.addWidget(self.duplicate_flow_btn)
         self.delete_flow_btn = QPushButton("删除")
         set_button_role(self.delete_flow_btn, "danger")
         self.delete_flow_btn.clicked.connect(self.delete_flow)
+        self.delete_flow_btn.setVisible(False)
         flow_select_layout.addWidget(self.delete_flow_btn)
         grasp_flow_layout.addLayout(flow_select_layout)
         
@@ -1183,7 +1239,86 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
                 getattr(self, attr).setEnabled(True)
         if hasattr(self, "collision_combo"):
             self.collision_combo.setEnabled(False)
+        # PR-C Task 6.4: gray out buttons whose command isn't advertised
+        # by the Runtime. ``_apply_capability_gating`` is a no-op when
+        # capabilities haven't been fetched yet (treated as "all supported").
+        self._apply_capability_gating()
         self._update_emergency_stop_button()
+
+    # -- PR-C Task 6: capability-based button gating ----------------------
+
+    # Mapping of GUI button attribute → IPC command name. Buttons listed
+    # here are force-disabled when the Runtime doesn't advertise the
+    # corresponding command in ``get_status.capabilities``.
+    _CAPABILITY_BUTTON_MAP = {
+        "enable_robot_btn": "enable_robot",
+        "disable_robot_btn": "disable_robot",
+        "clear_error_btn": "clear_alarms",
+        "connect_robot_btn": "connect_robot",
+        "collision_set_btn": "set_collision_level",
+        "d435i_connect_btn": "connect_camera",
+        "d405_connect_btn": "connect_camera",
+        "d435i_disconnect_btn": "disconnect_camera",
+        "d405_disconnect_btn": "disconnect_camera",
+        "modbus_start_btn": "start_modbus",
+        "modbus_stop_btn": "stop_modbus",
+        "realtime_btn": "get_vision_snapshot",
+        "get_pos_btn": "get_current_pose",
+        "read_point_btn": "get_point",
+        "move_initial_btn": "move_to_point",
+        "run_flow_btn": "start_debug_flow",
+        "run_task_btn": "start_production_flow",
+        "pause_btn": "pause_debug_flow",
+        "continue_btn": "resume_debug_flow",
+    }
+
+    def _is_capability_supported(self, command_name: str) -> bool:
+        """Return whether the Runtime advertises ``command_name``.
+
+        When capabilities haven't been fetched yet (empty list, e.g. before
+        the first ``get_status`` round-trip completes, or when connected to
+        a legacy Runtime that doesn't include the ``capabilities`` field),
+        all commands are treated as supported to avoid spuriously disabling
+        working buttons.
+        """
+        if not self._runtime_capabilities:
+            return True
+        return command_name in self._runtime_capabilities
+
+    def _apply_capability_gating(self):
+        """Disable buttons whose command isn't in Runtime capabilities."""
+        for btn_attr, command in self._CAPABILITY_BUTTON_MAP.items():
+            btn = getattr(self, btn_attr, None)
+            if btn is None:
+                continue
+            if not self._is_capability_supported(command):
+                btn.setEnabled(False)
+                btn.setToolTip(f"Runtime 版本不支持: {command}")
+            else:
+                # Clear the tooltip; the regular enable/disable logic in
+                # ``_refresh_action_states`` decides the actual state.
+                btn.setToolTip("")
+
+    def _cache_runtime_capabilities(self, data: dict):
+        """Cache ``capabilities`` from a ``get_status`` IPC response."""
+        capabilities = data.get("capabilities") or []
+        if isinstance(capabilities, list):
+            self._runtime_capabilities = [str(c) for c in capabilities]
+            self._apply_capability_gating()
+
+    def _refresh_runtime_capabilities(self):
+        """Fetch ``get_status`` via IPC and cache ``capabilities``.
+
+        Called once on startup. Subsequent refreshes happen whenever the
+        operator clicks the ``刷新状态`` (get_status) button in the Runtime
+        debug page — the response is routed through
+        :meth:`_cache_runtime_capabilities` by the ``on_success`` hook.
+        """
+        self._send_runtime_ipc(
+            "get_status",
+            on_success=self._cache_runtime_capabilities,
+            quiet=True,
+        )
 
     def _create_runtime_debug_page(self):
         page = QWidget()
@@ -1202,9 +1337,19 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             ("发布状态", "get_publication_status"),
         ):
             button = QPushButton(text)
-            button.clicked.connect(
-                lambda _checked=False, cmd=command: self._send_runtime_ipc(cmd)
-            )
+            # PR-C Task 6: ``get_status`` also refreshes the cached
+            # capabilities so capability-gated buttons update accordingly.
+            if command == "get_status":
+                button.clicked.connect(
+                    lambda _checked=False: self._send_runtime_ipc(
+                        "get_status",
+                        on_success=self._cache_runtime_capabilities,
+                    )
+                )
+            else:
+                button.clicked.connect(
+                    lambda _checked=False, cmd=command: self._send_runtime_ipc(cmd)
+                )
             runtime_layout.addWidget(button)
         # 重载配置按钮（成功后在状态栏提示）
         self.debug_reload_config_btn = QPushButton("重载配置")
@@ -1683,7 +1828,133 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             "D405",
             "已连接" if snapshot.d405_connected else "未连接",
         )
+        self._refresh_production_display(snapshot)
         self._refresh_modbus_table()
+
+    # PR 5 Task 2: ProductionState value → Chinese display name.
+    _PRODUCTION_STATE_CN: dict[str, str] = {
+        "manual_offline": "手动下线",
+        "idle": "空闲",
+        "standby": "待机",
+        "running": "运行中",
+        "paused": "已暂停",
+        "holding_hook": "扶钩等待",
+        "resetting": "复位中",
+        "error_recovery": "错误恢复中",
+        "flow_error": "流程错误",
+        "robot_error": "机器人故障",
+        "camera_error": "相机故障",
+    }
+
+    # 40001 value → Chinese meaning (subset for dashboard display).
+    _PLC_CMD_CN: dict[int, str] = {
+        0: "空闲/中停",
+        1: "复位",
+        2: "复位完成",
+        3: "执行流程",
+        4: "运行中",
+        5: "流程完成",
+        110: "流程ERR",
+        111: "机器人报错",
+        112: "相机报错",
+    }
+
+    def _refresh_production_display(self, snapshot: RuntimeHealthSnapshot) -> None:
+        """Update the 生产上下文 dashboard group from Health JSON ``production``.
+
+        PR 5 Task 2: reads the ``production`` field (added in PR 5 Task 1)
+        from the Runtime Health JSON and renders the live production
+        context (state / hook type / current flow / current step / PLC
+        status / mode / task_id) on the dashboard.
+
+        Falls back to ``"---"`` placeholders when the Runtime is offline
+        or the ``production`` field is absent (legacy Runtime builds).
+        """
+        production = snapshot.raw.get("production") or {}
+        if not isinstance(production, dict):
+            production = {}
+        flow = snapshot.raw.get("flow") or {}
+        if not isinstance(flow, dict):
+            flow = {}
+        modbus = snapshot.raw.get("modbus") or {}
+        if not isinstance(modbus, dict):
+            modbus = {}
+        # ``last_command`` carries the last 40001 value written by the PLC.
+        last_command = snapshot.raw.get("last_command") or {}
+        if not isinstance(last_command, dict):
+            last_command = {}
+
+        # 生产状态
+        state_value = str(production.get("state") or "")
+        if state_value:
+            state_cn = self._PRODUCTION_STATE_CN.get(state_value, state_value)
+        else:
+            state_cn = "---"
+        if hasattr(self, "prod_state_label"):
+            self.prod_state_label.setText(state_cn)
+            # Color-code by state category.
+            if state_value in {"running"}:
+                color = "#22c55e"
+            elif state_value in {"paused", "holding_hook", "resetting",
+                                 "error_recovery"}:
+                color = "#f59e0b"
+            elif state_value in {"flow_error", "robot_error", "camera_error",
+                                 "manual_offline"}:
+                color = "#ef4444"
+            else:
+                color = "#94a3b8"
+            self.prod_state_label.setStyleSheet(
+                f"color: {color}; font-weight: 600;"
+            )
+
+        # 钩子类型
+        hook_name = production.get("hook_name")
+        if hasattr(self, "prod_hook_label"):
+            self.prod_hook_label.setText(str(hook_name) if hook_name else "---")
+
+        # 当前程序 (flow name from flow snapshot; fall back to flow_id)
+        flow_name = flow.get("main_flow_name") or production.get("flow_id")
+        if hasattr(self, "prod_flow_label"):
+            self.prod_flow_label.setText(str(flow_name) if flow_name else "---")
+
+        # 当前步骤
+        step_name = flow.get("module_name")
+        if hasattr(self, "prod_step_label"):
+            self.prod_step_label.setText(str(step_name) if step_name else "---")
+
+        # PLC状态 (40001 current value + meaning)
+        cmd_value = last_command.get("value")
+        if cmd_value is None:
+            # Fall back to modbus stats if last_command is absent.
+            cmd_value = modbus.get("last_command_value")
+        if cmd_value is not None:
+            try:
+                cmd_int = int(cmd_value)
+                cmd_meaning = self._PLC_CMD_CN.get(cmd_int, str(cmd_int))
+                plc_text = f"40001={cmd_int} ({cmd_meaning})"
+            except (TypeError, ValueError):
+                plc_text = "40001=---"
+        else:
+            plc_text = "40001=---"
+        if hasattr(self, "prod_plc_label"):
+            self.prod_plc_label.setText(plc_text)
+
+        # 模式 (40002: 0→自动, 1→手动)
+        # The mode is not directly in the Health JSON; infer from
+        # production state when manual_offline, otherwise default to 自动.
+        if state_value == "manual_offline":
+            mode_text = "手动"
+        else:
+            mode_text = "自动"
+        if hasattr(self, "prod_mode_label"):
+            self.prod_mode_label.setText(mode_text)
+
+        # task_id (optional, for debugging)
+        task_id = production.get("task_id")
+        if hasattr(self, "prod_task_id_label"):
+            self.prod_task_id_label.setText(
+                str(task_id) if task_id else "---"
+            )
 
     def _update_runtime_state_display(self, state: str) -> None:
         """Update the status-bar Runtime label and main-control indicator.

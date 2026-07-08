@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 REG_CMD_STATUS = 40001  # 命令/状态
 REG_MODE = 40002        # 模式
 REG_HEARTBEAT = 40003   # 心跳
+REG_HOOK_TYPE = 40004   # 提钩杆类型
 
 # Modbus 线路地址（0-based，用于 SimCore API）
 _WIRE_ADDR = 0  # holding register 起始地址
@@ -40,6 +41,10 @@ STATUS_CAMERA_ERR = 112
 MODE_AUTO = 0
 MODE_MANUAL = 1
 
+# 提钩杆类型
+HOOK_TYPE_LOW = 0
+HOOK_TYPE_HIGH = 1
+
 _CMD_DISPLAY = {0: "空闲/中停", 1: "复位/延时放行", 2: "复位完成", 3: "执行流程", 4: "运行中", 5: "延时等待/流程完成", 110: "流程ERR", 111: "机器人报错", 112: "相机报错"}
 _MODE_DISPLAY = {0: "自动模式", 1: "手动模式"}
 
@@ -48,6 +53,7 @@ REGISTER_NAME = {
     40001: "命令/状态",
     40002: "运行模式",
     40003: "心跳",
+    40004: "提钩杆类型",
 }
 
 # 寄存器值描述映射
@@ -63,6 +69,8 @@ REGISTER_VALUE_DESC = {
     (40001, 112): "相机报错",
     (40002, 0): "自动模式",
     (40002, 1): "手动模式",
+    (40004, 0): "低钩子",
+    (40004, 1): "高钩子",
 }
 
 # Holding register function codes
@@ -70,8 +78,12 @@ HR_FC = {3, 6, 16, 22, 23}
 
 
 class DobotModbusServer:
-    def __init__(self, on_command_callback=None, slave_id=5):
+    def __init__(self, on_command_callback=None, on_mode_changed_callback=None, on_hook_type_changed_callback=None, slave_id=5):
         self._on_command = on_command_callback
+        self._on_mode_changed = on_mode_changed_callback
+        # PR 5 Task 4: optional callback invoked when 40004 (hook_type)
+        # changes. Signature: (old_hook: int, new_hook: int) -> None.
+        self._on_hook_type_changed = on_hook_type_changed_callback
         self._slave_id = slave_id
         self._running = False
         self._server_thread = None
@@ -169,6 +181,13 @@ class DobotModbusServer:
         cmd_triggered = False
         cmd_value = 0
         cmd_prefers_display_address = False
+        mode_changed_triggered = False
+        mode_old_val = None
+        mode_new_val = None
+        # PR 5 Task 4: track 40004 (hook_type) changes for diagnostic logging.
+        hook_type_changed_triggered = False
+        hook_type_old_val = None
+        hook_type_new_val = None
 
         for i, value in enumerate(set_values):
             raw_addr = address + i
@@ -202,6 +221,10 @@ class DobotModbusServer:
                 new_desc = REGISTER_VALUE_DESC.get((REG_CMD_STATUS, value), str(value))
                 logger.info("[Modbus监测] 命令/状态变化: %s → %s", old_desc, new_desc)
                 if value in (110, 111, 112):
+                    # PR 5 Task 6: winsound.Beep 保留为辅助提示。
+                    # 生产报警不依赖 Windows 音频系统，PLC 侧通过
+                    # 40001 状态触发 Buzzer/Alarm Light。此处仅在
+                    # 机械臂 Windows 工控机上提供本地蜂鸣辅助。
                     if _HAS_WINSOUND:
                         try:
                             winsound.Beep(1000, 500)
@@ -213,6 +236,15 @@ class DobotModbusServer:
                 old_desc = REGISTER_VALUE_DESC.get((REG_MODE, old_val), str(old_val))
                 new_desc = REGISTER_VALUE_DESC.get((REG_MODE, value), str(value))
                 logger.info("[Modbus监测] 模式变化: %s → %s", old_desc, new_desc)
+                mode_changed_triggered = True
+                mode_old_val = old_val
+                mode_new_val = value
+
+            # PR 5 Task 4: 40004 (hook_type) 变化追踪
+            if reg_addr == REG_HOOK_TYPE and old_val != value:
+                hook_type_changed_triggered = True
+                hook_type_old_val = old_val
+                hook_type_new_val = value
 
             # 命令检测
             if (
@@ -224,6 +256,26 @@ class DobotModbusServer:
                 cmd_value = value
                 cmd_prefers_display_address = prefers_display_address
 
+        # 40002 模式切换事件回调
+        if mode_changed_triggered and self._on_mode_changed is not None:
+            try:
+                self._on_mode_changed(
+                    old_mode=int(mode_old_val) if mode_old_val is not None else 0,
+                    new_mode=int(mode_new_val) if mode_new_val is not None else 0,
+                )
+            except Exception:
+                logger.exception("on_mode_changed 回调执行异常")
+
+        # PR 5 Task 4: 40004 (hook_type) 变化事件回调
+        if hook_type_changed_triggered and self._on_hook_type_changed is not None:
+            try:
+                self._on_hook_type_changed(
+                    old_hook=int(hook_type_old_val) if hook_type_old_val is not None else 0,
+                    new_hook=int(hook_type_new_val) if hook_type_new_val is not None else 0,
+                )
+            except Exception:
+                logger.exception("on_hook_type_changed 回调执行异常")
+
         if cmd_triggered and self._on_command:
             # 读取当前模式
             current_mode = self._read_current_register(
@@ -233,9 +285,52 @@ class DobotModbusServer:
                 default=MODE_AUTO,
                 prefer_display=cmd_prefers_display_address,
             )
-            self._on_command(cmd_value, mode=current_mode)
+            # 读取当前钩子类型 (40004)
+            current_hook_type = self._read_current_register(
+                current_registers,
+                start_address,
+                REG_HOOK_TYPE,
+                default=HOOK_TYPE_LOW,
+                prefer_display=cmd_prefers_display_address,
+            )
+            current_hook_type = int(current_hook_type)
+
+            # 非法 40004 检测：cmd==3 时拒绝启动，写 40001=110
+            if current_hook_type < HOOK_TYPE_LOW or current_hook_type > HOOK_TYPE_HIGH:
+                if cmd_value == CMD_HOOK:
+                    logger.error(
+                        "[Modbus协议错误] 40004 钩子类型非法: %d (合法范围 0/1)，拒绝 40001=3 启动，写 40001=110",
+                        current_hook_type,
+                    )
+                    self._write_status_hook_err()
+                    return None
+                else:
+                    logger.warning(
+                        "[Modbus协议警告] 40004 钩子类型非法: %d (合法范围 0/1)，命令 %d 仍传递",
+                        current_hook_type,
+                        cmd_value,
+                    )
+
+            self._on_command(cmd_value, mode=current_mode, hook_type=current_hook_type)
 
         return None
+
+    def _write_status_hook_err(self):
+        """写 40001=110 (流程ERR) 表示钩子类型非法等协议错误"""
+        if not self._loop or not self._loop.is_running() or not self._server:
+            return
+        values = [STATUS_HOOK_ERR]
+        signature = self._mark_internal_status_write(_WIRE_ADDR, values)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._server.context.async_setValues(self._slave_id, 3, _WIRE_ADDR, values),
+                self._loop,
+            )
+            future.result(timeout=2.0)
+        except Exception as e:
+            logger.error("_write_status_hook_err failed: %s", e)
+        finally:
+            self._discard_internal_status_write(signature)
 
     async def _heartbeat_coroutine(self):
         """心跳协程：40003 每秒交替 1/0"""

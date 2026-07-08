@@ -5,14 +5,15 @@
 发送通过 ``send_ipc_func`` 走 ``RuntimeIpcRequestThread`` 异步通道；
 Runtime 侧的错误随后通过既有的完成回调抵达（调试面板 / 状态栏）。
 
-渐进式策略：Runtime 端尚未实现的命令（如 ``enable_robot``、
-``connect_camera``、``start_modbus`` 等）仍照常发送，Runtime 会返回
-``unknown_command`` 错误并由既有完成处理器显示。当 Runtime 后续补充
-命令处理器时，本外观无需改动。
+PR-C: 命令契约由 :mod:`dobot_move.runtime.runtime_contract` 的
+``COMMAND_SPECS`` 单点定义。本外观 import 该字典仅作文档化用途，不强制
+客户端校验——Runtime 端会在 handler 调用前做 schema 验证。
 """
 from __future__ import annotations
 
 from typing import Any, Callable, Optional
+
+from ..runtime.runtime_contract import COMMAND_SPECS  # noqa: F401 — re-export for callers
 
 
 class RuntimeFacade:
@@ -62,6 +63,41 @@ class RuntimeFacade:
             return True, f"{action_name}命令已发送"
         except Exception as exc:
             return False, f"{action_name}失败：{exc}"
+
+    # -- PR-C Task 4: 异步结果回调 -----------------------------------------
+
+    def call_async(
+        self,
+        command: str,
+        data: Optional[dict] = None,
+        on_success: Optional[Callable[[dict], None]] = None,
+        on_failure: Optional[Callable[[str], None]] = None,
+    ) -> tuple[bool, str]:
+        """异步发送命令，通过回调接收 Runtime 真实结果。
+
+        内部调用 ``_send_ipc``（即 ``gui_app._send_runtime_ipc``）。
+        ``on_success`` 在 Runtime 返回成功 payload 时被调用；
+        ``on_failure`` 控制静默策略——传入回调时 ``quiet=False``（既有
+        失败提示仍会显示），为 ``None`` 时 ``quiet=True``（完全静默）。
+        """
+        try:
+            if not self._is_online():
+                msg = f"{command} 失败：Runtime 离线"
+                if on_failure is not None:
+                    on_failure(msg)
+                return False, msg
+            self._send_ipc(
+                command,
+                data,
+                on_success=on_success,
+                quiet=on_failure is None,
+            )
+            return True, f"{command} 命令已发送"
+        except Exception as exc:
+            msg = f"{command} 失败：{exc}"
+            if on_failure is not None:
+                on_failure(msg)
+            return False, msg
 
     # -- 机器人控制 ------------------------------------------------------
 
@@ -117,12 +153,39 @@ class RuntimeFacade:
             action_name="回到初始位置",
         )
 
-    def get_current_pose(self) -> tuple[bool, str]:
-        return self._send("get_current_pose", action_name="获取当前位置")
+    def get_current_pose(
+        self,
+        on_success: Optional[Callable[[dict], None]] = None,
+        on_failure: Optional[Callable[[str], None]] = None,
+    ) -> tuple[bool, str]:
+        """异步获取当前位姿，结果通过 ``on_success`` 回调送达。
 
-    def get_point(self, name: Optional[str] = None) -> tuple[bool, str]:
+        PR-C Task 4.2: 改用 ``call_async`` 走 Runtime IPC 回调通道，
+        槽函数可在 ``on_success`` 中拿到 ``{"pose": [...]}`` payload。
+        """
+        return self.call_async(
+            "get_current_pose",
+            on_success=on_success,
+            on_failure=on_failure,
+        )
+
+    def get_point(
+        self,
+        name: Optional[str] = None,
+        on_success: Optional[Callable[[dict], None]] = None,
+        on_failure: Optional[Callable[[str], None]] = None,
+    ) -> tuple[bool, str]:
+        """异步读取点位，结果通过 ``on_success`` 回调送达。
+
+        PR-C Task 4.3: 改用 ``call_async`` 走 Runtime IPC 回调通道。
+        """
         data = {"point_name": name} if name else None
-        return self._send("get_point", data, action_name="读取当前点位")
+        return self.call_async(
+            "get_point",
+            data,
+            on_success=on_success,
+            on_failure=on_failure,
+        )
 
     # -- 相机 ------------------------------------------------------------
 
@@ -149,8 +212,20 @@ class RuntimeFacade:
 
     # -- 调试流程 --------------------------------------------------------
 
-    def run_step(self, module: Any) -> tuple[bool, str]:
-        return self._send("run_step", {"module": module}, action_name="单步执行")
+    def run_step(
+        self,
+        flow_id: str,
+        step_index: int,
+    ) -> tuple[bool, str]:
+        """单步执行：在 ``flow_id`` 中运行第 ``step_index`` 个模块。
+
+        PR-C Task 3.1: 签名从 ``run_step(module)`` 改为
+        ``run_step(flow_id, step_index)``，payload 与 Runtime 端
+        ``_ipc_run_step`` 期望的 ``{"flow_id": str, "step_index": int}``
+        对齐（之前发送 ``{"module": module}`` 导致 schema 不匹配）。
+        """
+        data = {"flow_id": flow_id, "step_index": int(step_index)}
+        return self._send("run_step", data, action_name="单步执行")
 
     def run_flow(self, flow_id: Optional[str] = None) -> tuple[bool, str]:
         data = {"flow_id": flow_id} if flow_id else None

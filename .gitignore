@@ -39,3 +39,6 @@ user_data/*
 !user_data/.gitkeep
 !user_data/logs/.gitkeep
 *.lock
+
+# Runtime logs (WinSW service output)
+logs/

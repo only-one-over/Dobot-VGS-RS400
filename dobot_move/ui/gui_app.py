@@ -5,17 +5,17 @@
 """
 
 import sys
+import os
 import json
 import base64
 import time
-import numpy as np
 import logging
 from ..ui.qt_compat import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QGroupBox, QGridLayout, QStatusBar,
-    QMessageBox, QLineEdit, QDoubleSpinBox, QComboBox,
+    QMessageBox, QLineEdit, QDoubleSpinBox, QComboBox, QFileDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QFrame, QScrollArea, QStackedWidget,
-    QCheckBox, QSizePolicy, QTextEdit,
+    QCheckBox, QSizePolicy, QTextEdit, QTabWidget,
     Qt, QTimer, QPixmap,
 )
 
@@ -28,6 +28,10 @@ from ..config.config_manager import (
     get_modbus_slave_id,
     get_robot_ip,
     get_runtime_config,
+    get_camera_model_path,
+    set_camera_model_path,
+    set_robot_ip,
+    set_photo_position,
 )
 from ..ui.gui_runtime_status import (
     DEFAULT_RUNTIME_HEALTH_PATH,
@@ -46,8 +50,10 @@ from .mixins import (
     PointManagementMixin,
     GraspFlowMixin,
 )
-from ..ui.ui_theme import apply_theme, apply_status_visual, set_button_role, NAV_ICONS, card_style, metric_label_style, metric_title_style
+from ..ui.ui_theme import apply_theme, apply_status_visual, set_button_role, NAV_ICONS, COLORS, card_style, card_value_color, metric_label_style, metric_title_style, metric_value_style
 from ..flow.flow_step_list import FlowStepList
+from .production_monitor_page import ProductionMonitorPage
+from .config_center_page import ConfigCenterPage
 from ..ui.main_control_panel import MainControlPanel
 from ..flow.flow_library import FlowLibrary
 from ..ui.gui_debug_widgets import ErrorTrendPlot
@@ -88,6 +94,16 @@ _DEFAULT_GRASP_FLOW_MODULES = [
         }
     }
 ]
+
+_MODBUS_METRIC_STYLE = (
+    f"font-size: 13pt; font-weight: bold; color: {COLORS['accent_blue']}; "
+    "background: transparent;"
+)
+
+_CAM_COORD_STYLE = (
+    f"font-family: monospace; font-size: 13pt; color: #64748b;"
+)
+
 
 class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManagementMixin, GraspFlowMixin, QMainWindow):
     """机器人控制GUI"""
@@ -147,9 +163,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self._active_flow_id = None
         self._active_flow_name = None
         self._active_flow_modules = []
-        self._software_emergency_active = False
-        self._emergency_cmd_running = False
-        self._last_emergency_click_ts = 0.0
         self._editing_point_row = -1
         self._editing_point_name = None
         
@@ -159,8 +172,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         # unsupported buttons get gated. Sent quietly so it doesn't pollute
         # the debug panel on every startup.
         self._refresh_runtime_capabilities()
-        if HANDEYE_AVAILABLE:
-            self._load_calib_matrix("D435i")
+        # 手眼标定值已由 ConfigCenterPage 在构建时加载，无需在此重复加载
         self.statusBar().showMessage("正在初始化状态监控...")
 
     def _load_grasp_flow_modules(self):
@@ -247,86 +259,19 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         main_layout.setSpacing(8)
         main_layout.setContentsMargins(12, 12, 12, 8)
         
-        # ── 顶部状态仪表盘卡片 ──
-        status_group = QGroupBox("系统状态")
-        status_group.setObjectName("topStatusPanel")
-        status_layout = QHBoxLayout()
-        status_layout.setSpacing(12)
-        status_layout.setContentsMargins(12, 10, 12, 10)
-        
-        # 机器人状态卡片
-        status_layout.addWidget(self._create_status_card("机器人", "#3b82f6", "robot_status_label", "未连接"))
-
-        # 相机状态卡片
-        status_layout.addWidget(self._create_status_card("相机", "#06b6d4", "camera_status_label", "未连接"))
-
-        # GPU推理模式卡片
-        status_layout.addWidget(self._create_status_card("推理", "#f59e0b", "gpu_status_label", "未检测"))
-
-        # 初始位置卡片
-        status_layout.addWidget(self._create_status_card("位置", "#8b5cf6", "photo_position_label", f"{get_initial_point()}", label_color="#8b5cf6"))
-
-        
-        # 右侧操作区
-        right_actions = QVBoxLayout()
-        right_actions.setSpacing(6)
-        
-        self.realtime_btn = QPushButton("实时反馈")
-        self.realtime_btn.clicked.connect(self.open_realtime_feedback)
-        self.realtime_btn.setMinimumHeight(36)
-        right_actions.addWidget(self.realtime_btn)
-
-        self.emergency_stop_btn = QPushButton("安全停止")
-        self.emergency_stop_btn.setObjectName("emergencyStopButton")
-        self.emergency_stop_btn.setFixedSize(82, 82)
-        self.emergency_stop_btn.clicked.connect(self.on_emergency_stop)
-        self._update_emergency_stop_button()
-        right_actions.addWidget(self.emergency_stop_btn, 0, Qt.AlignmentFlag.AlignCenter)
-        
-        status_layout.addLayout(right_actions)
-
-        status_group.setLayout(status_layout)
-        main_layout.addWidget(status_group)
-
-        # ── PR 5 Task 2: 生产上下文仪表盘 ──
-        production_group = QGroupBox("生产上下文")
-        production_group.setObjectName("productionContextPanel")
-        production_layout = QGridLayout()
-        production_layout.setSpacing(6)
-        production_layout.setContentsMargins(12, 8, 12, 8)
-
-        # 生产状态 / 钩子类型 / 当前程序 / 当前步骤 / PLC状态 / 模式 / task_id
-        self.prod_state_label = QLabel("空闲")
-        self.prod_hook_label = QLabel("---")
-        self.prod_flow_label = QLabel("---")
-        self.prod_step_label = QLabel("---")
-        self.prod_plc_label = QLabel("40001=---")
-        self.prod_mode_label = QLabel("---")
-        self.prod_task_id_label = QLabel("---")
-        self.prod_task_id_label.setStyleSheet(
-            "font-family: monospace; font-size: 11px; color: #64748b;"
+        # ── 精简顶栏：仅标题 ──
+        # 系统状态卡片组与生产上下文面板已迁移到「生产监控」导航页
+        # 安全停止按钮已移除，停止功能由 Modbus 40001=0 或 IPC safe_stop 提供
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(12)
+        top_bar.setContentsMargins(4, 4, 4, 4)
+        title_label = QLabel("DOBOT VGS")
+        title_label.setStyleSheet(
+            "font-size: 18pt; font-weight: bold; color: #e5e7eb; padding: 8px;"
         )
-
-        rows = [
-            ("生产状态:", self.prod_state_label),
-            ("钩子类型:", self.prod_hook_label),
-            ("当前程序:", self.prod_flow_label),
-            ("当前步骤:", self.prod_step_label),
-            ("PLC状态:", self.prod_plc_label),
-            ("模式:", self.prod_mode_label),
-            ("task_id:", self.prod_task_id_label),
-        ]
-        for row_idx, (title, value_label) in enumerate(rows):
-            title_label = QLabel(title)
-            title_label.setStyleSheet(
-                "color: #94a3b8; font-size: 11px;"
-            )
-            value_label.setMinimumWidth(120)
-            production_layout.addWidget(title_label, row_idx, 0)
-            production_layout.addWidget(value_label, row_idx, 1)
-
-        production_group.setLayout(production_layout)
-        main_layout.addWidget(production_group)
+        top_bar.addWidget(title_label)
+        top_bar.addStretch()
+        main_layout.addLayout(top_bar)
 
         # ── 左侧导航 + 右侧内容 ──
         content_layout = QHBoxLayout()
@@ -343,7 +288,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         # 侧边栏标题
         nav_header = QLabel("DOBOT VGS")
         nav_header.setStyleSheet(
-            "color: #3b82f6; font-size: 11pt; font-weight: 900; "
+            f"color: {COLORS['primary']}; font-size: 11pt; font-weight: 900; "
             "letter-spacing: 1px; padding: 8px 10px 12px 10px; "
             "background: transparent; border: none;"
         )
@@ -356,22 +301,94 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         content_layout.addWidget(self.sidebar)
         content_layout.addWidget(self.stacked_widget, 1)
         
+        # ── 生产监控页（系统状态卡片 + 生产上下文，从顶部迁移） ──
+        self.production_monitor_page = ProductionMonitorPage()
+        self.production_monitor_page.realtime_requested.connect(self.open_realtime_feedback)
+        self._add_nav_page("生产监控", self.production_monitor_page)
+
+        # 向后兼容：将生产监控页的标签暴露为主窗口属性，
+        # 以便现有的 update_status / update_gpu_status
+        # 等方法无需修改即可继续工作
+        self.robot_status_label = self.production_monitor_page.robot_status_label
+        self.camera_status_label = self.production_monitor_page.camera_status_label
+        self.gpu_status_label = self.production_monitor_page.gpu_status_label
+        self.runtime_status_label = self.production_monitor_page.runtime_status_label
+        self.prod_state_label = self.production_monitor_page.prod_state_label
+        self.prod_hook_label = self.production_monitor_page.prod_hook_label
+        self.prod_flow_label = self.production_monitor_page.prod_flow_label
+        self.prod_step_label = self.production_monitor_page.prod_step_label
+        self.prod_plc_label = self.production_monitor_page.prod_plc_label
+        self.prod_mode_label = self.production_monitor_page.prod_mode_label
+        self.prod_task_id_label = self.production_monitor_page.prod_task_id_label
+        self.realtime_btn = self.production_monitor_page.realtime_btn
+
+        # ── 配置中心页（机器人/相机/手眼标定/Modbus/Runtime 配置） ──
+        self.config_center_page = ConfigCenterPage()
+        self._add_nav_page("配置中心", self.config_center_page)
+        self._connect_config_center_signals()
+
         # 主功能选项卡
+        self._add_nav_page("主功能", self._wrap_in_scroll(self._build_main_tab()))
+
+        # 运动编辑选项卡
+        self._add_nav_page("运动编辑", self._wrap_in_scroll(self._build_motion_tab()))
+
+        # 点位管理选项卡
+        self._add_nav_page("点位管理", self._wrap_in_scroll(self._build_point_tab()))
+
+        # Modbus 通信选项卡
+        self._add_nav_page("Modbus 通信", self._wrap_in_scroll(self._build_modbus_tab()))
+
+        self._create_alarm_tab()
+
+        # 手眼标定 Tab 已移除，相关功能迁移到「配置中心」导航页
+
+        # ===== 相机测试选项卡 =====
+        self._add_nav_page("相机测试", self._wrap_in_scroll(self._build_camera_test_tab()))
+        self._create_runtime_debug_page()
+
+        # Modbus 数据刷新定时器
+        self._modbus_refresh_timer = QTimer()
+        self._modbus_refresh_timer.timeout.connect(self._refresh_modbus_table)
+
+        self.refresh_points_table()
+
+        main_layout.addLayout(content_layout)
+
+        # 设置「生产监控」为首页（导航页注册完成后）
+        self.stacked_widget.setCurrentIndex(0)
+
+        # 状态栏
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("就绪")
+
+        # Runtime 状态指示（Task 4：maintenance 显式显示）
+        self.runtime_state_label = QLabel("Runtime: 未知")
+        self.runtime_state_label.setStyleSheet(
+            f"color: {COLORS['text']}; background-color: {COLORS['card']}; "
+            f"border: 1px solid {COLORS['line']}; border-radius: 6px; "
+            "padding: 2px 8px; margin: 0 4px;"
+        )
+        self.status_bar.addPermanentWidget(self.runtime_state_label)
+
+        self._set_status_visual(self.robot_status_label, "未连接")
+        self._set_status_visual(self.camera_status_label, "未连接")
+        self._select_editing_flow(self.editing_flow_id)
+        self._refresh_action_states()
+
+    def _build_main_tab(self):
+        """构建主功能页：主控制面板 + 向后兼容别名。"""
         main_tab = QWidget()
         main_tab_layout = QVBoxLayout(main_tab)
         main_tab_layout.setSpacing(10)
         main_tab_layout.setContentsMargins(10, 10, 10, 10)
 
         self.main_control = MainControlPanel(self.robot_ip)
-        # 连接信号到现有处理方法
+        # 连接信号到现有处理方法（相机控制已迁移到配置中心，不再连接）
         self.main_control.connect_robot.connect(self.connect_robot)
         self.main_control.enable_robot.connect(self.enable_robot)
         self.main_control.disable_robot.connect(self.disable_robot)
-        self.main_control.connect_d435i.connect(self.connect_d435i)
-        self.main_control.disconnect_d435i.connect(self.disconnect_d435i)
-        self.main_control.connect_d405.connect(self.connect_d405)
-        self.main_control.disconnect_d405.connect(self.disconnect_d405)
-        self.main_control.select_camera_model.connect(self._select_camera_model)
         self.main_control.run_grasp.connect(self.run_grasping_task)
         self.main_control.move_initial.connect(self.move_to_initial_position)
         self.main_control.get_pose.connect(self.get_current_position)
@@ -380,24 +397,14 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.main_control.pause.connect(self.on_pause)
         self.main_control.resume.connect(self.on_continue)
         self.main_control.stop_current_task.connect(self._on_stop_current_task)
-        self.main_control.collision_level_changed.connect(self.on_collision_level_changed)
-        self.main_control.ip_changed.connect(lambda ip: ConfigService.instance().set_ip('robot_ip', ip))
         self.main_control.main_flow_changed.connect(self._on_main_flow_changed)
         main_tab_layout.addWidget(self.main_control)
 
         # 向后兼容属性别名，供 mixins 和 _refresh_action_states 访问
-        self.ip_input = self.main_control.ip_input
         self.run_task_btn = self.main_control.run_task_btn
         self.connect_robot_btn = self.main_control.connect_robot_btn
         self.enable_robot_btn = self.main_control.enable_robot_btn
         self.disable_robot_btn = self.main_control.disable_robot_btn
-        self.d435i_status_label = self.main_control.d435i_status_label
-        self.d435i_connect_btn = self.main_control.d435i_connect_btn
-        self.d435i_disconnect_btn = self.main_control.d435i_disconnect_btn
-        self.d405_status_label = self.main_control.d405_status_label
-        self.d405_connect_btn = self.main_control.d405_connect_btn
-        self.d405_disconnect_btn = self.main_control.d405_disconnect_btn
-        self._refresh_camera_model_controls()
         self.get_pos_btn = self.main_control.get_pos_btn
         self.move_initial_btn = self.main_control.move_initial_btn
         self.collision_combo = self.main_control.collision_combo
@@ -405,10 +412,10 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.clear_error_btn = self.main_control.clear_error_btn
         self.pause_btn = self.main_control.pause_btn
         self.continue_btn = self.main_control.continue_btn
+        return main_tab
 
-        self._add_nav_page("主功能", self._wrap_in_scroll(main_tab))
-        
-        # 运动编辑选项卡
+    def _build_motion_tab(self):
+        """构建运动编辑页：抓取流程编辑 + 模块拼接工具。"""
         motion_tab = QWidget()
         motion_tab_layout = QVBoxLayout(motion_tab)
         motion_tab_layout.setSpacing(10)
@@ -428,15 +435,18 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         )
         flow_select_layout.addWidget(self.edit_flow_combo, 1)
         self.new_flow_btn = QPushButton("新建")
+        set_button_role(self.new_flow_btn, "primary")
         self.new_flow_btn.clicked.connect(self.create_flow)
         # Role-flow protection is enforced at FlowLibrary layer:
         # delete_flow/rename_flow raise ValueError for role flows;
         # the mixin's try/except surfaces a QMessageBox to the user.
         flow_select_layout.addWidget(self.new_flow_btn)
         self.rename_flow_btn = QPushButton("重命名")
+        set_button_role(self.rename_flow_btn, "secondary")
         self.rename_flow_btn.clicked.connect(self.rename_flow)
         flow_select_layout.addWidget(self.rename_flow_btn)
         self.duplicate_flow_btn = QPushButton("复制")
+        set_button_role(self.duplicate_flow_btn, "secondary")
         self.duplicate_flow_btn.clicked.connect(self.duplicate_flow)
         flow_select_layout.addWidget(self.duplicate_flow_btn)
         self.delete_flow_btn = QPushButton("删除")
@@ -453,75 +463,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         
         # 当前选中的步骤索引
         self.selected_step_index = -1
-        
-        point_mgmt_group = QGroupBox("点位管理")
-        point_mgmt_layout = QVBoxLayout()
-        point_mgmt_layout.setSpacing(10)
-
-        self.points_table = QTableWidget()
-        self.points_table.setColumnCount(9)
-        self.points_table.setHorizontalHeaderLabels(["名称", "X", "Y", "Z", "Rx", "Ry", "Rz", "相对", "基准点位"])
-        header = self.points_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.points_table.setColumnWidth(0, 100)
-        for col in range(1, 7):
-            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
-        self.points_table.setColumnWidth(7, 60)
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)
-        self.points_table.setColumnWidth(8, 120)
-        self.points_table.setAlternatingRowColors(True)
-        self.points_table.verticalHeader().setVisible(False)
-        self.points_table.verticalHeader().setDefaultSectionSize(56)
-        self.points_table.setMinimumHeight(300)
-        self.points_table.itemSelectionChanged.connect(self._on_point_selection_changed)
-        point_mgmt_layout.addWidget(self.points_table)
-
-        point_btn_layout = QHBoxLayout()
-        point_btn_layout.setSpacing(10)
-
-        self.add_point_btn = QPushButton("添加点位")
-        self.add_point_btn.clicked.connect(self._on_add_point)
-        point_btn_layout.addWidget(self.add_point_btn)
-
-        self.delete_point_btn = QPushButton("删除点位")
-        self.delete_point_btn.clicked.connect(self._on_delete_point)
-        point_btn_layout.addWidget(self.delete_point_btn)
-
-        self.edit_point_btn = QPushButton("修改点位")
-        self.edit_point_btn.clicked.connect(self._on_edit_point)
-        point_btn_layout.addWidget(self.edit_point_btn)
-
-        self.save_point_btn = QPushButton("保存修改")
-        self.save_point_btn.clicked.connect(self._on_save_point_edit)
-        self.save_point_btn.setEnabled(False)
-        point_btn_layout.addWidget(self.save_point_btn)
-
-        self.cancel_point_btn = QPushButton("取消修改")
-        self.cancel_point_btn.clicked.connect(self._on_cancel_point_edit)
-        self.cancel_point_btn.setEnabled(False)
-        point_btn_layout.addWidget(self.cancel_point_btn)
-
-        self.read_point_btn = QPushButton("读取当前点位")
-        self.read_point_btn.setMinimumWidth(120)
-        self.read_point_btn.clicked.connect(self._on_read_current_for_selected_point)
-        self.read_point_btn.setEnabled(False)
-        point_btn_layout.addWidget(self.read_point_btn)
-
-        self.refresh_points_btn = QPushButton("刷新点位")
-        self.refresh_points_btn.clicked.connect(self.refresh_points_table)
-        point_btn_layout.addWidget(self.refresh_points_btn)
-
-        # 运动到此点：通过 Runtime IPC 调用 move_to_point（Task 5）
-        self.move_to_point_btn = QPushButton("运动到此点")
-        self.move_to_point_btn.clicked.connect(self._on_move_to_point)
-        self.move_to_point_btn.setEnabled(False)
-        point_btn_layout.addWidget(self.move_to_point_btn)
-
-        point_btn_layout.addStretch()
-        point_mgmt_layout.addLayout(point_btn_layout)
-
-        point_mgmt_group.setLayout(point_mgmt_layout)
 
         module_group = QGroupBox("模块拼接工具")
         module_layout = QVBoxLayout()
@@ -537,11 +478,13 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         module_select_layout.addWidget(self.module_combo)
         
         self.add_module_btn = QPushButton("添加模块")
+        set_button_role(self.add_module_btn, "primary")
         self.add_module_btn.setDefault(True)
         self.add_module_btn.clicked.connect(self.add_module)
         module_select_layout.addWidget(self.add_module_btn)
         
         self.remove_module_btn = QPushButton("移除模块")
+        set_button_role(self.remove_module_btn, "danger")
         self.remove_module_btn.clicked.connect(self.remove_module)
         module_select_layout.addWidget(self.remove_module_btn)
         
@@ -568,7 +511,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.linear_point_combo = QComboBox()
         linear_layout.addWidget(self.linear_point_combo)
         self.linear_point_preview = QLabel("")
-        self.linear_point_preview.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.linear_point_preview.setStyleSheet("color: #64748b; font-size: 11pt;")
         linear_layout.addWidget(self.linear_point_preview)
         self.linear_point_combo.currentTextChanged.connect(self._on_linear_point_selected)
 
@@ -788,7 +731,35 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         # 段表格
         self.rpath_seg_table = QTableWidget(0, 15)
         self.rpath_seg_table.setHorizontalHeaderLabels(["启用", "名称", "坐标系", "方式", "X", "Y", "Z", "Rx", "Ry", "Rz", "速度", "加速度", "CP", "段后等待", "备注"])
-        self.rpath_seg_table.horizontalHeader().setStretchLastSection(True)
+        rpath_header = self.rpath_seg_table.horizontalHeader()
+        rpath_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)   # 启用
+        rpath_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # 名称
+        rpath_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)   # 坐标系
+        rpath_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)   # 方式
+        rpath_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)   # X
+        rpath_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)   # Y
+        rpath_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)   # Z
+        rpath_header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)   # Rx
+        rpath_header.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)   # Ry
+        rpath_header.setSectionResizeMode(9, QHeaderView.ResizeMode.Fixed)   # Rz
+        rpath_header.setSectionResizeMode(10, QHeaderView.ResizeMode.Fixed)  # 速度
+        rpath_header.setSectionResizeMode(11, QHeaderView.ResizeMode.Fixed)  # 加速度
+        rpath_header.setSectionResizeMode(12, QHeaderView.ResizeMode.Fixed)  # CP
+        rpath_header.setSectionResizeMode(13, QHeaderView.ResizeMode.Fixed)  # 段后等待
+        rpath_header.setSectionResizeMode(14, QHeaderView.ResizeMode.Stretch)  # 备注
+        self.rpath_seg_table.setColumnWidth(0, 60)   # 启用
+        self.rpath_seg_table.setColumnWidth(2, 80)   # 坐标系
+        self.rpath_seg_table.setColumnWidth(3, 80)   # 方式
+        self.rpath_seg_table.setColumnWidth(4, 80)   # X
+        self.rpath_seg_table.setColumnWidth(5, 80)   # Y
+        self.rpath_seg_table.setColumnWidth(6, 80)   # Z
+        self.rpath_seg_table.setColumnWidth(7, 80)   # Rx
+        self.rpath_seg_table.setColumnWidth(8, 80)   # Ry
+        self.rpath_seg_table.setColumnWidth(9, 80)   # Rz
+        self.rpath_seg_table.setColumnWidth(10, 80)  # 速度
+        self.rpath_seg_table.setColumnWidth(11, 80)  # 加速度
+        self.rpath_seg_table.setColumnWidth(12, 60)  # CP
+        self.rpath_seg_table.setColumnWidth(13, 80)  # 段后等待
         self.rpath_seg_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         rpath_layout.addWidget(self.rpath_seg_table)
 
@@ -880,6 +851,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         
         # 模块参数更新按钮
         self.update_param_btn = QPushButton("更新参数")
+        set_button_role(self.update_param_btn, "secondary")
         self.update_param_btn.setDefault(True)
         self.update_param_btn.clicked.connect(self.update_module_params)
         module_layout.addWidget(self.update_param_btn)
@@ -937,18 +909,96 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
 
         grasp_flow_group.setLayout(grasp_flow_layout)
         motion_tab_layout.addWidget(grasp_flow_group)
-        
-        self._add_nav_page("运动编辑", self._wrap_in_scroll(motion_tab))
+        return motion_tab
+
+    def _build_point_tab(self):
+        """构建点位管理页：点位表格 + 编辑控件。"""
+        point_mgmt_group = QGroupBox("点位管理")
+        point_mgmt_layout = QVBoxLayout()
+        point_mgmt_layout.setSpacing(10)
+
+        self.points_table = QTableWidget()
+        self.points_table.setColumnCount(9)
+        self.points_table.setHorizontalHeaderLabels(["名称", "X", "Y", "Z", "Rx", "Ry", "Rz", "相对", "基准点位"])
+        header = self.points_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.points_table.setColumnWidth(0, 100)
+        for col in range(1, 7):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        self.points_table.setColumnWidth(7, 60)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)
+        self.points_table.setColumnWidth(8, 120)
+        self.points_table.setAlternatingRowColors(True)
+        self.points_table.verticalHeader().setVisible(False)
+        self.points_table.verticalHeader().setDefaultSectionSize(56)
+        self.points_table.setMinimumHeight(300)
+        self.points_table.itemSelectionChanged.connect(self._on_point_selection_changed)
+        point_mgmt_layout.addWidget(self.points_table)
+
+        point_btn_layout = QHBoxLayout()
+        point_btn_layout.setSpacing(10)
+
+        self.add_point_btn = QPushButton("添加点位")
+        set_button_role(self.add_point_btn, "primary")
+        self.add_point_btn.clicked.connect(self._on_add_point)
+        point_btn_layout.addWidget(self.add_point_btn)
+
+        self.delete_point_btn = QPushButton("删除点位")
+        set_button_role(self.delete_point_btn, "danger")
+        self.delete_point_btn.clicked.connect(self._on_delete_point)
+        point_btn_layout.addWidget(self.delete_point_btn)
+
+        self.edit_point_btn = QPushButton("修改点位")
+        set_button_role(self.edit_point_btn, "secondary")
+        self.edit_point_btn.clicked.connect(self._on_edit_point)
+        point_btn_layout.addWidget(self.edit_point_btn)
+
+        self.save_point_btn = QPushButton("保存修改")
+        set_button_role(self.save_point_btn, "secondary")
+        self.save_point_btn.clicked.connect(self._on_save_point_edit)
+        self.save_point_btn.setEnabled(False)
+        point_btn_layout.addWidget(self.save_point_btn)
+
+        self.cancel_point_btn = QPushButton("取消修改")
+        set_button_role(self.cancel_point_btn, "secondary")
+        self.cancel_point_btn.clicked.connect(self._on_cancel_point_edit)
+        self.cancel_point_btn.setEnabled(False)
+        point_btn_layout.addWidget(self.cancel_point_btn)
+
+        self.read_point_btn = QPushButton("读取当前点位")
+        set_button_role(self.read_point_btn, "secondary")
+        self.read_point_btn.setMinimumWidth(120)
+        self.read_point_btn.clicked.connect(self._on_read_current_for_selected_point)
+        self.read_point_btn.setEnabled(False)
+        point_btn_layout.addWidget(self.read_point_btn)
+
+        self.refresh_points_btn = QPushButton("刷新点位")
+        set_button_role(self.refresh_points_btn, "secondary")
+        self.refresh_points_btn.clicked.connect(self.refresh_points_table)
+        point_btn_layout.addWidget(self.refresh_points_btn)
+
+        # 运动到此点：通过 Runtime IPC 调用 move_to_point（Task 5）
+        self.move_to_point_btn = QPushButton("运动到此点")
+        set_button_role(self.move_to_point_btn, "secondary")
+        self.move_to_point_btn.clicked.connect(self._on_move_to_point)
+        self.move_to_point_btn.setEnabled(False)
+        point_btn_layout.addWidget(self.move_to_point_btn)
+
+        point_btn_layout.addStretch()
+        point_mgmt_layout.addLayout(point_btn_layout)
+
+        point_mgmt_group.setLayout(point_mgmt_layout)
 
         point_tab = QWidget()
         point_tab_layout = QVBoxLayout(point_tab)
         point_tab_layout.setSpacing(10)
         point_tab_layout.setContentsMargins(10, 10, 10, 10)
         point_tab_layout.addWidget(point_mgmt_group)
-        self._add_nav_page("点位管理", self._wrap_in_scroll(point_tab))
+        return point_tab
 
-
-        # Modbus 通信选项卡
+    def _build_modbus_tab(self):
+        """构建 Modbus 通信页：从站控制 + 寄存器表格。"""
         modbus_tab = QWidget()
         modbus_layout = QVBoxLayout(modbus_tab)
         modbus_layout.setSpacing(10)
@@ -972,12 +1022,14 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         modbus_ctrl_layout.addWidget(self.modbus_slave_id_input, 1, 1)
 
         self.modbus_start_btn = QPushButton("启动从站服务")
+        set_button_role(self.modbus_start_btn, "connect")
         self.modbus_start_btn.setMinimumWidth(120)
         self.modbus_start_btn.setMinimumHeight(40)
         self.modbus_start_btn.clicked.connect(self.start_modbus_server)
         modbus_ctrl_layout.addWidget(self.modbus_start_btn, 0, 2)
 
         self.modbus_stop_btn = QPushButton("停止从站服务")
+        set_button_role(self.modbus_stop_btn, "warning")
         self.modbus_stop_btn.setMinimumWidth(120)
         self.modbus_stop_btn.setMinimumHeight(40)
         self.modbus_stop_btn.clicked.connect(self.stop_modbus_server)
@@ -993,21 +1045,21 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         # 实时通信状态面板
         status_panel = QFrame()
         status_panel.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
-        status_panel.setStyleSheet(card_style("#3b82f6"))
+        status_panel.setStyleSheet(card_style(COLORS["primary"]))
         status_panel_layout = QHBoxLayout(status_panel)
         status_panel_layout.setSpacing(15)
         status_panel_layout.setContentsMargins(12, 8, 12, 8)
 
         self.modbus_cycle_label = QLabel(" 周期: 0")
-        self.modbus_cycle_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #93c5fd; background: transparent;")
+        self.modbus_cycle_label.setStyleSheet(_MODBUS_METRIC_STYLE)
         status_panel_layout.addWidget(self.modbus_cycle_label)
 
         self.modbus_duration_label = QLabel(" 耗时: 0ms")
-        self.modbus_duration_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #93c5fd; background: transparent;")
+        self.modbus_duration_label.setStyleSheet(_MODBUS_METRIC_STYLE)
         status_panel_layout.addWidget(self.modbus_duration_label)
 
         self.modbus_status_panel_label = QLabel(" 状态: 停止")
-        self.modbus_status_panel_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #93c5fd; background: transparent;")
+        self.modbus_status_panel_label.setStyleSheet(_MODBUS_METRIC_STYLE)
         status_panel_layout.addWidget(self.modbus_status_panel_label)
 
         status_panel_layout.addStretch()
@@ -1027,47 +1079,10 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         
         reg_group.setLayout(reg_layout)
         modbus_layout.addWidget(reg_group)
+        return modbus_tab
 
-        self._add_nav_page("Modbus 通信", self._wrap_in_scroll(modbus_tab))
-
-        self._create_alarm_tab()
-
-        calib_tab = QWidget()
-        calib_layout = QVBoxLayout(calib_tab)
-        calib_layout.setSpacing(10)
-        calib_layout.setContentsMargins(10, 10, 10, 10)
-
-        calib_selector_layout = QHBoxLayout()
-        calib_selector_layout.addWidget(QLabel("选择相机:"))
-        self.calib_camera_combo = QComboBox()
-        self.calib_camera_combo.addItems(["D435i", "D405"])
-        self.calib_camera_combo.currentTextChanged.connect(self._on_calib_camera_changed)
-        calib_selector_layout.addWidget(self.calib_camera_combo)
-        calib_selector_layout.addStretch()
-        calib_layout.addLayout(calib_selector_layout)
-
-        self.calib_table = QTableWidget(4, 4)
-        self.calib_table.setHorizontalHeaderLabels(["Col 0", "Col 1", "Col 2", "Col 3"])
-        self.calib_table.setVerticalHeaderLabels(["Row 0", "Row 1", "Row 2", "Row 3"])
-        self.calib_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.calib_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        calib_layout.addWidget(self.calib_table)
-
-        calib_btn_layout = QHBoxLayout()
-        self.calib_save_btn = QPushButton("保存")
-        self.calib_save_btn.clicked.connect(self._on_calib_save)
-        self.calib_reset_btn = QPushButton("重置")
-        self.calib_reset_btn.clicked.connect(self._on_calib_reset)
-        self.calib_refresh_btn = QPushButton("刷新")
-        self.calib_refresh_btn.clicked.connect(self._on_calib_refresh)
-        calib_btn_layout.addWidget(self.calib_save_btn)
-        calib_btn_layout.addWidget(self.calib_reset_btn)
-        calib_btn_layout.addWidget(self.calib_refresh_btn)
-        calib_layout.addLayout(calib_btn_layout)
-
-        self._add_nav_page("手眼标定", self._wrap_in_scroll(calib_tab))
-
-        # ===== 相机测试选项卡 =====
+    def _build_camera_test_tab(self):
+        """构建相机测试页：画面显示 + 坐标信息。"""
         camera_test_tab = QWidget()
         camera_test_layout = QVBoxLayout(camera_test_tab)
 
@@ -1078,13 +1093,16 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.cam_test_combo.addItems(["D435i", "D405"])
         cam_test_ctrl.addWidget(self.cam_test_combo)
         self.cam_test_start_btn = QPushButton("开始测试")
+        set_button_role(self.cam_test_start_btn, "connect")
         self.cam_test_start_btn.clicked.connect(self._start_camera_test)
         cam_test_ctrl.addWidget(self.cam_test_start_btn)
         self.cam_test_stop_btn = QPushButton("停止测试")
+        set_button_role(self.cam_test_stop_btn, "warning")
         self.cam_test_stop_btn.clicked.connect(self._stop_camera_test)
         self.cam_test_stop_btn.setEnabled(False)
         cam_test_ctrl.addWidget(self.cam_test_stop_btn)
         self.cam_self_test_btn = QPushButton("相机自检")
+        set_button_role(self.cam_self_test_btn, "secondary")
         self.cam_self_test_btn.clicked.connect(self._run_camera_self_test)
         cam_test_ctrl.addWidget(self.cam_self_test_btn)
         cam_test_ctrl.addStretch()
@@ -1095,8 +1113,9 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
 
         # 左侧: 画面显示
         self.cam_test_image_label = QLabel("等待测试...")
-        self.cam_test_image_label.setFixedSize(640, 480)
-        self.cam_test_image_label.setStyleSheet("background-color: #0b0f1a; color: #64748b; font-size: 16px; border: 1px solid #2a3550; border-radius: 8px;")
+        self.cam_test_image_label.setMinimumSize(480, 360)
+        self.cam_test_image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.cam_test_image_label.setStyleSheet(f"background-color: {COLORS['bg']}; color: #64748b; font-size: 16pt; border: 1px solid {COLORS['line']}; border-radius: 8px;")
         self.cam_test_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         cam_test_content.addWidget(self.cam_test_image_label)
 
@@ -1105,27 +1124,27 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         coord_layout = QVBoxLayout(coord_group)
 
         self.cam_test_status_label = QLabel("状态: 未开始")
-        self.cam_test_status_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #93c5fd;")
+        self.cam_test_status_label.setStyleSheet(f"font-weight: bold; font-size: 14pt; color: {COLORS['accent_blue']};")
         coord_layout.addWidget(self.cam_test_status_label)
 
         coord_layout.addWidget(QLabel("相机坐标 (mm):"))
         self.cam_test_cam_coords = QLabel("X: ---  Y: ---  Z: ---")
-        self.cam_test_cam_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
+        self.cam_test_cam_coords.setStyleSheet(_CAM_COORD_STYLE)
         coord_layout.addWidget(self.cam_test_cam_coords)
 
         coord_layout.addWidget(QLabel("末端坐标 (mm):"))
         self.cam_test_end_coords = QLabel("X: ---  Y: ---  Z: ---")
-        self.cam_test_end_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
+        self.cam_test_end_coords.setStyleSheet(_CAM_COORD_STYLE)
         coord_layout.addWidget(self.cam_test_end_coords)
 
         coord_layout.addWidget(QLabel("基座坐标 (mm):"))
         self.cam_test_base_coords = QLabel("X: ---  Y: ---  Z: ---")
-        self.cam_test_base_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
+        self.cam_test_base_coords.setStyleSheet(_CAM_COORD_STYLE)
         coord_layout.addWidget(self.cam_test_base_coords)
 
         coord_layout.addWidget(QLabel("置信度"))
         self.cam_test_confidence = QLabel("---")
-        self.cam_test_confidence.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
+        self.cam_test_confidence.setStyleSheet(_CAM_COORD_STYLE)
         coord_layout.addWidget(self.cam_test_confidence)
 
         # D405 专用
@@ -1133,15 +1152,15 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         d405_layout = QVBoxLayout(self.cam_test_d405_group)
         d405_layout.addWidget(QLabel("抓取坐标 (mm):"))
         self.cam_test_handle_coords = QLabel("X: ---  Y: ---  Z: ---")
-        self.cam_test_handle_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
+        self.cam_test_handle_coords.setStyleSheet(_CAM_COORD_STYLE)
         d405_layout.addWidget(self.cam_test_handle_coords)
         d405_layout.addWidget(QLabel("钩尖坐标 (mm):"))
         self.cam_test_tip_coords = QLabel("X: ---  Y: ---  Z: ---")
-        self.cam_test_tip_coords.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
+        self.cam_test_tip_coords.setStyleSheet(_CAM_COORD_STYLE)
         d405_layout.addWidget(self.cam_test_tip_coords)
         d405_layout.addWidget(QLabel("铁钩长度:"))
         self.cam_test_hook_length = QLabel("--- mm")
-        self.cam_test_hook_length.setStyleSheet("font-family: monospace; font-size: 13px; color: #93c5fd;")
+        self.cam_test_hook_length.setStyleSheet(_CAM_COORD_STYLE)
         d405_layout.addWidget(self.cam_test_hook_length)
         self.cam_test_d405_group.setVisible(False)
         coord_layout.addWidget(self.cam_test_d405_group)
@@ -1153,61 +1172,18 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
 
 
         self.cam_test_worker = None
+        return camera_test_tab
 
-        self._add_nav_page("相机测试", self._wrap_in_scroll(camera_test_tab))
-        self._create_runtime_debug_page()
-
-        # Modbus 数据刷新定时器
-        self._modbus_refresh_timer = QTimer()
-        self._modbus_refresh_timer.timeout.connect(self._refresh_modbus_table)
-
-        self.refresh_points_table()
-
-        main_layout.addLayout(content_layout)
-        
-        # 状态栏
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("就绪")
-
-        # Runtime 状态指示（Task 4：maintenance 显式显示）
-        self.runtime_state_label = QLabel("Runtime: 未知")
-        self.runtime_state_label.setStyleSheet(
-            "color: #e2e8f0; background-color: #1e293b; "
-            "border: 1px solid #2a3550; border-radius: 6px; "
-            "padding: 2px 8px; margin: 0 4px;"
-        )
-        self.status_bar.addPermanentWidget(self.runtime_state_label)
-
-        self._set_status_visual(self.robot_status_label, "未连接")
-        self._set_status_visual(self.camera_status_label, "未连接")
-        self._select_editing_flow(self.editing_flow_id)
-        self._refresh_action_states()
-
-    def on_collision_level_changed(self, level):
-        """碰撞等级下拉框变化回调。"""
-        pass
 
     def _set_status_visual(self, label, value):
         apply_status_visual(label, value)
-
-    def _update_emergency_stop_button(self):
-        if not hasattr(self, "emergency_stop_btn"):
-            return
-        self.emergency_stop_btn.setText("安全停止")
-        # Toggle active property so the stylesheet can highlight the button
-        # while a software emergency stop is in effect.
-        active = "true" if getattr(self, "_software_emergency_active", False) else "false"
-        self.emergency_stop_btn.setProperty("active", active)
-        self.emergency_stop_btn.style().unpolish(self.emergency_stop_btn)
-        self.emergency_stop_btn.style().polish(self.emergency_stop_btn)
 
     def _refresh_action_states(self):
         for attr in (
             "enable_robot_btn", "disable_robot_btn", "get_pos_btn",
             "move_initial_btn", "collision_set_btn", "clear_error_btn", "run_flow_btn",
             "run_task_btn", "connect_robot_btn", "pause_btn", "continue_btn",
-            "editor_pause_btn", "editor_continue_btn", "emergency_stop_btn",
+            "editor_pause_btn", "editor_continue_btn",
             "realtime_btn", "read_point_btn", "linear_read_current_btn",
             "cam_test_start_btn", "cam_test_stop_btn",
         ):
@@ -1216,14 +1192,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         if hasattr(self.main_control, "main_flow_combo"):
             self.main_control.main_flow_combo.setEnabled(True)
 
-        for camera_type, camera_connected in (
-            ("D435i", self._runtime_status.d435i_connected),
-            ("D405", self._runtime_status.d405_connected),
-        ):
-            self.main_control.set_camera_model_selection_enabled(
-                camera_type,
-                not camera_connected,
-            )
         for attr in (
             "edit_flow_combo",
             "new_flow_btn",
@@ -1239,7 +1207,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         # by the Runtime. ``_apply_capability_gating`` is a no-op when
         # capabilities haven't been fetched yet (treated as "all supported").
         self._apply_capability_gating()
-        self._update_emergency_stop_button()
 
     # -- PR-C Task 6: capability-based button gating ----------------------
 
@@ -1252,10 +1219,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         "clear_error_btn": "clear_alarms",
         "connect_robot_btn": "connect_robot",
         "collision_set_btn": "set_collision_level",
-        "d435i_connect_btn": "connect_camera",
-        "d405_connect_btn": "connect_camera",
-        "d435i_disconnect_btn": "disconnect_camera",
-        "d405_disconnect_btn": "disconnect_camera",
         "modbus_start_btn": "start_modbus",
         "modbus_stop_btn": "stop_modbus",
         "realtime_btn": "get_vision_snapshot",
@@ -1322,6 +1285,22 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         layout.setSpacing(10)
         layout.setContentsMargins(10, 10, 10, 10)
 
+        # Task 11: Split the debug page into 3 inner tabs.
+        # Widget construction is unchanged; only the layout container changes.
+        tabs = QTabWidget()
+        tab_status = QWidget()
+        tab_status_layout = QVBoxLayout(tab_status)
+        tab_status_layout.setSpacing(10)
+        tab_status_layout.setContentsMargins(0, 0, 0, 0)
+        tab_flow = QWidget()
+        tab_flow_layout = QVBoxLayout(tab_flow)
+        tab_flow_layout.setSpacing(10)
+        tab_flow_layout.setContentsMargins(0, 0, 0, 0)
+        tab_vision = QWidget()
+        tab_vision_layout = QVBoxLayout(tab_vision)
+        tab_vision_layout.setSpacing(10)
+        tab_vision_layout.setContentsMargins(0, 0, 0, 0)
+
         runtime_group = QGroupBox("Runtime 维护控制")
         runtime_layout = QHBoxLayout(runtime_group)
         self.debug_runtime_state = QLabel("Runtime: 未连接")
@@ -1333,6 +1312,10 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             ("发布状态", "get_publication_status"),
         ):
             button = QPushButton(text)
+            set_button_role(
+                button,
+                {"enter_maintenance": "warning"}.get(command, "secondary"),
+            )
             # PR-C Task 6: ``get_status`` also refreshes the cached
             # capabilities so capability-gated buttons update accordingly.
             if command == "get_status":
@@ -1349,28 +1332,76 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             runtime_layout.addWidget(button)
         # 重载配置按钮（成功后在状态栏提示）
         self.debug_reload_config_btn = QPushButton("重载配置")
+        set_button_role(self.debug_reload_config_btn, "secondary")
         self.debug_reload_config_btn.clicked.connect(self._on_reload_config)
         runtime_layout.addWidget(self.debug_reload_config_btn)
         runtime_layout.addStretch()
-        layout.addWidget(runtime_group)
+        # Task 4: Runtime 状态概览组（置于页面顶部）
+        runtime_status_group = QGroupBox("Runtime 状态")
+        runtime_status_layout = QGridLayout(runtime_status_group)
+        runtime_status_layout.setColumnStretch(1, 1)
+        # 行 0: 运行状态
+        title_label = QLabel("运行状态:")
+        title_label.setStyleSheet(
+            "color: #cbd5e1; font-size: 10pt; font-weight: 700;"
+        )
+        runtime_status_layout.addWidget(title_label, 0, 0)
+        self.runtime_overview_state_label = QLabel("未知")
+        self.runtime_overview_state_label.setStyleSheet(metric_value_style())
+        self.runtime_overview_state_label.setMinimumWidth(200)
+        runtime_status_layout.addWidget(self.runtime_overview_state_label, 0, 1)
+        # 行 1: 在线状态
+        title_label = QLabel("在线状态:")
+        title_label.setStyleSheet(
+            "color: #cbd5e1; font-size: 10pt; font-weight: 700;"
+        )
+        runtime_status_layout.addWidget(title_label, 1, 0)
+        self.runtime_overview_online_label = QLabel("离线")
+        self.runtime_overview_online_label.setStyleSheet(metric_value_style())
+        self.runtime_overview_online_label.setMinimumWidth(200)
+        runtime_status_layout.addWidget(self.runtime_overview_online_label, 1, 1)
+        # 行 2: 最后错误
+        title_label = QLabel("最后错误:")
+        title_label.setStyleSheet(
+            "color: #cbd5e1; font-size: 10pt; font-weight: 700;"
+        )
+        runtime_status_layout.addWidget(title_label, 2, 0)
+        self.runtime_overview_error_label = QLabel("无")
+        self.runtime_overview_error_label.setStyleSheet(metric_value_style())
+        self.runtime_overview_error_label.setMinimumWidth(200)
+        runtime_status_layout.addWidget(self.runtime_overview_error_label, 2, 1)
+        # 行 3: 当前模块
+        title_label = QLabel("当前模块:")
+        title_label.setStyleSheet(
+            "color: #cbd5e1; font-size: 10pt; font-weight: 700;"
+        )
+        runtime_status_layout.addWidget(title_label, 3, 0)
+        self.runtime_overview_module_label = QLabel("---")
+        self.runtime_overview_module_label.setStyleSheet(metric_value_style())
+        self.runtime_overview_module_label.setMinimumWidth(200)
+        runtime_status_layout.addWidget(self.runtime_overview_module_label, 3, 1)
+        tab_status_layout.addWidget(runtime_status_group)
+        tab_status_layout.addWidget(runtime_group)
 
         # 任务状态轮询显示（SubTask 7.3）
         task_status_group = QGroupBox("任务状态")
         task_status_layout = QHBoxLayout(task_status_group)
         self.debug_task_status_label = QLabel("任务状态: 未知")
         self.debug_task_status_label.setStyleSheet(
-            "color: #e2e8f0; font-weight: 600; background: transparent; border: none;"
+            f"color: {COLORS['text']}; font-weight: 600; background: transparent; border: none;"
         )
         task_status_layout.addWidget(self.debug_task_status_label)
         task_status_layout.addStretch()
-        layout.addWidget(task_status_group)
+        tab_status_layout.addWidget(task_status_group)
 
         flow_group = QGroupBox("流程调试")
         flow_layout = QGridLayout(flow_group)
         self.debug_validate_btn = QPushButton("校验当前流程")
+        set_button_role(self.debug_validate_btn, "primary")
         self.debug_validate_btn.clicked.connect(self._validate_debug_flow)
         flow_layout.addWidget(self.debug_validate_btn, 0, 0)
         self.debug_start_btn = QPushButton("运行当前流程")
+        set_button_role(self.debug_start_btn, "primary")
         self.debug_start_btn.clicked.connect(self._start_debug_flow)
         flow_layout.addWidget(self.debug_start_btn, 0, 1)
         flow_layout.addWidget(QLabel("步骤序号:"), 0, 2)
@@ -1378,6 +1409,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.debug_step_input.setMaximumWidth(80)
         flow_layout.addWidget(self.debug_step_input, 0, 3)
         self.debug_step_btn = QPushButton("运行单步")
+        set_button_role(self.debug_step_btn, "secondary")
         self.debug_step_btn.clicked.connect(self._run_debug_step)
         flow_layout.addWidget(self.debug_step_btn, 0, 4)
         for column, (text, command) in enumerate(
@@ -1389,11 +1421,18 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             )
         ):
             button = QPushButton(text)
+            set_button_role(
+                button,
+                {
+                    "pause_debug_flow": "warning",
+                    "stop_debug_flow": "danger",
+                }.get(command, "secondary"),
+            )
             button.clicked.connect(
                 lambda _checked=False, cmd=command: self._send_runtime_ipc(cmd)
             )
             flow_layout.addWidget(button, 1, column)
-        layout.addWidget(flow_group)
+        tab_flow_layout.addWidget(flow_group)
 
         vision_group = QGroupBox("视觉诊断")
         vision_layout = QGridLayout(vision_group)
@@ -1401,9 +1440,11 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.debug_camera_combo.addItems(["D405", "D435i"])
         vision_layout.addWidget(self.debug_camera_combo, 0, 0)
         snapshot_button = QPushButton("采集诊断快照")
+        set_button_role(snapshot_button, "secondary")
         snapshot_button.clicked.connect(self._request_vision_snapshot)
         vision_layout.addWidget(snapshot_button, 0, 1)
         logs_button = QPushButton("读取 Runtime 日志")
+        set_button_role(logs_button, "secondary")
         logs_button.clicked.connect(
             lambda: self._send_runtime_ipc(
                 "get_runtime_logs",
@@ -1413,6 +1454,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         )
         vision_layout.addWidget(logs_button, 0, 2)
         self.debug_live_button = QPushButton("开始实时图")
+        set_button_role(self.debug_live_button, "secondary")
         self.debug_live_button.setCheckable(True)
         self.debug_live_button.toggled.connect(self._toggle_live_vision)
         vision_layout.addWidget(self.debug_live_button, 0, 3)
@@ -1424,17 +1466,17 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.debug_image_label.setMinimumSize(360, 240)
         self.debug_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.debug_image_label.setStyleSheet(
-            "background-color:#0b0f1a; border:1px solid #2a3550;"
+            f"background-color:{COLORS['bg']}; border:1px solid {COLORS['line']};"
         )
         vision_layout.addWidget(self.debug_image_label, 1, 0, 1, 3)
         self.debug_depth_label = QLabel("等待深度图")
         self.debug_depth_label.setMinimumSize(360, 240)
         self.debug_depth_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.debug_depth_label.setStyleSheet(
-            "background-color:#0b0f1a; border:1px solid #2a3550;"
+            f"background-color:{COLORS['bg']}; border:1px solid {COLORS['line']};"
         )
         vision_layout.addWidget(self.debug_depth_label, 1, 3, 1, 2)
-        layout.addWidget(vision_group)
+        tab_vision_layout.addWidget(vision_group)
 
         self.debug_telemetry_table = QTableWidget(0, 11)
         self.debug_telemetry_table.setHorizontalHeaderLabels(
@@ -1458,7 +1500,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.debug_telemetry_table.setEditTriggers(
             QTableWidget.EditTrigger.NoEditTriggers
         )
-        layout.addWidget(self.debug_telemetry_table)
+        tab_vision_layout.addWidget(self.debug_telemetry_table)
         plots_layout = QHBoxLayout()
         self.debug_error_time_plot = ErrorTrendPlot(
             "总误差 vs 时间",
@@ -1470,12 +1512,28 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         )
         plots_layout.addWidget(self.debug_error_time_plot)
         plots_layout.addWidget(self.debug_error_iteration_plot)
-        layout.addLayout(plots_layout)
+        tab_vision_layout.addLayout(plots_layout)
 
         self.debug_output = QTextEdit()
         self.debug_output.setReadOnly(True)
         self.debug_output.setMinimumHeight(150)
-        layout.addWidget(self.debug_output)
+        tab_vision_layout.addWidget(self.debug_output)
+
+        # Wrap each tab in a scroll area and register on the QTabWidget.
+        tab_status_layout.addStretch()
+        tab_flow_layout.addStretch()
+        tab_vision_layout.addStretch()
+        for _tab_widget, _tab_name in (
+            (tab_status, "状态概览"),
+            (tab_flow, "流程调试"),
+            (tab_vision, "视觉诊断"),
+        ):
+            _tab_scroll = QScrollArea()
+            _tab_scroll.setWidget(_tab_widget)
+            _tab_scroll.setWidgetResizable(True)
+            tabs.addTab(_tab_scroll, _tab_name)
+        layout.addWidget(tabs)
+
         self._add_nav_page("Runtime 调试", self._wrap_in_scroll(page))
 
         self._debug_telemetry_timer = QTimer(self)
@@ -1795,6 +1853,47 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             self.debug_runtime_state.setText(
                 f"Runtime: {snapshot.runtime_state} | 下一任务版本: {revision}"
             )
+        # Task 4: Runtime 调试页状态概览组
+        if hasattr(self, "runtime_overview_state_label"):
+            state_cn = translate_runtime_state(snapshot.runtime_state)
+            state_color = runtime_state_color(snapshot.runtime_state)
+            self.runtime_overview_state_label.setText(state_cn)
+            self.runtime_overview_state_label.setStyleSheet(metric_value_style(state_color))
+        if hasattr(self, "runtime_overview_online_label"):
+            if snapshot.online:
+                ts_str = (
+                    time.strftime("%H:%M:%S", time.localtime(snapshot.timestamp))
+                    if snapshot.timestamp > 0
+                    else "---"
+                )
+                online_text = f"在线 (更新于 {ts_str})"
+                online_color = "#22c55e"
+            else:
+                online_text = "离线"
+                online_color = "#9e9e9e"
+            self.runtime_overview_online_label.setText(online_text)
+            self.runtime_overview_online_label.setStyleSheet(metric_value_style(online_color))
+        if hasattr(self, "runtime_overview_error_label"):
+            error_text = snapshot.last_error if snapshot.last_error else "无"
+            self.runtime_overview_error_label.setText(error_text)
+            error_color = "#ef4444" if snapshot.last_error else "#cbd5e1"
+            self.runtime_overview_error_label.setStyleSheet(metric_value_style(error_color))
+        if hasattr(self, "runtime_overview_module_label"):
+            flow = snapshot.raw.get("flow") or {}
+            if not isinstance(flow, dict):
+                flow = {}
+            module_name = flow.get("module_name")
+            module_index = flow.get("module_index")
+            if module_name or module_index is not None:
+                parts = []
+                if module_name:
+                    parts.append(str(module_name))
+                if module_index is not None:
+                    parts.append(f"#{module_index}")
+                module_text = " ".join(parts) if parts else "---"
+            else:
+                module_text = "---"
+            self.runtime_overview_module_label.setText(module_text)
         # Task 4：在状态栏永久区域显式展示 Runtime 状态（含 maintenance）
         self._update_runtime_state_display(snapshot.runtime_state)
         if not snapshot.online:
@@ -1816,141 +1915,18 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             else ("Runtime 离线" if not snapshot.online else "未连接")
         )
         self.update_status("camera", camera_status)
-        self._set_camera_status(
+        # 相机状态更新到配置中心页（相机控制已迁移至配置中心）
+        self.config_center_page.update_camera_status(
             "D435i",
             "已连接" if snapshot.d435i_connected else "未连接",
         )
-        self._set_camera_status(
+        self.config_center_page.update_camera_status(
             "D405",
             "已连接" if snapshot.d405_connected else "未连接",
         )
-        self._refresh_production_display(snapshot)
+        self.production_monitor_page.update_status_cards(snapshot)
+        self.production_monitor_page.update_production_display(snapshot)
         self._refresh_modbus_table()
-
-    # PR 5 Task 2: ProductionState value → Chinese display name.
-    _PRODUCTION_STATE_CN: dict[str, str] = {
-        "manual_offline": "手动下线",
-        "idle": "空闲",
-        "standby": "待机",
-        "running": "运行中",
-        "paused": "已暂停",
-        "holding_hook": "扶钩等待",
-        "resetting": "复位中",
-        "error_recovery": "错误恢复中",
-        "flow_error": "流程错误",
-        "robot_error": "机器人故障",
-        "camera_error": "相机故障",
-    }
-
-    # 40001 value → Chinese meaning (subset for dashboard display).
-    _PLC_CMD_CN: dict[int, str] = {
-        0: "空闲/中停",
-        1: "复位",
-        2: "复位完成",
-        3: "执行流程",
-        4: "运行中",
-        5: "流程完成",
-        110: "流程ERR",
-        111: "机器人报错",
-        112: "相机报错",
-    }
-
-    def _refresh_production_display(self, snapshot: RuntimeHealthSnapshot) -> None:
-        """Update the 生产上下文 dashboard group from Health JSON ``production``.
-
-        PR 5 Task 2: reads the ``production`` field (added in PR 5 Task 1)
-        from the Runtime Health JSON and renders the live production
-        context (state / hook type / current flow / current step / PLC
-        status / mode / task_id) on the dashboard.
-
-        Falls back to ``"---"`` placeholders when the Runtime is offline
-        or the ``production`` field is absent (legacy Runtime builds).
-        """
-        production = snapshot.raw.get("production") or {}
-        if not isinstance(production, dict):
-            production = {}
-        flow = snapshot.raw.get("flow") or {}
-        if not isinstance(flow, dict):
-            flow = {}
-        modbus = snapshot.raw.get("modbus") or {}
-        if not isinstance(modbus, dict):
-            modbus = {}
-        # ``last_command`` carries the last 40001 value written by the PLC.
-        last_command = snapshot.raw.get("last_command") or {}
-        if not isinstance(last_command, dict):
-            last_command = {}
-
-        # 生产状态
-        state_value = str(production.get("state") or "")
-        if state_value:
-            state_cn = self._PRODUCTION_STATE_CN.get(state_value, state_value)
-        else:
-            state_cn = "---"
-        if hasattr(self, "prod_state_label"):
-            self.prod_state_label.setText(state_cn)
-            # Color-code by state category.
-            if state_value in {"running"}:
-                color = "#22c55e"
-            elif state_value in {"paused", "holding_hook", "resetting",
-                                 "error_recovery"}:
-                color = "#f59e0b"
-            elif state_value in {"flow_error", "robot_error", "camera_error",
-                                 "manual_offline"}:
-                color = "#ef4444"
-            else:
-                color = "#94a3b8"
-            self.prod_state_label.setStyleSheet(
-                f"color: {color}; font-weight: 600;"
-            )
-
-        # 钩子类型
-        hook_name = production.get("hook_name")
-        if hasattr(self, "prod_hook_label"):
-            self.prod_hook_label.setText(str(hook_name) if hook_name else "---")
-
-        # 当前程序 (flow name from flow snapshot; fall back to flow_id)
-        flow_name = flow.get("main_flow_name") or production.get("flow_id")
-        if hasattr(self, "prod_flow_label"):
-            self.prod_flow_label.setText(str(flow_name) if flow_name else "---")
-
-        # 当前步骤
-        step_name = flow.get("module_name")
-        if hasattr(self, "prod_step_label"):
-            self.prod_step_label.setText(str(step_name) if step_name else "---")
-
-        # PLC状态 (40001 current value + meaning)
-        cmd_value = last_command.get("value")
-        if cmd_value is None:
-            # Fall back to modbus stats if last_command is absent.
-            cmd_value = modbus.get("last_command_value")
-        if cmd_value is not None:
-            try:
-                cmd_int = int(cmd_value)
-                cmd_meaning = self._PLC_CMD_CN.get(cmd_int, str(cmd_int))
-                plc_text = f"40001={cmd_int} ({cmd_meaning})"
-            except (TypeError, ValueError):
-                plc_text = "40001=---"
-        else:
-            plc_text = "40001=---"
-        if hasattr(self, "prod_plc_label"):
-            self.prod_plc_label.setText(plc_text)
-
-        # 模式 (40002: 0→自动, 1→手动)
-        # The mode is not directly in the Health JSON; infer from
-        # production state when manual_offline, otherwise default to 自动.
-        if state_value == "manual_offline":
-            mode_text = "手动"
-        else:
-            mode_text = "自动"
-        if hasattr(self, "prod_mode_label"):
-            self.prod_mode_label.setText(mode_text)
-
-        # task_id (optional, for debugging)
-        task_id = production.get("task_id")
-        if hasattr(self, "prod_task_id_label"):
-            self.prod_task_id_label.setText(
-                str(task_id) if task_id else "---"
-            )
 
     def _update_runtime_state_display(self, state: str) -> None:
         """Update the status-bar Runtime label and main-control indicator.
@@ -1968,17 +1944,19 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             return
         self.runtime_state_label.setText(f"Runtime: {cn_text}")
         if state in {"MAINTENANCE", "MAINTENANCE_REQUESTED"}:
-            bg_color = "#ffc107" if state == "MAINTENANCE" else "#ff9800"
+            # bg_color == runtime_state_color(state) for maintenance states,
+            # so reuse the already-computed ``color`` to avoid hardcoding hex
+            # values that must stay in sync with gui_runtime_status.
             self.runtime_state_label.setStyleSheet(
                 "color: #1f2937; "
-                f"background-color: {bg_color}; "
+                f"background-color: {color}; "
                 f"border: 1px solid {color}; border-radius: 6px; "
                 "padding: 2px 8px; margin: 0 4px; font-weight: 700;"
             )
         else:
             self.runtime_state_label.setStyleSheet(
-                "color: #e2e8f0; background-color: #1e293b; "
-                "border: 1px solid #2a3550; border-radius: 6px; "
+                f"color: {COLORS['text']}; background-color: {COLORS['card']}; "
+                f"border: 1px solid {COLORS['line']}; border-radius: 6px; "
                 "padding: 2px 8px; margin: 0 4px;"
             )
         # Forward to the main control panel indicator (if present)
@@ -1992,85 +1970,35 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         """更新GPU推理模式状态显示。"""
         if provider_text is None:
             self.gpu_status_label.setText("未检测")
-            self.gpu_status_label.setStyleSheet(metric_label_style("#94a3b8"))
+            self.gpu_status_label.setStyleSheet(metric_label_style(COLORS["muted"]))
         elif "GPU" in provider_text:
             self.gpu_status_label.setText("GPU")
-            self.gpu_status_label.setStyleSheet(metric_label_style("#22c55e"))
+            self.gpu_status_label.setStyleSheet(metric_label_style(COLORS["success"]))
         else:
             self.gpu_status_label.setText("CPU")
-            self.gpu_status_label.setStyleSheet(metric_label_style("#f59e0b"))
+            self.gpu_status_label.setStyleSheet(metric_label_style(COLORS["warning"]))
 
     def update_status(self, status_type, status_value):
         """更新状态显示。"""
         if status_type == "robot":
             self.robot_status_label.setText(f"{status_value}")
             self._set_status_visual(self.robot_status_label, status_value)
-            # 更新卡片值颜色
-            if any(k in status_value for k in ("已连接", "运行", "成功", "connected", "running")):
-                self.robot_status_label.setStyleSheet(metric_label_style("#22c55e"))
-            elif any(k in status_value for k in ("错误", "失败", "报警", "error", "failed")):
-                self.robot_status_label.setStyleSheet(metric_label_style("#ef4444"))
-            else:
-                self.robot_status_label.setStyleSheet(metric_label_style("#94a3b8"))
+            color = card_value_color(status_value)
+            self.robot_status_label.setStyleSheet(metric_label_style(color))
         elif status_type == "camera":
             self.camera_status_label.setText(f"{status_value}")
             self._set_status_visual(self.camera_status_label, status_value)
-            if any(k in status_value for k in ("已连接", "运行", "成功", "connected", "running")):
-                self.camera_status_label.setStyleSheet(metric_label_style("#22c55e"))
-            elif any(k in status_value for k in ("错误", "失败", "error", "failed")):
-                self.camera_status_label.setStyleSheet(metric_label_style("#ef4444"))
-            else:
-                self.camera_status_label.setStyleSheet(metric_label_style("#94a3b8"))
-        elif status_type == "photo_position":
-            self.photo_position_label.setText(f"{status_value}")
+            color = card_value_color(status_value)
+            self.camera_status_label.setStyleSheet(metric_label_style(color))
         elif status_type == "general":
             self.status_bar.showMessage(status_value)
         self._refresh_action_states()
 
-    def on_emergency_stop(self):
-        """Software safe-stop via the dedicated Stop channel (port 8766).
-
-        Bypasses the normal FIFO queue so it executes immediately even when
-        a long-running command is blocking the command worker thread. The
-        button is debounced (500 ms) and stays clickable regardless of
-        command execution state.
-        """
-        import time as _time
-        now = _time.monotonic()
-        if now - getattr(self, "_last_emergency_click_ts", 0.0) < 0.5:
-            return
-        self._last_emergency_click_ts = now
-        if getattr(self, "_emergency_cmd_running", False):
-            return
-        self._emergency_cmd_running = True
-        self._send_runtime_ipc_stop(
-            "safe_stop",
-            on_success=lambda data: self._on_emergency_stop_finished(
-                "safe_stop", bool(data.get("emergency_stop_sent"))
-            ),
-            on_failure=lambda msg: self._on_emergency_stop_finished(
-                "safe_stop", False, error=msg
-            ),
-        )
-
-    def _on_emergency_stop_finished(self, cmd_name, success, error=""):
-        del cmd_name
-        self._emergency_cmd_running = False
-        if success:
-            self._software_emergency_active = True
-            self.statusBar().showMessage("安全停止已执行", 5000)
-        else:
-            self._software_emergency_active = False
-            message = f"安全停止失败: {error}" if error else "安全停止失败"
-            self.statusBar().showMessage(message, 5000)
-        self._update_emergency_stop_button()
-
     def _on_stop_current_task(self):
         """Normal motion stop via the normal IPC channel (port 8765).
 
-        Distinct from :meth:`on_emergency_stop`: this only calls
-        ``dashboard.Stop()`` on the Runtime side to halt the current
-        motion without dropping the robot enable state.
+        This only calls ``dashboard.Stop()`` on the Runtime side to halt
+        the current motion without dropping the robot enable state.
         """
         self._send_runtime_ipc(
             "stop_current_task",
@@ -2087,11 +2015,13 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
 
         ops_layout = QHBoxLayout()
         self.alarm_refresh_btn = QPushButton("刷新报警记录")
+        set_button_role(self.alarm_refresh_btn, "secondary")
         self.alarm_refresh_btn.setMinimumWidth(120)
         self.alarm_refresh_btn.clicked.connect(self._refresh_alarm_table)
         ops_layout.addWidget(self.alarm_refresh_btn)
 
         self.alarm_clear_btn = QPushButton("清空本地记录")
+        set_button_role(self.alarm_clear_btn, "danger")
         self.alarm_clear_btn.setMinimumWidth(120)
         self.alarm_clear_btn.clicked.connect(self._clear_alarm_history)
         self.alarm_clear_btn.setEnabled(False)
@@ -2102,7 +2032,19 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.alarm_table = QTableWidget()
         self.alarm_table.setColumnCount(7)
         self.alarm_table.setHorizontalHeaderLabels(["时间", "来源", "代码", "等级", "描述", "处理建议", "原始响应"])
-        self.alarm_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        header = self.alarm_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)  # 时间
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)  # 来源
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  # 代码
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # 等级
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)  # 描述
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)  # 处理建议
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)  # 原始响应
+        self.alarm_table.setColumnWidth(0, 150)  # 时间
+        self.alarm_table.setColumnWidth(1, 100)  # 来源
+        self.alarm_table.setColumnWidth(2, 80)   # 代码
+        self.alarm_table.setColumnWidth(3, 60)   # 等级
+        self.alarm_table.setColumnWidth(6, 100)  # 原始响应
         self.alarm_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.alarm_table.setAlternatingRowColors(True)
         alarm_layout.addWidget(self.alarm_table)
@@ -2129,60 +2071,130 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.statusBar().showMessage(msg, 3000)
         return success
     
-    def _on_calib_camera_changed(self, camera_type):
-        self._load_calib_matrix(camera_type)
+    # ------------------------------------------------------------------
+    # 配置中心信号连接与处理
+    # ------------------------------------------------------------------
+    def _connect_config_center_signals(self):
+        """连接配置中心页面的信号到对应处理方法。"""
+        page = self.config_center_page
 
-    def _load_calib_matrix(self, camera_type):
-        if not HANDEYE_AVAILABLE:
+        # 机器人配置
+        page.ip_save_requested.connect(self._on_config_save_ip)
+        page.photo_position_save_requested.connect(self._on_config_save_photo_position)
+
+        # 相机配置
+        page.camera_model_select_requested.connect(self._on_config_select_camera_model)
+        page.camera_connect_requested.connect(self._on_config_camera_connect)
+        page.camera_disconnect_requested.connect(self._on_config_camera_disconnect)
+
+        # 手眼标定
+        page.calib_save_requested.connect(self._on_config_calib_save)
+        page.calib_reset_requested.connect(self._on_config_calib_reset)
+        page.calib_refresh_requested.connect(self._on_config_calib_refresh)
+        page.calib_camera_changed.connect(self._on_config_calib_camera_changed)
+
+        # 配置重载
+        page.reload_config_requested.connect(self._on_config_reload)
+
+    def _on_config_save_ip(self, ip):
+        """保存机器人 IP 并提示。"""
+        if not ip:
+            self.statusBar().showMessage("IP 地址不能为空", 3000)
+            return
+        if set_robot_ip(ip):
+            self.robot_ip = ip
+            self.statusBar().showMessage(f"机器人 IP 已保存: {ip}", 5000)
+        else:
+            self.statusBar().showMessage("IP 地址格式无效", 3000)
+
+    def _on_config_save_photo_position(self, pose):
+        """保存拍照位并提示。"""
+        if set_photo_position(list(pose)):
+            self.statusBar().showMessage("拍照位已保存", 5000)
+        else:
+            self.statusBar().showMessage("拍照位保存失败", 3000)
+
+    def _on_config_select_camera_model(self, camera_type):
+        """选择并保存相机 ONNX 模型路径。"""
+        if self._runtime_camera_connected(camera_type):
+            QMessageBox.warning(
+                self, "相机正在使用",
+                f"{camera_type} 正由 Runtime 使用，请先安全停用后再更换模型",
+            )
+            return
+        current_path = get_camera_model_path(camera_type)
+        selected_path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"选择 {camera_type} ONNX 模型",
+            os.path.dirname(current_path) if current_path else "",
+            "ONNX 模型 (*.onnx)",
+        )
+        if not selected_path:
             return
         try:
-            manager = HandEyeCalibManager()
-            matrix = manager.get_matrix(camera_type)
-            for i in range(4):
-                for j in range(4):
-                    item = QTableWidgetItem(f"{matrix[i][j]:.6f}")
-                    self.calib_table.setItem(i, j, item)
-        except Exception as e:
-            QMessageBox.warning(self, "警告", f"加载标定矩阵失败: {e}")
+            normalized = set_camera_model_path(camera_type, selected_path)
+            self.config_center_page.update_camera_status(camera_type, "未连接", normalized)
+            self.statusBar().showMessage(f"{camera_type} 模型已保存: {normalized}", 5000)
+        except Exception as exc:
+            QMessageBox.critical(self, "模型配置失败", str(exc))
 
-    def _on_calib_save(self):
+    def _on_config_camera_connect(self, camera_type):
+        """连接指定相机。"""
+        success, msg = self._runtime_facade.connect_camera(camera_type)
+        self.statusBar().showMessage(msg, 3000)
+
+    def _on_config_camera_disconnect(self, camera_type):
+        """断开指定相机。"""
+        success, msg = self._runtime_facade.disconnect_camera(camera_type)
+        self.statusBar().showMessage(msg, 3000)
+
+    def _on_config_calib_save(self, camera_type, pose_values):
+        """保存手眼标定位姿。"""
         if not HANDEYE_AVAILABLE:
             QMessageBox.critical(self, "错误", "手眼标定模块不可用")
             return
-        camera_type = self.calib_camera_combo.currentText()
         try:
-            matrix = np.eye(4)
-            for i in range(4):
-                for j in range(4):
-                    item = self.calib_table.item(i, j)
-                    if item:
-                        matrix[i][j] = float(item.text())
             manager = HandEyeCalibManager()
-            if manager.set_matrix_direct(camera_type, matrix):
-                QMessageBox.information(self, "成功", f"{camera_type} 标定矩阵已保存")
+            if manager.set_matrix_from_poses(camera_type, list(pose_values)):
+                self.config_center_page._load_calib_from_config(camera_type)
+                self.statusBar().showMessage(f"{camera_type} 标定位姿已保存", 5000)
             else:
-                QMessageBox.critical(self, "错误", "保存标定矩阵失败")
+                QMessageBox.critical(self, "错误", "保存标定位姿失败")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存失败: {e}")
 
-    def _on_calib_reset(self):
+    def _on_config_calib_reset(self, camera_type):
+        """重置手眼标定为默认值。"""
         if not HANDEYE_AVAILABLE:
             return
-        camera_type = self.calib_camera_combo.currentText()
-        reply = QMessageBox.question(self, "确认", f"确定要重置 {camera_type} 的标定矩阵为默认值吗？",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        reply = QMessageBox.question(
+            self, "确认",
+            f"确定要重置 {camera_type} 的标定矩阵为默认值吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
         if reply == QMessageBox.StandardButton.Yes:
             try:
                 manager = HandEyeCalibManager()
-                manager.reset_to_default(camera_type)
-                self._load_calib_matrix(camera_type)
-                QMessageBox.information(self, "成功", f"{camera_type} 标定矩阵已重置")
+                if manager.reset_to_default(camera_type):
+                    self.config_center_page._load_calib_from_config(camera_type)
+                    self.statusBar().showMessage(f"{camera_type} 标定已重置", 5000)
+                else:
+                    QMessageBox.critical(self, "错误", "重置标定失败")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"重置失败: {e}")
 
-    def _on_calib_refresh(self):
-        camera_type = self.calib_camera_combo.currentText()
-        self._load_calib_matrix(camera_type)
+    def _on_config_calib_refresh(self, camera_type):
+        """刷新手眼标定显示。"""
+        self.config_center_page._load_calib_from_config(camera_type)
+        self.statusBar().showMessage(f"{camera_type} 标定已刷新", 3000)
+
+    def _on_config_calib_camera_changed(self, camera_type):
+        """相机切换时加载该相机的标定值。"""
+        self.config_center_page._load_calib_from_config(camera_type)
+
+    def _on_config_reload(self):
+        """通过 IPC 重载 Runtime 配置。"""
+        self._on_reload_config()
 
     def closeEvent(self, event):
         """Close GUI-only resources without touching Runtime hardware."""

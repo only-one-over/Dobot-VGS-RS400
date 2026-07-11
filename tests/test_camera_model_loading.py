@@ -153,7 +153,7 @@ def test_model_initialization_failure_happens_before_camera_pipeline(monkeypatch
     monkeypatch.setattr(
         vision_module,
         "get_calibration",
-        lambda camera_type: {"tool_base_calib_pose": [0] * 6},
+        lambda camera_type: {"cam_to_flange_pose": [0] * 6},
     )
     monkeypatch.setattr(
         vision_module,

@@ -11,7 +11,7 @@ from ..ui.qt_compat import (
     QWidget, QVBoxLayout, QGridLayout, QPushButton, QLabel, QComboBox,
     QLineEdit, QHBoxLayout, QFrame, pyqtSignal,
 )
-from ..ui.ui_theme import apply_status_visual, set_button_role, card_style, metric_title_style
+from ..ui.ui_theme import COLORS, apply_status_visual, set_button_role, card_style, metric_title_style
 from ..ui.gui_runtime_status import (
     translate_runtime_state,
     runtime_state_color,
@@ -25,11 +25,6 @@ class MainControlPanel(QWidget):
     connect_robot = pyqtSignal()
     enable_robot = pyqtSignal()
     disable_robot = pyqtSignal()
-    connect_d435i = pyqtSignal()
-    disconnect_d435i = pyqtSignal()
-    connect_d405 = pyqtSignal()
-    disconnect_d405 = pyqtSignal()
-    select_camera_model = pyqtSignal(str)
     run_grasp = pyqtSignal()
     move_initial = pyqtSignal()
     get_pose = pyqtSignal()
@@ -39,7 +34,6 @@ class MainControlPanel(QWidget):
     resume = pyqtSignal()
     stop_current_task = pyqtSignal()
     collision_level_changed = pyqtSignal(int)
-    ip_changed = pyqtSignal(str)
     main_flow_changed = pyqtSignal(str)
 
     BTN_HEIGHT = 38
@@ -69,33 +63,25 @@ class MainControlPanel(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
 
         # ── 连接配置卡片 ──
-        conn_card, conn_layout = self._make_card("连接配置", "#3b82f6")
+        conn_card, conn_layout = self._make_card("连接配置", COLORS["primary"])
 
-        ip_row = QHBoxLayout()
-        ip_row.setSpacing(8)
-        ip_label = QLabel("IP:")
-        ip_label.setStyleSheet("color: #94a3b8; font-weight: 600; background: transparent; border: none;")
-        self.ip_input = QLineEdit(robot_ip)
-        self.ip_input.setMaximumWidth(150)
-        self.ip_input.setPlaceholderText("机器人IP地址")
-        ip_row.addWidget(ip_label)
-        ip_row.addWidget(self.ip_input)
-        ip_row.addStretch()
-
-        self.connect_robot_btn = QPushButton("连接机器人")
+        # 连接按钮（IP 配置已迁移到配置中心）
+        connect_row = QHBoxLayout()
+        connect_row.setSpacing(8)
+        self.connect_robot_btn = QPushButton("连接设备")
         set_button_role(self.connect_robot_btn, "connect")
         self.connect_robot_btn.setDefault(True)
         self.connect_robot_btn.setMinimumHeight(self.BTN_HEIGHT)
-        ip_row.addWidget(self.connect_robot_btn)
-
-        conn_layout.addLayout(ip_row)
+        connect_row.addWidget(self.connect_robot_btn)
+        connect_row.addStretch()
+        conn_layout.addLayout(connect_row)
 
         # Runtime 状态指示灯（Task 4：maintenance 显式显示）
         runtime_row = QHBoxLayout()
         runtime_row.setSpacing(8)
         runtime_title = QLabel("Runtime:")
         runtime_title.setStyleSheet(
-            "color: #94a3b8; font-weight: 600; "
+            f"color: {COLORS['muted']}; font-weight: 600; "
             "background: transparent; border: none;"
         )
         self.runtime_indicator_dot = QLabel()
@@ -105,7 +91,7 @@ class MainControlPanel(QWidget):
         )
         self.runtime_state_text = QLabel("未知")
         self.runtime_state_text.setStyleSheet(
-            "color: #e2e8f0; font-weight: 600; "
+            f"color: {COLORS['text']}; font-weight: 600; "
             "background: transparent; border: none;"
         )
         runtime_row.addWidget(runtime_title)
@@ -116,7 +102,7 @@ class MainControlPanel(QWidget):
         layout.addWidget(conn_card)
 
         # ── 任务控制卡片 ──
-        task_card, task_layout = self._make_card("任务控制", "#2563eb")
+        task_card, task_layout = self._make_card("任务控制", COLORS["primary_dark"])
 
         flow_row = QHBoxLayout()
         flow_row.setSpacing(8)
@@ -190,7 +176,7 @@ class MainControlPanel(QWidget):
         collision_row = QHBoxLayout()
         collision_row.setSpacing(8)
         collision_label = QLabel("碰撞等级:")
-        collision_label.setStyleSheet("color: #94a3b8; font-weight: 600; background: transparent; border: none;")
+        collision_label.setStyleSheet(f"color: {COLORS['muted']}; font-weight: 600; background: transparent; border: none;")
         self.collision_combo = QComboBox()
         self.collision_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.collision_combo.addItems([
@@ -218,72 +204,7 @@ class MainControlPanel(QWidget):
 
         layout.addWidget(robot_card)
 
-        # ── 相机控制卡片 ──
-        cam_card, cam_layout = self._make_card("相机控制", "#06b6d4")
-
-        # D435i
-        self.d435i_status_label = QLabel("D435i: 未连接")
-        apply_status_visual(self.d435i_status_label, "未连接")
-        cam_layout.addWidget(self.d435i_status_label)
-
-        d435i_model_row = QHBoxLayout()
-        d435i_model_row.setSpacing(8)
-        self.d435i_model_path = QLineEdit()
-        self.d435i_model_path.setReadOnly(True)
-        self.d435i_model_path.setPlaceholderText("未选择模型")
-        d435i_model_row.addWidget(self.d435i_model_path, 1)
-        self.d435i_model_select_btn = QPushButton("选择模型")
-        set_button_role(self.d435i_model_select_btn, "secondary")
-        self.d435i_model_select_btn.setMinimumHeight(self.BTN_HEIGHT)
-        d435i_model_row.addWidget(self.d435i_model_select_btn)
-        cam_layout.addLayout(d435i_model_row)
-
-        d435i_row = QHBoxLayout()
-        d435i_row.setSpacing(8)
-        self.d435i_connect_btn = QPushButton("D435i 连接")
-        set_button_role(self.d435i_connect_btn, "connect")
-        self.d435i_connect_btn.setMinimumHeight(self.BTN_HEIGHT)
-        d435i_row.addWidget(self.d435i_connect_btn)
-
-        self.d435i_disconnect_btn = QPushButton("D435i 断开")
-        set_button_role(self.d435i_disconnect_btn, "secondary")
-        self.d435i_disconnect_btn.setMinimumHeight(self.BTN_HEIGHT)
-        self.d435i_disconnect_btn.setEnabled(False)
-        d435i_row.addWidget(self.d435i_disconnect_btn)
-        cam_layout.addLayout(d435i_row)
-
-        # D405
-        self.d405_status_label = QLabel("D405: 未连接")
-        apply_status_visual(self.d405_status_label, "未连接")
-        cam_layout.addWidget(self.d405_status_label)
-
-        d405_model_row = QHBoxLayout()
-        d405_model_row.setSpacing(8)
-        self.d405_model_path = QLineEdit()
-        self.d405_model_path.setReadOnly(True)
-        self.d405_model_path.setPlaceholderText("未选择模型")
-        d405_model_row.addWidget(self.d405_model_path, 1)
-        self.d405_model_select_btn = QPushButton("选择模型")
-        set_button_role(self.d405_model_select_btn, "secondary")
-        self.d405_model_select_btn.setMinimumHeight(self.BTN_HEIGHT)
-        d405_model_row.addWidget(self.d405_model_select_btn)
-        cam_layout.addLayout(d405_model_row)
-
-        d405_row = QHBoxLayout()
-        d405_row.setSpacing(8)
-        self.d405_connect_btn = QPushButton("D405 连接")
-        set_button_role(self.d405_connect_btn, "connect")
-        self.d405_connect_btn.setMinimumHeight(self.BTN_HEIGHT)
-        d405_row.addWidget(self.d405_connect_btn)
-
-        self.d405_disconnect_btn = QPushButton("D405 断开")
-        set_button_role(self.d405_disconnect_btn, "secondary")
-        self.d405_disconnect_btn.setMinimumHeight(self.BTN_HEIGHT)
-        self.d405_disconnect_btn.setEnabled(False)
-        d405_row.addWidget(self.d405_disconnect_btn)
-        cam_layout.addLayout(d405_row)
-
-        layout.addWidget(cam_card)
+        # 相机控制卡片已移除，相关功能迁移到「配置中心」导航页
 
         layout.addStretch()
 
@@ -292,16 +213,6 @@ class MainControlPanel(QWidget):
         self.connect_robot_btn.clicked.connect(self.connect_robot.emit)
         self.enable_robot_btn.clicked.connect(self.enable_robot.emit)
         self.disable_robot_btn.clicked.connect(self.disable_robot.emit)
-        self.d435i_connect_btn.clicked.connect(self.connect_d435i.emit)
-        self.d435i_disconnect_btn.clicked.connect(self.disconnect_d435i.emit)
-        self.d405_connect_btn.clicked.connect(self.connect_d405.emit)
-        self.d405_disconnect_btn.clicked.connect(self.disconnect_d405.emit)
-        self.d435i_model_select_btn.clicked.connect(
-            lambda: self.select_camera_model.emit("D435i")
-        )
-        self.d405_model_select_btn.clicked.connect(
-            lambda: self.select_camera_model.emit("D405")
-        )
         self.run_task_btn.clicked.connect(self.run_grasp.emit)
         self.move_initial_btn.clicked.connect(self.move_initial.emit)
         self.get_pos_btn.clicked.connect(self.get_pose.emit)
@@ -311,9 +222,6 @@ class MainControlPanel(QWidget):
         self.continue_btn.clicked.connect(self.resume.emit)
         self.stop_task_btn.clicked.connect(self.stop_current_task.emit)
         self.collision_combo.currentIndexChanged.connect(self.collision_level_changed.emit)
-        self.ip_input.editingFinished.connect(
-            lambda: self.ip_changed.emit(self.ip_input.text().strip())
-        )
         self.main_flow_combo.currentIndexChanged.connect(
             self._emit_main_flow_changed
         )
@@ -348,16 +256,3 @@ class MainControlPanel(QWidget):
                 selected_index = index
         self.main_flow_combo.setCurrentIndex(selected_index)
         self.main_flow_combo.blockSignals(False)
-
-    def set_camera_model_path(self, camera_type, model_path):
-        field = self.d435i_model_path if camera_type == "D435i" else self.d405_model_path
-        field.setText(os.path.basename(model_path))
-        field.setToolTip(model_path)
-
-    def set_camera_model_selection_enabled(self, camera_type, enabled):
-        button = (
-            self.d435i_model_select_btn
-            if camera_type == "D435i"
-            else self.d405_model_select_btn
-        )
-        button.setEnabled(enabled)

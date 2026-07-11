@@ -832,7 +832,7 @@ def test_modbus_delay_instance_fields_removed():
 
 
 def test_wait_for_flow_delay_or_signal_has_no_signal_checker_param():
-    """wait_for_flow_delay_or_signal 不再接受 signal_checker 参数。"""
+    """wait_for_flow_delay_or_signal 不接受 signal_checker，但接受 release_event。"""
     if "pyrealsense2" not in sys.modules:
         sys.modules["pyrealsense2"] = types.ModuleType("pyrealsense2")
     from dobot_move.flow.flow_executor import wait_for_flow_delay_or_signal
@@ -840,17 +840,20 @@ def test_wait_for_flow_delay_or_signal_has_no_signal_checker_param():
     sig = inspect.signature(wait_for_flow_delay_or_signal)
     params = list(sig.parameters.keys())
     assert "signal_checker" not in params, (
-        "signal_checker 参数应已移除（delay 模块仅支持纯超时）"
+        "signal_checker 参数应已移除"
+    )
+    assert "release_event" in params, (
+        "release_event 参数应存在（用于 modbus_or_timeout 模式放行）"
     )
 
 
-def test_wait_for_flow_delay_or_signal_returns_timeout_or_stopped_only():
-    """wait_for_flow_delay_or_signal 仅返回 'timeout' 或 'stopped'。"""
+def test_wait_for_flow_delay_or_signal_returns_expected_results():
+    """wait_for_flow_delay_or_signal 返回 'timeout'、'stopped' 或 'released'。"""
     if "pyrealsense2" not in sys.modules:
         sys.modules["pyrealsense2"] = types.ModuleType("pyrealsense2")
     from dobot_move.flow.flow_executor import wait_for_flow_delay_or_signal
 
-    # 正常超时
+    # 正常超时（无 release_event）
     result = wait_for_flow_delay_or_signal(0.01, threading.Event(), poll_interval=0.005)
     assert result == "timeout"
 
@@ -860,9 +863,17 @@ def test_wait_for_flow_delay_or_signal_returns_timeout_or_stopped_only():
     result = wait_for_flow_delay_or_signal(10.0, stop_event, poll_interval=0.005)
     assert result == "stopped"
 
+    # release_event 触发放行
+    release_event = threading.Event()
+    release_event.set()
+    result = wait_for_flow_delay_or_signal(
+        10.0, threading.Event(), release_event=release_event, poll_interval=0.005
+    )
+    assert result == "released"
 
-def test_delay_module_validation_rejects_modbus_or_timeout():
-    """delay 模块校验拒绝 modbus_or_timeout 模式（仅支持 time）。"""
+
+def test_delay_module_validation_accepts_modbus_or_timeout():
+    """delay 模块校验接受 modbus_or_timeout 模式。"""
     if "pyrealsense2" not in sys.modules:
         sys.modules["pyrealsense2"] = types.ModuleType("pyrealsense2")
     from dobot_move.flow.flow_executor import validate_grasp_flow_modules
@@ -878,8 +889,7 @@ def test_delay_module_validation_rejects_modbus_or_timeout():
         }
     ]
     errors = validate_grasp_flow_modules(modules)
-    assert len(errors) == 1
-    assert "延时等待方式无效" in errors[0]
+    assert errors == []
 
 
 def test_delay_module_validation_accepts_time_mode():

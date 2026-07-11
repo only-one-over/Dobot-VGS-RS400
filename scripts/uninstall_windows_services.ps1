@@ -17,16 +17,25 @@ Stop-And-UninstallServiceWrapper -Executable (
     Join-Path $serviceDirectory "DobotRuntimeService.exe"
 )
 
+# 清理防火墙规则（若存在）
+foreach ($ruleName in @("Dobot Modbus", "Dobot Remote API")) {
+    $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+    if ($null -ne $existing) {
+        Remove-NetFirewallRule -DisplayName $ruleName
+        Write-Host "Removed firewall rule: $ruleName"
+    }
+}
+
 if ($EnableLegacyTasks -or $StartLegacyTasks) {
     Enable-LegacyTasks -Start:$StartLegacyTasks
 }
 if ($RemoveToken) {
     $config = Get-Content -LiteralPath (
-        Join-Path $ProjectRoot "dobot_move\config.json"
+        Join-Path $ProjectRoot "user_data\config.json"
     ) -Raw | ConvertFrom-Json
-    $tokenPath = Join-Path $ProjectRoot "runtime_ipc.token"
+    $tokenPath = Join-Path $ProjectRoot "user_data\runtime_ipc.token"
     if (
-        $config.runtime -and
+        $config.PSObject.Properties.Name -contains "runtime" -and
         $config.runtime.PSObject.Properties.Name -contains "ipc_token_path"
     ) {
         $configuredTokenPath = [string]$config.runtime.ipc_token_path

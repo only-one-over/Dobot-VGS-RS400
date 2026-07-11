@@ -162,7 +162,7 @@ class VisionSystem:
         self.cx, self.cy = None, None
         
         calib_data = get_calibration(camera_type)
-        if not calib_data or "tool_base_calib_pose" not in calib_data:
+        if not calib_data or "cam_to_flange_pose" not in calib_data:
             raise ValueError(f"未找到相机 {camera_type} 的标定数据")
         self.T_cam2gripper = get_camera_handeye_matrix(camera_type)
         logger.info(f"✅ 加载 {camera_type} 手眼标定矩阵 T_hand_eye:")

@@ -27,8 +27,6 @@ class _StubWindow:
         self._emergency_cmd_running = False
         self._last_emergency_click_ts = 0.0
         self.stop_calls = []
-        self.button_active = None
-        self.button_text = None
         self._status_bar = _StubStatusBar()
 
     def _send_runtime_ipc_stop(self, command, data=None, on_success=None, on_failure=None):
@@ -36,10 +34,6 @@ class _StubWindow:
 
     def statusBar(self):
         return self._status_bar
-
-    def _update_emergency_stop_button(self):
-        active = "true" if self._software_emergency_active else "false"
-        self.button_active = active
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +94,6 @@ def test_finished_success_sets_active_and_status():
     DobotMainWindow._on_emergency_stop_finished(stub, "safe_stop", True)
     assert stub._emergency_cmd_running is False
     assert stub._software_emergency_active is True
-    assert stub.button_active == "true"
     assert any("安全停止已执行" in msg for msg, _ in stub._status_bar.messages)
 
 
@@ -112,7 +105,6 @@ def test_finished_failure_clears_active_and_shows_error():
     )
     assert stub._emergency_cmd_running is False
     assert stub._software_emergency_active is False
-    assert stub.button_active == "false"
     assert any("安全停止失败" in msg and "Dashboard 断开" in msg
                for msg, _ in stub._status_bar.messages)
 
@@ -122,43 +114,6 @@ def test_finished_failure_no_error_message():
     DobotMainWindow._on_emergency_stop_finished(stub, "safe_stop", False)
     assert stub._software_emergency_active is False
     assert any("安全停止失败" in msg for msg, _ in stub._status_bar.messages)
-
-
-# ---------------------------------------------------------------------------
-# _update_emergency_stop_button
-# ---------------------------------------------------------------------------
-
-
-def test_update_button_active_when_emergency_active():
-    """Button property 'active' toggles with _software_emergency_active."""
-    stub = _StubWindow()
-    # We need a real button-like object; create a minimal stub
-    class _StubButton:
-        def __init__(self):
-            self.text = None
-            self.property = {}
-            self._style = type("_S", (), {"unpolish": lambda self, w: None,
-                                          "polish": lambda self, w: None})()
-
-        def setText(self, text):
-            self.text = text
-
-        def setProperty(self, name, value):
-            self.property[name] = value
-
-        def style(self):
-            return self._style
-
-    stub.emergency_stop_btn = _StubButton()
-
-    stub._software_emergency_active = True
-    DobotMainWindow._update_emergency_stop_button(stub)
-    assert stub.emergency_stop_btn.text == "安全停止"
-    assert stub.emergency_stop_btn.property["active"] == "true"
-
-    stub._software_emergency_active = False
-    DobotMainWindow._update_emergency_stop_button(stub)
-    assert stub.emergency_stop_btn.property["active"] == "false"
 
 
 # ---------------------------------------------------------------------------

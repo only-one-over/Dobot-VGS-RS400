@@ -76,7 +76,7 @@ def build_runtime_service_xml(
         "Owns Dobot, RealSense, Modbus and production flow execution.",
         python_exe,
         project_root,
-        "-m dobot_move.runtime_agent --startup-delay 0",
+        "-m dobot_move.runtime.runtime_agent --startup-delay 0",
         project_root / "logs" / "winsw-runtime",
     )
     _add_environment(
@@ -104,7 +104,7 @@ def build_watchdog_service_xml(
 ) -> str:
     project_root = Path(project_root).resolve()
     arguments = (
-        "-m dobot_move.runtime_watchdog "
+        "-m dobot_move.runtime.runtime_watchdog "
         f"--restart-mode service --service-name {runtime_service_id}"
     )
     root = _base_service(
@@ -116,6 +116,7 @@ def build_watchdog_service_xml(
         arguments,
         project_root / "logs" / "winsw-watchdog",
     )
+    _add_text(root, "depend", runtime_service_id)
     _add_environment(
         root,
         {

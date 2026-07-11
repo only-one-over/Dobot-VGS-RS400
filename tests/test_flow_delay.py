@@ -123,11 +123,11 @@ def test_flow_delay_validation_rejects_invalid_wait_mode():
 
     errors = validate_grasp_flow_modules(modules)
 
-    assert errors == ["第1步「等待PLC」：延时等待方式无效（仅支持 time）"]
+    assert errors == ["第1步「等待PLC」：延时等待方式无效（仅支持 time 或 modbus_or_timeout）"]
 
 
-def test_flow_delay_validation_rejects_modbus_or_timeout_mode():
-    """PR 7: modbus_or_timeout 模式已移除，校验应拒绝该模式。"""
+def test_flow_delay_validation_accepts_modbus_or_timeout_mode():
+    """modbus_or_timeout 模式应被校验接受。"""
     modules = [
         {
             "type": "delay",
@@ -138,10 +138,8 @@ def test_flow_delay_validation_rejects_modbus_or_timeout_mode():
             },
         }
     ]
-
     errors = validate_grasp_flow_modules(modules)
-
-    assert errors == ["第1步「等待PLC」：延时等待方式无效（仅支持 time）"]
+    assert errors == []
 
 
 def test_flow_thread_executes_delay_module_and_finishes():
@@ -167,3 +165,28 @@ def test_flow_thread_executes_delay_module_and_finishes():
     assert results == [True]
     assert controller.released
     assert controller._active_flow_thread is None
+
+
+def test_flow_delay_released_by_event():
+    """modbus_or_timeout 模式下 release_event.set() 应提前返回 'released'。"""
+    stop_event = threading.Event()
+    release_event = threading.Event()
+    # 0.5 秒后放行
+    threading.Timer(0.5, release_event.set).start()
+    start = time.perf_counter()
+    result = wait_for_flow_delay_or_signal(
+        10.0, stop_event, release_event=release_event, poll_interval=0.01
+    )
+    elapsed = time.perf_counter() - start
+    assert result == "released"
+    assert elapsed < 2.0  # 远小于 10 秒超时
+
+
+def test_flow_delay_timeout_with_release_event():
+    """modbus_or_timeout 模式下未触发 release_event 时超时返回 'timeout'。"""
+    stop_event = threading.Event()
+    release_event = threading.Event()  # 不触发
+    result = wait_for_flow_delay_or_signal(
+        0.1, stop_event, release_event=release_event, poll_interval=0.01
+    )
+    assert result == "timeout"

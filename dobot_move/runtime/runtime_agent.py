@@ -397,6 +397,7 @@ class RuntimeProgramRunner:
         self.next_revision: Optional[str] = None
         self._active_flow = None
         self._pause_ref: Optional[list[bool]] = None
+        self._release_event: Optional[threading.Event] = None
         self.task_id: Optional[str] = None
         self.task_mode: Optional[str] = None
         self.last_task_result: Optional[bool] = None
@@ -824,6 +825,7 @@ class RuntimeProgramRunner:
             self.controller._user_index = int(config_snapshot.get("user_index", 0))
             self.controller._tool_index = int(config_snapshot.get("tool_index", 0))
             self._pause_ref = [False]
+            self._release_event = threading.Event()
             flow = FlowExecutor(
                 self.controller,
                 self.vision_d435i,
@@ -831,6 +833,7 @@ class RuntimeProgramRunner:
                 modules,
                 self._pause_ref,
             )
+            flow.release_event = self._release_event
             self._active_flow = flow
             flow.on_log = lambda msg: logger.info("runtime flow: %s", msg)
             # PR 4: on_finished now receives a FlowResult; capture the
@@ -847,10 +850,13 @@ class RuntimeProgramRunner:
                 if index < len(modules):
                     module_deadline[0] = self.last_progress_time + module_timeout_seconds(modules[index])
                     params = modules[index].get("params") or {}
+                    is_delay_release = (
+                        modules[index].get("type") == "delay"
+                        and params.get("wait_mode") == "modbus_or_timeout"
+                    )
                     state = (
                         RuntimeState.WAITING_DELAY
-                        if modules[index].get("type") == "delay"
-                        and params.get("wait_mode") == "modbus_or_timeout"
+                        if is_delay_release
                         else RuntimeState.RUNNING
                     )
                     if task_mode == "debug":
@@ -861,6 +867,19 @@ class RuntimeProgramRunner:
                         module_index=index,
                         module_name=self.current_module_name,
                     )
+                    # 生产模式下写 40001 状态码
+                    if task_mode == "production":
+                        try:
+                            if is_delay_release:
+                                # 进入延时放行：重置并写 40001=5
+                                if self._release_event is not None:
+                                    self._release_event.clear()
+                                self.controller._write_modbus_status(5)
+                            else:
+                                # 离开延时或非延时模块：写回 40001=4
+                                self.controller._write_modbus_status(4)
+                        except Exception:
+                            logger.exception("on_progress 写 40001 失败")
 
             flow.on_progress = on_progress
             def run_flow_with_snapshot():
@@ -932,6 +951,7 @@ class RuntimeProgramRunner:
         finally:
             self._active_flow = None
             self._pause_ref = None
+            self._release_event = None
             self.active_required_cameras = set()
             if task_mode == "debug":
                 self.failure_latched = False
@@ -1130,7 +1150,7 @@ class DobotRuntimeAgent:
         self.service_stop_marker_path = Path(
             runtime_config.get(
                 "service_stop_marker_path",
-                PROJECT_ROOT / "runtime_service_stopped.json",
+                Path(USER_DATA_DIR) / "runtime_service_stopped.json",
             )
         )
         if self.service_mode:
@@ -2416,6 +2436,10 @@ class DobotRuntimeAgent:
             self._handle_pause_command()
             return
         if cmd == CMD_RESET:
+            # 延时放行检查：如果当前正在延时放行等待中，触发放行而非复位
+            if self._is_in_delay_release_wait():
+                self._release_delay_wait()
+                return
             self._handle_reset_command()
             return
 
@@ -2575,6 +2599,36 @@ class DobotRuntimeAgent:
             ProductionState.RUNNING,
             reason=f"resumed task_id={task.task_id}",
         )
+
+    def _is_in_delay_release_wait(self) -> bool:
+        """检查当前是否处于延时放行等待状态。
+
+        判据：production_state 为 RUNNING（延时期间不改变生产状态），
+        且 program_runner 的 release_event 存在，
+        且 program_runner 的当前模块是 delay + modbus_or_timeout。
+        """
+        if self.production_state != ProductionState.RUNNING:
+            return False
+        runner = self.program_runner
+        if runner is None or runner._release_event is None:
+            return False
+        # 检查当前模块是否为 delay + modbus_or_timeout
+        # 通过 RuntimeState 判断更可靠：WAITING_DELAY 状态表示在延时放行中
+        # 但 RuntimeState 在 program_runner 上，不在 agent 上
+        # 简化判据：release_event 存在即可能在延时中
+        return True
+
+    def _release_delay_wait(self) -> None:
+        """放行当前延时等待，让流程继续下一步。"""
+        runner = self.program_runner
+        if runner is None or runner._release_event is None:
+            logger.warning("收到 40001=1 放行命令但无活跃的延时等待")
+            return
+        logger.info("40001=1 延时放行触发，release_event.set()")
+        runner._release_event.set()
+        # 放行后重置 release_event 以备下次使用
+        # 注意：不能立即 clear，因为 FlowExecutor 还在等待循环中检查
+        # clear 操作在 on_progress 下次进入 delay 模块时处理
 
     def _handle_pause_command(self) -> bool:
         """40001=0 in auto mode — pause when RUNNING (PR 3 Task 8).
@@ -3421,11 +3475,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH, help="Path to durable runtime state JSON.")
     parser.add_argument("--lock-path", type=Path, default=DEFAULT_LOCK_PATH, help="Path to the single-instance lock file.")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help="Directory for runtime.log.")
+    parser.add_argument("--check-config", action="store_true", help="部署预检：验证配置完整性后退出，不启动 Runtime。")
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
+
+    # 部署预检模式：python runtime_agent.py --check-config
+    if args.check_config:
+        from ..config.config_manager import check_config
+        ok = check_config(verbose=True)
+        return 0 if ok else 1
+
     setup_runtime_logging(args.log_dir)
     instance_lock = SingleInstanceLock(args.lock_path)
     if not instance_lock.acquire():

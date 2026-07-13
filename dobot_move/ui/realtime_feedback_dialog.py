@@ -9,6 +9,7 @@ from ..ui.qt_compat import (
     QTimer, Qt, QFont,
 )
 from ..robot.dobot_api import DobotApiFeedBack
+from ..ui.ui_theme import COLORS
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ class RealTimeFeedbackDialog(QDialog):
         # 顶部控制区
         control_layout = QHBoxLayout()
         self.status_label = QLabel("未连接")
-        self.status_label.setStyleSheet("color: red; font-weight: bold;")
+        self.status_label.setStyleSheet(f"color: {COLORS['danger']}; font-weight: bold;")
         self.connect_btn = QPushButton("连接")
         self.connect_btn.clicked.connect(self.toggle_connection)
         control_layout.addWidget(self.status_label)
@@ -143,7 +144,7 @@ class RealTimeFeedbackDialog(QDialog):
             self.timer.start(100)
         except Exception as e:
             self.status_label.setText(f"连接失败: {e}")
-            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+            self.status_label.setStyleSheet(f"color: {COLORS['danger']}; font-weight: bold;")
 
     def disconnect(self):
         self.timer.stop()
@@ -152,7 +153,7 @@ class RealTimeFeedbackDialog(QDialog):
             self.feedback.close()
             self.feedback = None
         self.status_label.setText("未连接")
-        self.status_label.setStyleSheet("color: red; font-weight: bold;")
+        self.status_label.setStyleSheet(f"color: {COLORS['danger']}; font-weight: bold;")
         self.connect_btn.setText("连接")
         self.reset_labels()
 

@@ -104,12 +104,13 @@ def wait_for_flow_delay_or_signal(
     stop_event,
     is_paused_ref=None,
     poll_interval=0.05,
+    release_event=None,
 ):
-    """Wait until timeout or stop while remaining responsive to pause.
+    """Wait until timeout, stop, or release while remaining responsive to pause.
 
-    PR 7: 旧 ``signal_checker`` 参数与 ``modbus_or_timeout`` 模式已移除，
-    扶钩等待由状态机 HOLDING_HOOK 状态处理。返回值仅可能为 ``"stopped"``
-    或 ``"timeout"``。
+    当 ``release_event`` 不为 None 且被 set 时，提前返回 ``"released"``，
+    用于 ``modbus_or_timeout`` 模式下主站放行信号。返回值可能为
+    ``"stopped"``、``"timeout"`` 或 ``"released"``。
     """
     duration_s = float(duration_s)
     if not math.isfinite(duration_s) or duration_s <= 0:
@@ -122,6 +123,8 @@ def wait_for_flow_delay_or_signal(
     while remaining > 0:
         if stop_event.is_set():
             return "stopped"
+        if release_event is not None and release_event.is_set():
+            return "released"
 
         now = time.monotonic()
         paused = bool(is_paused_ref and is_paused_ref[0])
@@ -136,13 +139,14 @@ def wait_for_flow_delay_or_signal(
     return "timeout"
 
 
-def wait_for_flow_delay(duration_s, stop_event, is_paused_ref=None, poll_interval=0.05):
+def wait_for_flow_delay(duration_s, stop_event, is_paused_ref=None, poll_interval=0.05, release_event=None):
     """Wait for a flow delay while remaining responsive to pause and stop."""
     result = wait_for_flow_delay_or_signal(
         duration_s,
         stop_event,
         is_paused_ref=is_paused_ref,
         poll_interval=poll_interval,
+        release_event=release_event,
     )
     return result != "stopped"
 
@@ -230,8 +234,8 @@ def validate_grasp_flow_modules(modules: list) -> list:
             elif duration_s > 3600:
                 errors.append(f"第{step}步「{name}」：延时时长不能超过3600秒")
             wait_mode = params.get("wait_mode", "time")
-            if wait_mode != "time":
-                errors.append(f"第{step}步「{name}」：延时等待方式无效（仅支持 time）")
+            if wait_mode not in ("time", "modbus_or_timeout"):
+                errors.append(f"第{step}步「{name}」：延时等待方式无效（仅支持 time 或 modbus_or_timeout）")
 
     return errors
 
@@ -276,6 +280,8 @@ class FlowExecutor:
         self.on_progress: Optional[Callable[[int, int, str], None]] = None
         # PR 4: last structured result populated by _fail_module / run().
         self.last_result: Optional[FlowResult] = None
+        # 可由 Runtime 注入的主站放行事件，用于 delay 模块 modbus_or_timeout 模式
+        self.release_event: Optional[threading.Event] = None
 
     def get_visual_servo_telemetry(self):
         controller = self.active_visual_servo
@@ -1049,30 +1055,35 @@ class FlowExecutor:
                             self._fail_module(ctx, i, name, "延时时长必须大于0秒且不超过3600秒")
                             return self.last_result
 
-                        # PR 7: 旧 ``modbus_or_timeout`` 模式已移除，delay 模块仅支持纯超时。
-                        # 扶钩等待由状态机 HOLDING_HOOK 状态处理。
                         wait_mode = p.get('wait_mode', 'time')
-                        if wait_mode != "time":
-                            self._fail_module(ctx, i, name, "延时等待方式无效（仅支持 time）")
+                        if wait_mode not in ("time", "modbus_or_timeout"):
+                            self._fail_module(ctx, i, name, "延时等待方式无效（仅支持 time 或 modbus_or_timeout）")
                             return self.last_result
 
                         if self.on_log:
-                            self.on_log(f"⏱️ 延时 {duration_s:.1f} 秒")
+                            self.on_log(f"⏱️ 延时 {duration_s:.1f} 秒 (模式: {wait_mode})")
 
                         wait_start = time.perf_counter()
+                        # modbus_or_timeout 模式传入 release_event；time 模式不传（保持纯超时）
+                        release_evt = self.release_event if wait_mode == "modbus_or_timeout" else None
                         wait_result = wait_for_flow_delay_or_signal(
                             duration_s,
                             ctx.stop_event,
                             self.is_paused_ref,
                             poll_interval=min(wait_poll_interval, 0.05),
+                            release_event=release_evt,
                         )
                         if wait_result == "stopped":
                             self._fail_module(ctx, i, name, "用户停止（延时中）", code="USER_STOP", failure_kind=FailureKind.FLOW, recoverable=False)
                             return self.last_result
+                        # "released" 和 "timeout" 都视为正常完成
                         wait_elapsed = time.perf_counter() - wait_start
                         cmd_elapsed = 0.0
                         if self.on_log:
-                            self.on_log(f"✅ 模块{i+1}延时完成")
+                            if wait_result == "released":
+                                self.on_log(f"✅ 模块{i+1}延时被主站放行提前结束")
+                            else:
+                                self.on_log(f"✅ 模块{i+1}延时完成")
 
                     elif module['type'] == "camera":
                         camera_type = module['params'].get('camera_type', 'D435i')

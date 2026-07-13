@@ -54,6 +54,161 @@ _execution_config_snapshot = contextvars.ContextVar(
 )
 
 
+# ---------------------------------------------------------------------------
+# 环境变量覆盖 (deployment override)
+#   支持通过环境变量覆盖 config.json 中的关键字段，无需修改文件即可适配不同部署环境。
+#   环境变量优先级 > config.json > 代码默认值
+#
+#   约定：
+#     DOBOT_ROBOT_IP       → robot_ip
+#     DOBOT_MODBUS_PORT    → modbus_port
+#     DOBOT_MODBUS_SLAVE   → modbus_slave_id
+#     DOBOT_D435I_MODEL    → camera.models.D435i
+#     DOBOT_D405_MODEL     → camera.models.D405
+#     DOBOT_REMOTE_API_PORT → remote_api.port
+# ---------------------------------------------------------------------------
+
+# 可被环境变量覆盖的配置项映射：env_var → (config_key, coerce_fn)
+_ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
+    "DOBOT_ROBOT_IP":        ("robot_ip", str),
+    "DOBOT_MODBUS_PORT":     ("modbus_port", int),
+    "DOBOT_MODBUS_SLAVE":    ("modbus_slave_id", int),
+    "DOBOT_D435I_MODEL":     ("camera.models.D435i", str),
+    "DOBOT_D405_MODEL":      ("camera.models.D405", str),
+    "DOBOT_REMOTE_API_PORT": ("remote_api.port", int),
+}
+
+# 运行时生效的覆盖记录（供 check_config / 调试用）
+_active_env_overrides: dict[str, str] = {}
+
+
+def _apply_env_overrides(config: dict) -> dict:
+    """Apply environment variable overrides to a config dict in-place."""
+    for env_key, (config_path, coerce_fn) in _ENV_OVERRIDES.items():
+        env_val = os.environ.get(env_key)
+        if env_val is None or env_val.strip() == "":
+            continue
+        try:
+            coerced = coerce_fn(env_val.strip())
+        except (ValueError, TypeError):
+            logger.warning("环境变量 %s=%r 类型转换失败，已忽略", env_key, env_val)
+            continue
+        # 支持点分路径（如 camera.models.D435i）
+        keys = config_path.split(".")
+        d = config
+        for k in keys[:-1]:
+            if k not in d or not isinstance(d[k], dict):
+                d[k] = {}
+            d = d[k]
+        d[keys[-1]] = coerced
+        _active_env_overrides[env_key] = env_val.strip()
+        logger.info("配置覆盖 %s ← %s=%s", config_path, env_key, env_val.strip())
+    return config
+
+
+def get_active_env_overrides() -> dict[str, str]:
+    """Return a copy of currently active environment overrides."""
+    return dict(_active_env_overrides)
+
+
+def check_config(verbose: bool = True) -> bool:
+    """验证当前配置的完整性，部署后用于预检。
+
+    Returns True if all critical checks pass, False otherwise.
+    """
+    _active_env_overrides.clear()
+    config = load_config()
+    config = _apply_env_overrides(config)
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    # --- 必填项检查 ---
+    robot_ip = config.get("robot_ip")
+    if not robot_ip:
+        errors.append("[必填] robot_ip 未设置（或设置 DOBOT_ROBOT_IP 环境变量）")
+    elif not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', str(robot_ip)):
+        errors.append(f"[必填] robot_ip 格式无效: {robot_ip}")
+    elif not all(0 <= int(p) <= 255 for p in str(robot_ip).split('.')):
+        errors.append(f"[必填] robot_ip 范围无效: {robot_ip}")
+
+    modbus_port = config.get("modbus_port", 502)
+    if not isinstance(modbus_port, int) or not (1 <= modbus_port <= 65535):
+        errors.append(f"[必填] modbus_port 无效: {modbus_port}（应为 1-65535）")
+
+    # --- 相机模型检查 ---
+    camera_config = config.get("camera", {})
+    models = camera_config.get("models", {}) if isinstance(camera_config, dict) else {}
+    for cam_type in SUPPORTED_CAMERA_TYPES:
+        model_path = models.get(cam_type) if isinstance(models, dict) else None
+        if not model_path:
+            warnings.append(f"[选填] camera.models.{cam_type} 未设置，将使用默认模型 {DEFAULT_CAMERA_MODEL_PATH}")
+        elif not os.path.isfile(os.path.expanduser(model_path)):
+            errors.append(f"[必填] camera.models.{cam_type} 模型文件不存在: {model_path}")
+
+    # --- 标定检查 ---
+    calibration = config.get("calibration", {})
+    for cam_type in SUPPORTED_CAMERA_TYPES:
+        cal = calibration.get(cam_type, {}) if isinstance(calibration, dict) else {}
+        if not cal.get("cam_to_flange_pose"):
+            warnings.append(f"[选填] calibration.{cam_type} 未标定（手眼矩阵将使用默认值）")
+
+    # --- 拍照位检查 ---
+    photo = config.get("photo_position")
+    if photo is not None:
+        if not isinstance(photo, list) or len(photo) != 6:
+            errors.append(f"[必填] photo_position 格式无效（应为 6 元素列表），当前: {photo}")
+        elif not all(isinstance(v, (int, float)) for v in photo):
+            errors.append(f"[必填] photo_position 包含非数值元素: {photo}")
+
+    # --- 点位检查 ---
+    points = config.get("points", {})
+    if not isinstance(points, dict):
+        warnings.append("[选填] points 不是字典，点位功能不可用")
+    else:
+        for name in ("initial_point", "d435i", "d405"):
+            if name not in points:
+                warnings.append(f"[选填] points.{name} 缺失（系统会在首次运行时自动创建）")
+
+    # --- 流程库检查 ---
+    if not os.path.exists(GRASP_FLOW_FILE):
+        warnings.append(f"[选填] 流程库不存在: {GRASP_FLOW_FILE}（首次运行时从模板创建）")
+
+    # --- 输出结果 ---
+    if verbose:
+        print("=" * 60)
+        print("配置预检 (check_config)")
+        print("=" * 60)
+        print(f"配置文件: {CONFIG_FILE}")
+        if _active_env_overrides:
+            print(f"环境变量覆盖: {len(_active_env_overrides)} 项")
+            for k, v in _active_env_overrides.items():
+                print(f"  {k} = {v}")
+        else:
+            print("环境变量覆盖: 无")
+        print("-" * 60)
+        if errors:
+            print(f"❌ 错误 ({len(errors)}):")
+            for e in errors:
+                print(f"   {e}")
+        if warnings:
+            print(f"⚠️  警告 ({len(warnings)}):")
+            for w in warnings:
+                print(f"   {w}")
+        if not errors and not warnings:
+            print("✅ 所有检查通过")
+        elif not errors:
+            print("✅ 关键检查通过（有警告但不影响启动）")
+        print("-" * 60)
+        if errors:
+            print("❌ 预检失败，请修正以上错误后再启动")
+        else:
+            print("✅ 预检通过，可以启动")
+        print("=" * 60)
+
+    return len(errors) == 0
+
+
 def _migrate_legacy_paths():
     """Migrate user data from legacy locations to user_data/.
 
@@ -173,7 +328,7 @@ def get_visual_servo_config():
 
 
 def load_config():
-    """加载配置文件（支持备份恢复）"""
+    """加载配置文件（支持备份恢复 + 环境变量覆盖）"""
     global _config_cache, _cache_valid
     execution_snapshot = _execution_config_snapshot.get()
     if execution_snapshot is not None:
@@ -186,7 +341,6 @@ def load_config():
                 _config_cache = json.load(f)
             _cache_valid = True
             logger.info("✅ 配置文件加载成功: %s", CONFIG_FILE)
-            return _config_cache
         except (json.JSONDecodeError, Exception) as e:
             logger.error("❌ 配置文件加载失败: %s，尝试从备份恢复", e)
             # 尝试从备份恢复
@@ -199,13 +353,20 @@ def load_config():
                     logger.info("✅ 从备份恢复配置成功: %s", bak_file)
                     # 恢复成功后立即保存回主文件
                     save_config(_config_cache)
-                    return _config_cache
                 except Exception as bak_e:
                     logger.error("❌ 备份文件也损坏: %s", bak_e)
-            return {}
+                    _config_cache = {}
+            else:
+                _config_cache = {}
     else:
         logger.warning("⚠️ 配置文件不存在，使用默认配置: %s", CONFIG_FILE)
-        return {}
+        _config_cache = {}
+
+    # 应用环境变量覆盖（不写回文件，仅影响内存）
+    if _config_cache:
+        _config_cache = _apply_env_overrides(_config_cache)
+        _cache_valid = True
+    return _config_cache
 
 
 def invalidate_config_cache():
@@ -472,38 +633,89 @@ def update_config(key, value):
 from ..robot.transform_utils import euler2rot as _euler2rot, pose2matrix as _pose2matrix
 
 
-_DEFAULT_D405_TOOL_BASE_CALIB = [-210, 0, 310, 90, 0, -90]
-_DEFAULT_D405_CAM_BASE_CALIB = [-72.76, -10.12, 31.18, 90, 0, -90]
+# 新默认 cam_to_flange_pose 由旧默认值计算：
+#   inv(pose2matrix(-210,0,310,90,0,-90)) @ pose2matrix(-72.76,-10.12,31.18,90,0,-90)
+_DEFAULT_CAM_TO_FLANGE_POSE = [10.12, -278.82, -137.24, 0.0, 0.0, 0.0]
+
+
+def _rot2euler(R, degree=True):
+    """旋转矩阵 -> 欧拉角 (ZYX，与 euler2rot 互逆)。"""
+    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    singular = sy < 1e-6
+    if not singular:
+        rx = np.arctan2(R[2, 1], R[2, 2])
+        ry = np.arctan2(-R[2, 0], sy)
+        rz = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        rx = np.arctan2(-R[1, 2], R[1, 1])
+        ry = np.arctan2(-R[2, 0], sy)
+        rz = 0.0
+    if degree:
+        rx, ry, rz = np.degrees([rx, ry, rz])
+    return rx, ry, rz
+
+
+def _matrix2pose(T, degree=True):
+    """4x4 齐次变换矩阵 -> 位姿 [x, y, z, rx, ry, rz]。"""
+    x, y, z = T[:3, 3]
+    rx, ry, rz = _rot2euler(T[:3, :3], degree)
+    return [float(x), float(y), float(z), float(rx), float(ry), float(rz)]
+
+
+def _tool_cam_base_to_flange(tool_base_calib_pose, cam_base_calib_pose):
+    """旧双位姿格式迁移为 cam_to_flange_pose:
+    cam_to_flange = inv(T_tool2base) @ T_cam2base
+    """
+    T_tool2base = _pose2matrix(*tool_base_calib_pose)
+    T_cam2base = _pose2matrix(*cam_base_calib_pose)
+    T_cam2flange = np.linalg.inv(T_tool2base) @ T_cam2base
+    return _matrix2pose(T_cam2flange)
 
 
 def get_calibration(camera_type="D435i"):
     config = load_config()
     calibration = config.get("calibration", {})
+    if not isinstance(calibration, dict):
+        calibration = {}
+    migrated = False
+
+    # 旧版单相机格式：tool_base_calib_pose / cam_base_calib_pose 直接位于 calibration 根下
     if "tool_base_calib_pose" in calibration and "cam_base_calib_pose" in calibration:
         old_tool = calibration.pop("tool_base_calib_pose")
         old_cam = calibration.pop("cam_base_calib_pose")
         calibration["D435i"] = {
-            "tool_base_calib_pose": old_tool,
-            "cam_base_calib_pose": old_cam,
+            "cam_to_flange_pose": _tool_cam_base_to_flange(old_tool, old_cam),
         }
         calibration["D405"] = {
-            "tool_base_calib_pose": list(_DEFAULT_D405_TOOL_BASE_CALIB),
-            "cam_base_calib_pose": list(_DEFAULT_D405_CAM_BASE_CALIB),
+            "cam_to_flange_pose": list(_DEFAULT_CAM_TO_FLANGE_POSE),
         }
+        migrated = True
+
+    # 旧版双位姿格式：每个相机条目下有 tool_base_calib_pose + cam_base_calib_pose
+    for cam_type, calib in list(calibration.items()):
+        if not isinstance(calib, dict):
+            continue
+        if "tool_base_calib_pose" in calib and "cam_base_calib_pose" in calib:
+            old_tool = calib.pop("tool_base_calib_pose")
+            old_cam = calib.pop("cam_base_calib_pose")
+            calib["cam_to_flange_pose"] = _tool_cam_base_to_flange(old_tool, old_cam)
+            migrated = True
+
+    if migrated:
         config["calibration"] = calibration
         save_config(config)
+
     cam_calib = calibration.get(camera_type, {})
     return cam_calib
 
 
-def set_calibration(camera_type, tool_base_calib_pose, cam_base_calib_pose):
+def set_calibration(camera_type, cam_to_flange_pose):
     global _cache_valid
     config = load_config()
     if "calibration" not in config:
         config["calibration"] = {}
     config["calibration"][camera_type] = {
-        "tool_base_calib_pose": tool_base_calib_pose,
-        "cam_base_calib_pose": cam_base_calib_pose,
+        "cam_to_flange_pose": cam_to_flange_pose,
     }
     result = save_config(config)
     _cache_valid = False
@@ -517,11 +729,8 @@ def get_all_calibrations():
 
 def get_camera_handeye_matrix(camera_type="D435i"):
     calib = get_calibration(camera_type)
-    tool_base_calib_pose = calib.get("tool_base_calib_pose", [-210, 0, 310, 90, 0, -90])
-    cam_base_calib_pose = calib.get("cam_base_calib_pose", [-72.76, -10.12, 31.18, 90, 0, -90])
-    T_tool2base = _pose2matrix(*tool_base_calib_pose)
-    T_cam2base = _pose2matrix(*cam_base_calib_pose)
-    T_cam2gripper = np.linalg.inv(T_tool2base) @ T_cam2base
+    cam_to_flange_pose = calib.get("cam_to_flange_pose", _DEFAULT_CAM_TO_FLANGE_POSE)
+    T_cam2gripper = _pose2matrix(*cam_to_flange_pose)
     return T_cam2gripper
 
 

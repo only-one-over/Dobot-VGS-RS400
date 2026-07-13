@@ -19,9 +19,9 @@ function Resolve-DobotProjectRoot {
     param([Parameter(Mandatory = $true)][string]$ProjectRoot)
     $resolved = (Resolve-Path -LiteralPath $ProjectRoot).Path
     if (-not (Test-Path -LiteralPath (
-        Join-Path $resolved "dobot_move\runtime_agent.py"
+        Join-Path $resolved "dobot_move\runtime\runtime_agent.py"
     ))) {
-        throw "dobot_move.runtime_agent not found under: $resolved"
+        throw "dobot_move.runtime.runtime_agent not found under: $resolved"
     }
     return $resolved
 }

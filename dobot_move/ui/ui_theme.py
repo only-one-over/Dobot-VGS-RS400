@@ -28,6 +28,14 @@ COLORS = {
     "accent_blue": "#93c5fd",
 }
 
+FONT_SIZES = {
+    "xs": 9,   # 占位/禁用文本
+    "sm": 10,  # 标题/辅助文本
+    "md": 11,  # 正文
+    "lg": 13,  # 强调值
+    "xl": 18,  # 页面标题
+}
+
 # Sidebar navigation icon characters (Unicode)
 NAV_ICONS = {
     "主功能":    "\u2302",
@@ -35,8 +43,10 @@ NAV_ICONS = {
     "点位管理":  "\u25CE",
     "Modbus 通信": "\u229E",
     "报警记录":  "\u26A0",
-    "手眼标定":  "\u25A3",
     "相机测试":  "\u25C9",
+    "生产监控":  "\u25A0",
+    "配置中心":  "\u2699",
+    "Runtime 调试": "\u25C8",
 }
 
 
@@ -101,7 +111,7 @@ QLabel {
 }
 
 QLabel#cardTitle {
-    color: #64748b;
+    color: #94a3b8;
     font-size: 9pt;
     font-weight: 700;
 }
@@ -121,6 +131,29 @@ QLineEdit:focus,
 QDoubleSpinBox:focus,
 QComboBox:focus {
     border-color: #3b82f6;
+}
+
+QPushButton:focus {
+    border-color: #3b82f6;
+    outline: 1px solid #3b82f6;
+}
+
+QTableWidget:focus {
+    border-color: #3b82f6;
+}
+
+QListWidget:focus {
+    border-color: #3b82f6;
+}
+
+QComboBox QAbstractItemView {
+    background: #111827;
+    color: #e2e8f0;
+    selection-background-color: #1e3a8a;
+    selection-color: #93c5fd;
+    border: 1px solid #334155;
+    padding: 4px 8px;
+    outline: none;
 }
 
 QPushButton {
@@ -180,28 +213,6 @@ QPushButton[role="secondary"] {
     background: #1a2236;
     border-color: #334155;
     color: #94a3b8;
-}
-
-QPushButton#emergencyStopButton {
-    min-width: 82px;
-    min-height: 82px;
-    max-width: 82px;
-    max-height: 82px;
-    border-radius: 41px;
-    background: #dc2626;
-    border: 4px solid #7f1d1d;
-    color: #ffffff;
-    font-size: 13pt;
-    font-weight: 900;
-}
-
-QPushButton#emergencyStopButton:hover {
-    background: #b91c1c;
-}
-
-QPushButton#emergencyStopButton[active="true"] {
-    background: #f97316;
-    border-color: #9a3412;
 }
 
 QTabWidget#workspaceTabs::pane {
@@ -447,7 +458,7 @@ def card_style(accent_color: str = "") -> str:
 def metric_label_style(color: str = "#e2e8f0") -> str:
     """Large metric value label."""
     return (
-        f"color: {color}; font-size: 18pt; font-weight: 700; "
+        f"color: {color}; font-size: 13pt; font-weight: 700; "
         "font-family: 'Segoe UI', monospace; background: transparent; border: none;"
     )
 
@@ -455,7 +466,24 @@ def metric_label_style(color: str = "#e2e8f0") -> str:
 def metric_title_style() -> str:
     """Small uppercase metric title label."""
     return (
-        "color: #64748b; font-size: 8pt; font-weight: 700; "
+        "color: #cbd5e1; font-size: 10pt; font-weight: 700; "
         "text-transform: uppercase; letter-spacing: 0.5px; "
         "background: transparent; border: none;"
     )
+
+
+def metric_value_style(color: str = "#e2e8f0") -> str:
+    """Standard metric value style for overview/summary labels (13pt)."""
+    return (
+        f"color: {color}; font-size: 13pt; font-weight: 600; "
+        "background: transparent; border: none;"
+    )
+
+
+def card_value_color(text: str) -> str:
+    """Return the appropriate color for a card value based on its text content."""
+    if any(k in text for k in ("已连接", "运行", "成功", "connected", "running")):
+        return "#22c55e"
+    if any(k in text for k in ("错误", "失败", "报警", "error", "failed")):
+        return "#ef4444"
+    return "#cbd5e1"

@@ -30,12 +30,10 @@ def _matrix2pose(T, degree=True):
 
 _DEFAULT_CALIBRATIONS = {
     "D435i": {
-        "tool_base_calib_pose": [-210, 0, 310, 90, 0, -90],
-        "cam_base_calib_pose": [-72.76, -10.12, 31.18, 90, 0, -90],
+        "cam_to_flange_pose": [10.12, -278.82, -137.24, 0.0, 0.0, 0.0],
     },
     "D405": {
-        "tool_base_calib_pose": [-210, 0, 310, 90, 0, -90],
-        "cam_base_calib_pose": [-72.76, -10.12, 31.18, 90, 0, -90],
+        "cam_to_flange_pose": [10.12, -278.82, -137.24, 0.0, 0.0, 0.0],
     },
 }
 
@@ -47,21 +45,15 @@ class HandEyeCalibManager:
     def get_matrix(self, camera_type) -> np.ndarray:
         return config_manager.get_camera_handeye_matrix(camera_type)
 
-    def set_matrix_from_poses(self, camera_type, tool_base_calib_pose, cam_base_calib_pose) -> bool:
-        result = config_manager.set_calibration(camera_type, tool_base_calib_pose, cam_base_calib_pose)
+    def set_matrix_from_poses(self, camera_type, cam_to_flange_pose) -> bool:
+        result = config_manager.set_calibration(camera_type, cam_to_flange_pose)
         if result:
             self._calibrations = config_manager.get_all_calibrations()
         return result
 
     def set_matrix_direct(self, camera_type, matrix_4x4) -> bool:
-        calib = config_manager.get_calibration(camera_type)
-        tool_base_calib_pose = calib.get("tool_base_calib_pose",
-                                          _DEFAULT_CALIBRATIONS.get(camera_type,
-                                                                     _DEFAULT_CALIBRATIONS["D435i"])["tool_base_calib_pose"])
-        T_tool2base = _pose2matrix(*tool_base_calib_pose)
-        T_cam2base_calib = T_tool2base @ matrix_4x4
-        cam_base_calib_pose = _matrix2pose(T_cam2base_calib)
-        result = config_manager.set_calibration(camera_type, tool_base_calib_pose, cam_base_calib_pose)
+        cam_to_flange_pose = _matrix2pose(matrix_4x4)
+        result = config_manager.set_calibration(camera_type, cam_to_flange_pose)
         if result:
             self._calibrations = config_manager.get_all_calibrations()
         return result
@@ -72,8 +64,7 @@ class HandEyeCalibManager:
             return False
         result = config_manager.set_calibration(
             camera_type,
-            list(defaults["tool_base_calib_pose"]),
-            list(defaults["cam_base_calib_pose"]),
+            list(defaults["cam_to_flange_pose"]),
         )
         if result:
             self._calibrations = config_manager.get_all_calibrations()
@@ -85,6 +76,5 @@ class HandEyeCalibManager:
     def get_poses(self, camera_type) -> dict:
         calib = config_manager.get_calibration(camera_type)
         return {
-            "tool_base_calib_pose": calib.get("tool_base_calib_pose", []),
-            "cam_base_calib_pose": calib.get("cam_base_calib_pose", []),
+            "cam_to_flange_pose": calib.get("cam_to_flange_pose", []),
         }

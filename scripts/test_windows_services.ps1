@@ -11,11 +11,16 @@ $vendorBinary = Join-Path $ProjectRoot (
     "dobot_move\windows_service\vendor\WinSW-x64.exe"
 )
 
-& $PythonExe -c (
-    "from dobot_move.windows_service.service_config import " +
-    "verify_winsw_binary; import sys; " +
-    "sys.exit(0 if verify_winsw_binary(r'$vendorBinary') else 1)"
-)
+Push-Location $ProjectRoot
+try {
+    & $PythonExe -c (
+        "from dobot_move.windows_service.service_config import " +
+        "verify_winsw_binary; import sys; " +
+        "sys.exit(0 if verify_winsw_binary(r'$vendorBinary') else 1)"
+    )
+} finally {
+    Pop-Location
+}
 if ($LASTEXITCODE -ne 0) {
     throw "WinSW SHA256 verification failed."
 }
@@ -30,11 +35,11 @@ if ($watchdog.Status -ne "Running") {
 }
 
 $config = Get-Content -LiteralPath (
-    Join-Path $ProjectRoot "dobot_move\config.json"
+    Join-Path $ProjectRoot "user_data\config.json"
 ) -Raw | ConvertFrom-Json
-$healthPath = Join-Path $ProjectRoot "runtime_health.json"
+$healthPath = Join-Path $ProjectRoot "user_data\runtime_health.json"
 if (
-    $config.runtime -and
+    $config.PSObject.Properties.Name -contains "runtime" -and
     $config.runtime.PSObject.Properties.Name -contains "health_path"
 ) {
     $configuredHealthPath = [string]$config.runtime.health_path
@@ -69,13 +74,40 @@ if ($null -eq $health -or $age -gt 5) {
     throw "Runtime health file did not become fresh within 30 seconds."
 }
 
+$ipcPort = 8765
+if (
+    $config.PSObject.Properties.Name -contains "runtime" -and
+    $config.runtime.PSObject.Properties.Name -contains "ipc_port"
+) {
+    $ipcPort = [int]$config.runtime.ipc_port
+}
+$ipcTokenPath = ""
+if (
+    $config.PSObject.Properties.Name -contains "runtime" -and
+    $config.runtime.PSObject.Properties.Name -contains "ipc_token_path"
+) {
+    $configuredTokenPath = [string]$config.runtime.ipc_token_path
+    if ([IO.Path]::IsPathRooted($configuredTokenPath)) {
+        $ipcTokenPath = $configuredTokenPath
+    } else {
+        $ipcTokenPath = Join-Path $ProjectRoot $configuredTokenPath
+    }
+}
 Push-Location $ProjectRoot
 try {
-    & $PythonExe -c (
-        "from dobot_move.gui_ipc_client import RuntimeIpcClient; " +
-        "r=RuntimeIpcClient().ping(); " +
-        "assert r.get('ok'), r; print('IPC ping: OK')"
-    )
+    if ($ipcTokenPath) {
+        & $PythonExe -c (
+            "from dobot_move.ui.gui_ipc_client import RuntimeIpcClient; " +
+            "r=RuntimeIpcClient(port=$ipcPort, token_path=r'$ipcTokenPath').ping(); " +
+            "assert r.get('ok'), r; print('IPC ping: OK')"
+        )
+    } else {
+        & $PythonExe -c (
+            "from dobot_move.ui.gui_ipc_client import RuntimeIpcClient; " +
+            "r=RuntimeIpcClient(port=$ipcPort).ping(); " +
+            "assert r.get('ok'), r; print('IPC ping: OK')"
+        )
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "Authenticated Runtime IPC ping failed."
     }

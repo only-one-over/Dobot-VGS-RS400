@@ -1,4 +1,8 @@
-"""Non-hardware deployment checks for the Windows Service installer."""
+"""Non-hardware deployment checks for the Windows Service installer.
+
+Checks are split into errors (block installation) and warnings (allow
+installation to proceed, surfaced for user awareness).
+"""
 
 from __future__ import annotations
 
@@ -6,12 +10,15 @@ import importlib
 import json
 from pathlib import Path
 
-from .. import config_manager
+from ..config import config_manager
 from ..flow.flow_library import FlowLibrary
 
 
-def collect_preflight_errors() -> list[str]:
+def collect_preflight_errors() -> tuple[list[str], list[str]]:
+    """Return (errors, warnings). Errors block installation; warnings do not."""
     errors: list[str] = []
+    warnings: list[str] = []
+
     try:
         config = json.loads(
             Path(config_manager.CONFIG_FILE).read_text(encoding="utf-8")
@@ -45,16 +52,54 @@ def collect_preflight_errors() -> list[str]:
             configured or config_manager.DEFAULT_CAMERA_MODEL_PATH
         )
         if model_path.suffix.lower() != ".onnx":
-            errors.append(f"{camera_type} model is not an ONNX file: {model_path}")
+            warnings.append(
+                f"{camera_type} model is not an ONNX file: {model_path}"
+            )
         elif not model_path.is_file():
-            errors.append(f"{camera_type} model does not exist: {model_path}")
-    return errors
+            # 模型文件可在部署后通过 GUI 或 config 提供，仅警告不阻塞安装
+            warnings.append(
+                f"{camera_type} model does not exist: {model_path} "
+                "(部署后请通过 camera.models 配置或放置模型文件)"
+            )
+
+    # runtime 配置段检查
+    runtime_config = config.get("runtime", {})
+    if not isinstance(runtime_config, dict):
+        warnings.append("config.json 的 runtime 段不是对象，将使用默认值")
+        runtime_config = {}
+    else:
+        if not runtime_config:
+            warnings.append(
+                "config.json 未配置 runtime 段，将使用默认值 "
+                "(ipc_port=8765, ipc_stop_port=8766)"
+            )
+
+    # 端口可用性检查（warning 级，不阻塞安装）
+    import socket
+    default_ports = {
+        "IPC": ("127.0.0.1", runtime_config.get("ipc_port", 8765)),
+        "Stop": ("127.0.0.1", runtime_config.get("ipc_stop_port", 8766)),
+        "Modbus": ("0.0.0.0", config.get("modbus_port", 502)),
+    }
+    for name, (addr, port) in default_ports.items():
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((addr, int(port)))
+            sock.close()
+        except OSError:
+            warnings.append(
+                f"{name} 端口 {addr}:{port} 被占用，安装后服务可能启动失败"
+            )
+    return errors, warnings
 
 
 def main() -> int:
-    errors = collect_preflight_errors()
+    errors, warnings = collect_preflight_errors()
+    for warning in warnings:
+        print(f"[WARNING] {warning}")
     for error in errors:
-        print(error)
+        print(f"[ERROR] {error}")
     return 1 if errors else 0
 
 

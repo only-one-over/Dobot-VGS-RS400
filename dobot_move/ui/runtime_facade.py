@@ -5,15 +5,12 @@
 发送通过 ``send_ipc_func`` 走 ``RuntimeIpcRequestThread`` 异步通道；
 Runtime 侧的错误随后通过既有的完成回调抵达（调试面板 / 状态栏）。
 
-PR-C: 命令契约由 :mod:`dobot_move.runtime.runtime_contract` 的
-``COMMAND_SPECS`` 单点定义。本外观 import 该字典仅作文档化用途，不强制
-客户端校验——Runtime 端会在 handler 调用前做 schema 验证。
+PR-C: 命令契约由 :mod:`dobot_move.runtime.runtime_contract` 单点定义。
+Runtime 端会在 handler 调用前做 schema 验证，客户端无需自行校验。
 """
 from __future__ import annotations
 
 from typing import Any, Callable, Optional
-
-from ..runtime.runtime_contract import COMMAND_SPECS  # noqa: F401 — re-export for callers
 
 
 class RuntimeFacade:

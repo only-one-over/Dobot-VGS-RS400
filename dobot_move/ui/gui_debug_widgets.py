@@ -22,17 +22,17 @@ class ErrorTrendPlot(QWidget):
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#0b0f1a"))
-        painter.setPen(QColor("#cbd5e1"))
+        painter.fillRect(self.rect(), QColor("#f7f9fb"))
+        painter.setPen(QColor("#86909c"))
         painter.drawText(10, 20, self.title)
 
         left, top = 42, 30
         right, bottom = max(left + 1, self.width() - 10), max(top + 1, self.height() - 24)
-        painter.setPen(QPen(QColor("#334155"), 1))
+        painter.setPen(QPen(QColor("#dde2e9"), 1))
         painter.drawLine(left, top, left, bottom)
         painter.drawLine(left, bottom, right, bottom)
         if len(self.samples) < 2:
-            painter.setPen(QColor("#64748b"))
+            painter.setPen(QColor("#c9cdd4"))
             painter.drawText(left + 10, top + 30, "等待视觉伺服数据")
             return
 
@@ -50,9 +50,9 @@ class ErrorTrendPlot(QWidget):
             x = left + (x_value - x_min) / x_span * (right - left)
             y = bottom - max(0.0, y_value) / y_max * (bottom - top)
             points.append((int(x), int(y)))
-        painter.setPen(QPen(QColor("#22c55e"), 2))
+        painter.setPen(QPen(QColor("#1664FF"), 2))
         for start, end in zip(points, points[1:]):
             painter.drawLine(start[0], start[1], end[0], end[1])
-        painter.setPen(QColor("#94a3b8"))
+        painter.setPen(QColor("#86909c"))
         painter.drawText(4, top + 5, f"{y_max:.1f}")
         painter.drawText(8, bottom + 16, "0")

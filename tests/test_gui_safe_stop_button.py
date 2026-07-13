@@ -32,6 +32,9 @@ class _StubWindow:
     def _send_runtime_ipc_stop(self, command, data=None, on_success=None, on_failure=None):
         self.stop_calls.append((command, data, on_success, on_failure))
 
+    def _update_emergency_stop_button(self):
+        pass
+
     def statusBar(self):
         return self._status_bar
 

@@ -87,7 +87,7 @@ class MainControlPanel(QWidget):
         self.runtime_indicator_dot = QLabel()
         self.runtime_indicator_dot.setFixedSize(16, 16)
         self.runtime_indicator_dot.setStyleSheet(
-            "background-color: #9e9e9e; border-radius: 8px; border: none;"
+            "background-color: #c9cdd4; border-radius: 8px; border: none;"
         )
         self.runtime_state_text = QLabel("未知")
         self.runtime_state_text.setStyleSheet(

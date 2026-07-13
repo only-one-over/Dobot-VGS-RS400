@@ -29,10 +29,10 @@ STATUS_FAILED = "failed"
 
 # Status display config
 _STATUS_CONFIG = {
-    STATUS_PENDING:   {"icon": "⏳", "color": "#94a3b8", "bg": "#1e293b", "border": "#475569"},
-    STATUS_RUNNING:   {"icon": "▶", "color": "#93c5fd", "bg": "#1e3a8a", "border": "#3b82f6"},
-    STATUS_COMPLETED: {"icon": "✓", "color": "#86efac", "bg": "#064e3b", "border": "#22c55e"},
-    STATUS_FAILED:    {"icon": "✗", "color": "#fca5a5", "bg": "#450a0a", "border": "#ef4444"},
+    STATUS_PENDING:   {"icon": "⏳", "color": "#86909c", "bg": "#f7f9fb", "border": "#dde2e9"},
+    STATUS_RUNNING:   {"icon": "▶", "color": "#1664FF", "bg": "#f3f7ff", "border": "#1664FF"},
+    STATUS_COMPLETED: {"icon": "✓", "color": "#189959", "bg": "#e2f5eb", "border": "#2a814b"},
+    STATUS_FAILED:    {"icon": "✗", "color": "#c43138", "bg": "#feeced", "border": "#d7312a"},
 }
 
 _MIME_TYPE = "application/x-flow-step-index"
@@ -150,10 +150,11 @@ class FlowStepList(QWidget):
         self._items: list[FlowStepItem] = []
         self._modules: list[dict] = []
         self._selected_index = -1
+        self._empty_label: QLabel | None = None
 
         self.setAcceptDrops(True)
         self.setObjectName("flow_step_list")
-        self.setStyleSheet("#flow_step_list { border: 1px solid #334155; border-radius: 6px; }")
+        self.setStyleSheet("#flow_step_list { border: 1px solid #dde2e9; border-radius: 6px; }")
 
     def set_steps(self, modules: list[dict]):
         """Set the step list from module definitions."""
@@ -176,16 +177,22 @@ class FlowStepList(QWidget):
 
     def _rebuild(self):
         """Rebuild all step items from self._modules."""
-        # Clear existing
+        # Clear existing step items
         for item in self._items:
             self._layout.removeWidget(item)
             item.setParent(None)
         self._items.clear()
 
+        # Clear previous empty label if present
+        if self._empty_label is not None:
+            self._layout.removeWidget(self._empty_label)
+            self._empty_label.setParent(None)
+            self._empty_label = None
+
         if not self._modules:
-            empty = QLabel("抓取流程为空")
-            empty.setStyleSheet(FLOW_STEP_EMPTY_STYLE)
-            self._layout.addWidget(empty)
+            self._empty_label = QLabel("抓取流程为空")
+            self._empty_label.setStyleSheet(FLOW_STEP_EMPTY_STYLE)
+            self._layout.addWidget(self._empty_label)
             return
 
         for i, module in enumerate(self._modules):

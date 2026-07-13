@@ -12,12 +12,8 @@ class VisionMixin:
     """Camera configuration UI backed only by Runtime health snapshots."""
 
     def _refresh_camera_model_controls(self):
-        for camera_type in ("D435i", "D405"):
-            try:
-                model_path = get_camera_model_path(camera_type)
-                self.main_control.set_camera_model_path(camera_type, model_path)
-            except Exception as exc:
-                logger.error("读取 %s 模型配置失败: %s", camera_type, exc)
+        # Camera model path UI moved to ConfigCenterPage; no-op in mixin.
+        pass
 
     def _runtime_camera_connected(self, camera_type):
         snapshot = getattr(self, "_runtime_status", None)
@@ -47,7 +43,8 @@ class VisionMixin:
             return False
         try:
             normalized = set_camera_model_path(camera_type, selected_path)
-            self.main_control.set_camera_model_path(camera_type, normalized)
+            if hasattr(self, 'config_center_page'):
+                self.config_center_page.update_camera_status(camera_type, "未连接", normalized)
             QMessageBox.information(
                 self,
                 "模型已保存",
@@ -60,13 +57,10 @@ class VisionMixin:
             return False
 
     def _set_camera_status(self, camera_type, status):
-        label = (
-            self.d435i_status_label
-            if camera_type == "D435i"
-            else self.d405_status_label
-        )
-        label.setText(f"{camera_type}: {status}")
-        apply_status_visual(label, status)
+        if hasattr(self, 'config_center_page'):
+            self.config_center_page.update_camera_status(camera_type, status)
+        else:
+            logger.debug("config_center_page not available; cannot update camera status for %s", camera_type)
 
     def connect_d435i(self):
         success, msg = self._runtime_facade.connect_camera("D435i")

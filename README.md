@@ -8,17 +8,6 @@
 
 基于 Python + PySide6 的越疆 CR 系列机械臂视觉定位控制系统。集成双 RealSense 深度相机（D435i + D405）、YOLO 实例分割、ByteTrack 目标跟踪、3D 卡尔曼滤波、手眼标定、视觉伺服和普通圆弧运动，实现从目标识别到精准定位的全自动化流程。
 
-## 目录
-
-- [功能特性](#功能特性)
-- [快速开始](#快速开始)
-- [架构](#架构)
-- [使用方法](#使用方法)
-- [配置](#配置)
-- [C++ 加速](#c-加速)
-- [常见问题](#常见问题)
-- [许可证](#许可证)
-
 ## 功能特性
 
 - 🎯 **双相机协作** — D435i 粗定位 + D405 精细识别（掩码几何中心）
@@ -51,476 +40,181 @@
 
 ## 快速开始
 
-### 前置条件
+### 快速开始 · 开发模式
 
-- Python 3.10+（推荐 3.12）
-- Intel RealSense SDK 2.0
-- CMake 3.15+ 和 C++17 编译器（可选，用于 C++ 加速）
+适用于本地开发、调试 GUI 和视觉功能。
 
-### 安装
-
-```bash
-# 1. 克隆仓库
+```powershell
 git clone https://github.com/only-one-over/Dobot-VGS-RS400.git
 cd Dobot-VGS-RS400
 
-# 2. 创建虚拟环境并安装依赖
+# 创建虚拟环境（推荐 Python 3.12 x64）
 python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# Linux
-source .venv/bin/activate
+.\.venv\Scripts\activate
+
+# 安装依赖
 pip install -r requirements.txt
 
-# 3. （可选）构建 C++ 加速模块
-python build_cpp.py
+# 启动 GUI
+python run.py
 ```
 
-> GPU 和 C++ 依赖为可选，已包含在 requirements.txt 中（用注释标注）。无 NVIDIA GPU 时自动回退 CPU 推理。GPU 环境详细部署指南见 [docs/gpu_environment.md](docs/gpu_environment.md)。
+### 快速开始 · Windows Service 部署
 
-### 验证安装
+适用于生产环境 7×24 无人值守运行。使用 WinSW 将 Runtime + Watchdog 注册为 Windows 服务。
 
-```bash
-# 基础依赖验证
-python -c "import PySide6, numpy, cv2, pyrealsense2, onnxruntime; print('All dependencies OK')"
+#### 默认路径
 
-# GPU 真实启用验证（必须用 best.onnx 创建 session 确认 provider）
-python -c "import onnxruntime as ort; s = ort.InferenceSession('dobot_move/best.onnx', providers=['CUDAExecutionProvider']); print('Active providers:', s.get_providers())"
-# 注：best.onnx 为兼容回退路径，实际模型路径在 user_data/config.json 中配置
-# 通过标准：输出包含 CUDAExecutionProvider
+| 项目 | 默认值 | 自定义参数 |
+|------|--------|------------|
+| 项目根目录 | `C:\DobotRuntime` | `-ProjectRoot <路径>` |
+| Python 解释器 | `<ProjectRoot>\.venv\Scripts\python.exe` | `-PythonExe <路径>` |
+| 服务用户 | `.\DobotRuntimeSvc` | `-ServiceUser <用户名>` |
+| 用户数据目录 | `<ProjectRoot>\user_data\` | — |
+| WinSW 包装日志 | `<ProjectRoot>\logs\` | — |
+| Runtime 日志 | `<ProjectRoot>\user_data\logs\` | — |
+| IPC Token | `<ProjectRoot>\user_data\runtime_ipc.token` | config `runtime.ipc_token_path` |
+| 健康文件 | `<ProjectRoot>\user_data\runtime_health.json` | — |
 
-# 可选：验证 C++ 模块
-python -c "import dobot_core; print('C++ module OK:', dir(dobot_core))"
-```
-
-> 仅检查 `get_available_providers()` 不够——它只说明 onnxruntime 识别 CUDA provider，不代表实际能创建 CUDA session。正确验证方式是创建 InferenceSession 并确认 active provider。详见 [docs/gpu_environment.md](docs/gpu_environment.md)。
-
-## 架构
-
-```
-┌─────────────────────────────────────────────────┐
-│                   GUI (PySide6)                    │
-│           DobotMainWindow + 7 Mixins             │
-├─────────┬──────────┬──────────┬─────────────────┤
-│  机器人   │  视觉     │  力控     │   Modbus        │
-│  控制     │  系统     │  圆弧    │   通信          │
-├─────────┼──────────┼──────────┼─────────────────┤
-│DobotApi │VisionSys │ForceArc  │ ModbusServer    │
-│Dashboard│ +Tracker │+FBMonitor│ ModbusClient    │
-│Feedback │ +Kalman3D│+ArcPlanner│                │
-├─────────┴──────────┴──────────┴─────────────────┤
-│          dobot_core (C++ pybind11, 可选)           │
-│     transforms / nms / yolo (后处理)               │
-└─────────────────────────────────────────────────┘
-```
-
-### 核心模块
-
-| 模块 | 文件 | 描述 |
-|------|------|------|
-| 主界面 | `ui/gui_app.py` | PySide6 主窗口 + 7 个 Mixin |
-| 机器人控制器 | `robot/robot_controller.py` | 运动控制、状态管理 |
-| 通信 | `robot/dobot_api.py` | TCP/IP Dashboard (29999) + Feedback (30004) |
-| 视觉系统 | `vision/vision_system.py` | YOLO 推理、目标检测、3D 定位 |
-| 目标跟踪 | `vision/tracker.py` | ByteTrack 多目标跟踪 |
-| 3D 滤波 | `vision/kalman_filter_3d.py` | 6 状态 3D Kalman 滤波器 |
-| 深度处理 | `vision/depth_processor.py` | 4 级 RealSense 深度滤波链 |
-| 手眼标定 | `robot/hand_eye_calib.py` | 标定矩阵管理 |
-| 坐标变换 | `robot/transform_utils.py` | euler2rot / pose2matrix |
-| 视觉伺服 | `robot/visual_servo_controller.py` | 多线程视觉伺服控制 |
-| 圆弧运动 | `robot/arc_motion_controller.py` | 原生 Dobot Arc() 运动控制 | 力传感器监测线程 |
-| 圆弧规划 | `robot/arc_trajectory_planner.py` | 圆弧航点生成 | CAN 总线电池监测 |
-| Modbus 服务器 | `communication/modbus_server.py` | Modbus TCP 服务器 | Modbus TCP 客户端（小车） |
-| 配置管理 | `config/config_manager.py` | JSON 配置读写 |
-| 主控面板 | `ui/main_control_panel.py` | 主控面板组件，基于信号通信 |
-| 流程步骤列表 | `flow/flow_step_list.py` | 流程步骤列表，拖拽排序+状态图标 |
-| Qt 兼容层 | `ui/qt_compat.py` | Qt 框架兼容层（PySide6） |
-| 工作线程 | `flow/flow_executor.py` | 纯 Python 流程执行器、FlowRunContext、模块验证、运动互斥锁（无 Qt 依赖） |
-| Qt 适配 | `flow/qt_workers.py` | FlowThread 包装 FlowExecutor，回调桥接到 pyqtSignal |
-| 相机测试 | `flow/camera_test_worker.py` | GUI 专用相机测试 Worker（QImage/QThread） |
-| 兼容入口 | `flow/workers.py` | 向后兼容 shim，re-export 上述三个模块的公开符号 |
-| 后台代理 | `runtime/runtime_agent.py` | 设备监督、流程看门狗、健康状态和崩溃恢复（无 Qt 依赖） |
-| 外部看门狗 | `runtime/runtime_watchdog.py` | 卡死检测、独立 Stop、进程重启和重启熔断 |
-| 韧性基础 | `runtime/runtime_resilience.py` | 状态持久化、单实例锁、资源指标和超时预算 |
-| C++ 核心 | `cpp_core/` | pybind11 加速模块 |
-
-### 项目结构
-
-```
-dobot_move_python/
-├── user_data/                    # 用户数据（替换包时保留）
-│   ├── config.json               # 现场配置（标定/点位/IP）
-│   ├── grasp_flow_modules.json   # 用户编辑的流程库
-│   ├── alarm_history.json        # 运行时报警记录
-│   ├── runtime_*.json            # Runtime 运行时状态
-│   └── logs/                     # 运行时日志
-├── dobot_move/                   # 主代码包（用户只需更新此文件夹）
-│   ├── robot/                    # 机械臂控制
-│   ├── vision/                   # 视觉感知
-│   ├── ui/                       # 界面层 + mixins/
-│   ├── runtime/                  # 生产后端
-│   ├── flow/                     # 流程编排
-│   ├── config/                   # 配置管理 + 报警码
-│   ├── communication/            # Modbus 通信
-│   ├── remote_api/               # 外部 REST API（只读查询）
-│   └── windows_service/          # Windows 服务封装
-├── cpp_core/                     # C++ 加速模块源码
-├── run.py                        # GUI 入口
-├── runtime_agent.py              # Runtime 入口
-├── runtime_watchdog.py           # Watchdog 入口
-├── remote_api.py                 # Remote API 入口（薄兼容层）
-└── requirements.txt
-```
-
-### 升级更新
-
-用户升级只需用新版 `dobot_move/` 文件夹覆盖旧版即可，`user_data/` 中的配置和数据完全保留：
-
-1. 备份 `user_data/`（可选）
-2. 用新版 `dobot_move/` 覆盖旧版
-3. 重启应用
-
-首次升级时，`config_manager.py` 会自动检测旧位置的数据（`dobot_move/config.json`、`dobot_move/gui_mixins/grasp_flow_modules.json` 等）并迁移到 `user_data/`，用户无感知。
-
-### 硬件要求
-
-| 设备 | 型号 | 备注 |
-|------|------|------|
-| 机械臂 | Dobot CR5 / CR10 / CRA 系列 | TCP/IP 协议控制 |
-| 中距相机 | Intel RealSense D435i | 粗定位，深度 0.5-2.2m |
-| 近距相机 | Intel RealSense D405 | 精细识别，深度 0.07-0.8m |
-| 力传感器 | 内置六轴力传感器 | Dobot FT 系列 |
-| 网络 | 以太网 | 机器人 IP 默认 192.168.1.50 |
-
-## 使用方法
-
-### 启动应用
-
-```bash
-python -m dobot_move
-```
-
-生产现场 7x24 后台运行使用包内模块：
+#### 步骤 1：准备项目目录和虚拟环境
 
 ```powershell
-python -m dobot_move.runtime_agent
+# 方式 A：使用默认路径 C:\DobotRuntime
+mkdir C:\DobotRuntime
+cd C:\DobotRuntime
+# 将项目文件复制到 C:\DobotRuntime（或 git clone 到此目录）
+
+# 方式 B：使用自定义路径（例如 D:\DobotProd）
+# git clone https://github.com/only-one-over/Dobot-VGS-RS400.git D:\DobotProd
+# cd D:\DobotProd
+
+# 创建虚拟环境
+python -m venv .venv
+
+# 安装依赖
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Windows 10/11 生产部署推荐使用 WinSW 双服务：Runtime 服务独占硬件，Watchdog 服务负责卡死恢复，GUI 由登录用户独立启动。安装、校验和回滚步骤见 [docs/windows_service.md](docs/windows_service.md)。
+#### 步骤 2：安装 Windows 服务
 
-生产环境应同时运行 `dobot_move.runtime_agent` 和 `dobot_move.runtime_watchdog`。GUI 与后台都会先启动 Modbus，再立即在后台并发连接机器人和主流程需要的相机；5 秒观察窗口结束后不阻塞、不报码，后台继续低频重连。运行流程前使用缓存状态快速检查，缺少设备时 Modbus 写 `110` 并拒绝本次启动。根目录同名脚本只保留为旧命令兼容入口。开机自启动、异常恢复、`40001` 状态协议和状态排查见 [docs/runtime_agent.md](docs/runtime_agent.md)。
-
-### Remote REST API（可选）
-
-供外部平板/MES 只读查询机器人状态的独立 HTTP 服务，不暴露任何控制命令，不影响 Runtime/Watchdog/GUI：
+以**管理员身份**运行 PowerShell：
 
 ```powershell
-python -m dobot_move.remote_api --host 0.0.0.0 --port 8000
-```
-
-- 与 Runtime 解耦：通过 30004 反馈端口（Dobot CR 支持多客户端并发）和 Modbus TCP 客户端（读 `localhost:502`）获取数据，不重复开服务
-- 生产状态通过读取 `user_data/remote_api_health.json` 间接获取（Runtime 写入 `runtime_health.json`，remote_api 写入自己的健康文件）
-- Token 认证：`Authorization: Bearer <token>`，token 为空时禁用认证（仅限内网调试）
-- 端点：`/api/v1/health`（免认证）、`/api/v1/status`、`/api/v1/feedback/all`、`/api/v1/modbus/registers`、`/api/v1/production/status`
-- 旧路径 `/api/status` 等返回 301 重定向到 v1（保留 query string）
-- CORS 头 `Access-Control-Allow-Origin: *`
-- 零新第三方依赖（仅用标准库 `ThreadingHTTPServer`）
-
-配置示例见 [config.example.json](dobot_move/config/config.example.json) 的 `remote_api` 块。
-
-### 首次设置
-
-1. **连接机器人** — 在界面中输入机器人 IP，点击"连接"
-2. **使能机器人** — 连接成功后，点击"使能"
-3. **手眼标定**（如需重新标定）：
-   - 切换到"手眼标定"选项卡
-   - 输入标定板上的工具点位姿和相机原点位姿
-   - 点击"计算"生成标定矩阵
-4. **选择并连接相机模型** — 在主控制页分别为 D435i、D405 选择兼容的 ONNX 模型，然后连接相机
-5. **测试视觉** — 点击"相机测试"验证检测效果
-6. **选择主流程** — 可新建、重命名、复制和切换多个流程；主控制页选择的主流程供手动运行和 Modbus `40001=3` 使用
-7. **运行抓取流程** — 运动编辑页运行当前编辑流程，主控制页运行已选主流程；两处均可暂停和继续
-
-### 抓取流程
-
-```
-拍照位 → D435i 粗识别 → 移动至 D435i 目标上方
-→ 视觉伺服逼近 → D405 精细识别（掩码几何中心）
-→ 计算目标点 → 移动至目标位置
-→ 原生圆弧运动或相对移动（可选） → 抬升 → 放置
-```
-
-### 流程模块类型
-
-| 类型 | 描述 |
-|------|------|
-| 直线运动 | MovJ/MovL 绝对运动，支持已保存点位/相机识别坐标/初始位置三种目标 |
-| 圆弧运动 | 基于当前位姿生成圆弧路径，使用 ServoP 队列运动 |
-| 相对移动 | 单次 RelMovL/RelMovJ 相对运动 |
-| 连续相对路径 | 多段相对运动，15列段表编辑，stop_each/queued 两种执行模式 |
-| 相机识别 | 多帧检测+置信度提前退出+缓存复用，D435i/D405 双相机 |
-| 视觉伺服 | D405 闭环迭代逼近，自适应增益 |
-| 关节旋转 | RelJointMovJ 关节空间旋转 |
-
-### 运动完成判定
-
-运动完成判定采用三级优先级机制：
-
-1. **指令 ID 优先短路**（最高优先级）：当有 command_id 且 30004 反馈新鲜时，仅使用官方模式判定（`CurrentCommandId == command_id && RobotMode == 5`），判定完成后立即返回，跳过通用速度/状态判定
-2. **30004 反馈状态机**（兜底）：仅在无 command_id 或 30004 反馈失效时使用。线速度+角速度归零 + 位姿到位（绝对运动）或 RunningStatus/RunQueuedCmd 完成（相对运动）+ 连续稳定 3 次
-3. **Dashboard 兜底**：仅在 30004 反馈过期时按 1.0s 冷却间隔查询 RobotMode
-
-安全守卫：最小稳定时间（0.15s）+ 必须见过运动状态才允许判定完成。
-
-### 安全机制
-
-- **急停独立连接**：通过独立临时 TCP 连接发送 EmergencyStop，避免主 Dashboard 连接锁阻塞
-- **运动互斥锁**：流程和 Modbus 运动互斥执行，急停始终优先
-- **急停立即停止**：急停触发时立即设置 stop_event，流程线程马上停止下发
-- **反馈包校验**：30004 反馈 TestValue 严格校验，校验失败不更新缓存
-- **连接状态分离**：Dashboard 连接状态和 30004 反馈健康状态分开显示
-- **急停响应码校验**：独立连接返回响应码非 0 时走主连接兜底；空响应（超时）记录"已发送未确认"
-- **急停按钮防抖**：急停按钮始终可点击，内部 500ms 时间戳防抖，不受命令执行状态禁用
-
-## 配置
-
-### config.json
-
-将 `dobot_move/config/config.example.json` 复制为 `user_data/config.json`，并根据实际环境修改配置值。
-
-配置文件位于 `user_data/config.json`：
-
-| 字段 | 类型 | 描述 | 示例 |
-|------|------|------|------|
-| `robot_ip` | string | 机器人 IP 地址 | `"192.168.1.50"` |
-| `photo_position` | float[6] | 拍照位 (x,y,z,rx,ry,rz) mm/deg | `[900.98, -403.82, 166.76, -83.92, 1.30, -89.06]` |
-| `target_offset` | float[3] | 目标偏移 (dx,dy,dz) mm | `[0, 0, 0]` |
-| `calibration.D435i` | object | D435i 手眼标定参数 | 见下方 |
-| `calibration.D405` | object | D405 手眼标定参数 | 见下方 |
-| `camera.models.D435i` | string | D435i 使用的 ONNX 模型绝对路径 | `"D:\\models\\d435i.onnx"` |
-| `camera.models.D405` | string | D405 使用的 ONNX 模型绝对路径 | `"D:\\models\\d405.onnx"` |
-| `points` | object | 点位表 | 见下方 | 小车 IP 地址 | `"192.168.5.2"` | 小车 Modbus 端口 | `502` |
-| `modbus_port` | int | 本地 Modbus 服务器端口 | `502` |
-| `user_index` | int | 用户坐标系索引 | `0` |
-| `tool_index` | int | 工具坐标系索引 | `0` |
-
-#### Remote API
-
-`remote_api` 配置块控制外部只读 HTTP 服务的监听地址、认证、30004 反馈和 Modbus 客户端行为。整块缺失时使用默认值。
-
-| 字段 | 类型 | 默认值 | 描述 |
-|------|------|--------|------|
-| `host` | string | `"0.0.0.0"` | HTTP 监听地址 |
-| `port` | int | `8000` | HTTP 监听端口 |
-| `token` | string | `""` | Bearer Token，为空时禁用认证（仅限内网调试） |
-| `feedback_port` | int | `30004` | 30004 反馈端口 |
-| `feedback_reconnect_interval_s` | float | `2.0` | 反馈断流后重连间隔 |
-| `feedback_stale_ok_s` | float | `0.3` | 反馈新鲜阈值（秒） |
-| `feedback_stale_fail_s` | float | `2.0` | 反馈失效阈值（秒） |
-| `modbus_client_timeout_s` | float | `3.0` | Modbus 客户端读取超时 |
-| `modbus_host` | string | `"127.0.0.1"` | Modbus 客户端目标主机（默认读本地 Runtime 的 502） |
-| `allowed_ips` | array | `[]` | IP 白名单（空数组表示不限制） |
-
-#### 性能配置
-
-| 字段 | 默认值 | 描述 |
-|------|--------|------|
-| `flow_wait_poll_interval` | 0.05 | 流程等待轮询间隔（秒） |
-| `robot_mode_dashboard_fallback_interval` | 1.0 | RobotMode Dashboard 查询冷却间隔（秒） |
-| `pose_cache_max_age` | 0.3 | 位姿缓存最大年龄（秒） |
-| `motion_settle_time` | 0.15 | 运动命令后最小稳定时间（秒） |
-| `motion_done_speed_threshold` | 1.0 | 线速度归零阈值（mm/s） |
-| `motion_done_rotation_speed_threshold` | 1.0 | 角速度归零阈值（°/s） |
-| `motion_done_pose_tolerance` | 2.0 | 位姿到位容差（mm） |
-| `motion_done_rotation_tolerance` | 2.0 | 旋转到位容差（°） |
-| `motion_done_stable_samples` | 3 | 连续稳定采样次数 |
-| `motion_done_use_feedback` | true | 是否使用 30004 反馈辅助判定 |
-| `feedback_stale_fail_age` | 2.0 | 反馈断流失败判定时间（秒） |
-
-#### 手眼标定
-
-每个相机的标定数据包含两个字段：
-
-```json
-{
-  "tool_base_calib_pose": [x, y, z, rx, ry, rz],
-  "cam_base_calib_pose": [x, y, z, rx, ry, rz]
-}
-```
-
-- `tool_base_calib_pose`：标定板上工具点相对于基座的位姿
-- `cam_base_calib_pose`：相机原点相对于基座的位姿
-
-系统计算手眼矩阵：`T_cam2gripper = inv(T_tool2base) @ T_cam2base`
-
-#### 点位表
-
-```json
-{
-  "d435i": {
-    "coords": [x, y, z, rx, ry, rz],
-    "is_relative": false,
-    "relative_to": null,
-    "offset": [0, 0, 0, 0, 0, 0],
-    "is_default": true
-  }
-}
-```
-
-| 字段 | 描述 |
-|------|------|
-| `coords` | 绝对坐标 (mm, deg) |
-| `is_relative` | 是否为相对点位 |
-| `relative_to` | 参考点名称（用于相对点位） |
-| `offset` | 相对偏移 |
-| `is_default` | 系统默认点位（不可删除） |
-
-两个默认点位：`d435i`（D435i 识别目标中心）和 `d405`（D405 识别目标中心），由视觉系统自动更新。
-
-## C++ 加速
-
-### 模块结构
-
-```
-cpp_core/
-├── CMakeLists.txt
-├── include/dobot_core/
-│   ├── transforms.h
-│   ├── nms.h
-│   └── yolo.h
-└── src/
-    ├── pybind_module.cpp
-    ├── transforms.cpp
-    ├── nms.cpp
-    └── yolo.cpp
-```
-
-### API
-
-```python
-import dobot_core
-
-# 坐标变换
-R = dobot_core.transforms.euler2rot(rx, ry, rz, degree=True)  # → 3x3 numpy array
-T = dobot_core.transforms.pose2matrix(x, y, z, rx, ry, rz)    # → 4x4 numpy array
-p = dobot_core.transforms.transform_point(matrix, point)       # → 3D numpy array
-
-# NMS
-keep = dobot_core.nms.nms(boxes, scores, iou_threshold=0.5)   # → list[int]
-
-# YOLOv8 后处理
-dets = dobot_core.yolo.postprocess_yolov8(outputs, original_size, scale,
-       offset, new_size, num_classes, conf_threshold, iou_threshold)
-masks = dobot_core.yolo.process_mask(protos, masks_in, bboxes, shape,
-        scale, offset, new_size, threshold)
-```
-
-### 回退
-
-当 `dobot_core` 不可用时（未编译或不支持的平台），程序自动回退到纯 Python 实现，不影响任何功能。
-
-### 构建
-
-```bash
-pip install pybind11 cmake
-python build_cpp.py
-```
-
-## 常见问题
-
-### 缺少依赖 opencv-python
-```bash
-pip install opencv-python
-```
-
-### 相机连接失败
-- 确认 RealSense 相机已通过 USB 连接
-- 确认已安装 Intel RealSense SDK 2.0
-- 检查 `pyrealsense2` 版本是否与 SDK 版本匹配
-- 使用多台相机时需指定序列号
-
-### 机器人连接失败
-- 确认机器人与 PC 在同一网段
-- 检查 `user_data/config.json` 中的 `robot_ip`
-- 确认机器人已开机且网络可达（`ping 192.168.1.50`）
-
-### C++ 模块构建失败
-- 确认已安装 CMake 3.15+ 和 C++17 编译器
-- Windows 需要安装 Visual Studio Build Tools
-- 不构建 C++ 模块不影响使用——程序会回退到 Python
-
-### YOLO 推理（优先 GPU，自动回退 CPU）
-
-本项目 YOLO 推理优先使用 NVIDIA GPU + CUDA，无 GPU 时自动回退 CPU 推理。CUDA runtime 和 cuDNN 随 pip 包自动安装到虚拟环境中。
-
-```bash
-# 确认 GPU 可用
-nvidia-smi
-
-# 验证 GPU 真实启用
-python -c "import onnxruntime as ort; s = ort.InferenceSession('dobot_move/best.onnx', providers=['CUDAExecutionProvider']); print('Active providers:', s.get_providers())"
-# 注：best.onnx 为兼容回退路径，实际模型路径在 user_data/config.json 中配置
-```
-
-| 模式 | YOLO 推理耗时 | 视觉伺服闭环频率 | 安装要求 | 支持状态 |
-|------|--------------|-----------------|----------|----------|
-| GPU (CUDA) | ~20-50ms | ~10-15 Hz | NVIDIA GPU + 驱动 + onnxruntime-gpu[cuda,cudnn] | ✅ 推荐 |
-| CPU | ~100-300ms | ~3-5 Hz | 无额外要求 | ✅ 支持（自动回退） |
-
-> 完整 GPU 环境部署指南见 [docs/gpu_environment.md](docs/gpu_environment.md)。注意 `onnxruntime` 和 `onnxruntime-gpu` 不能同时安装，装了 GPU 版后 CPU 版需先卸载。连接相机后界面"推理"卡片会显示当前模式（GPU/CPU）。
-
-### YOLO 模型检测效果差
-- 在主控制页确认 D435i、D405 各自选择了正确的 `.onnx` 模型；相机连接期间需先断开才能更换
-- 未配置相机模型时，程序兼容使用包内 `best.onnx`（位于 `dobot_move/` 目录）
-- 检查光照条件，避免强烈反光
-- 新模型必须使用固定 NCHW 输入尺寸，并输出当前后处理支持的 YOLO 检测或实例分割张量
-- GUI、抓取流程和后台运行统一按相机类型读取模型配置；模型文件丢失或不兼容时会拒绝连接，不会静默使用其他模型
-- `*.onnx` 已被 Git 忽略，现场模型文件需单独部署
-
-### 手眼标定精度不足
-- 确认标定板上工具点位姿记录准确
-- 检查欧拉角约定（本项目使用 ZYX 旋转顺序）
-- 建议多次标定取平均值
-- 标定误差应 < 5mm
-
-## 许可证
-
-本项目基于 MIT 许可证授权——详见 [LICENSE](LICENSE) 文件。
-
-## 生产部署速查
-
-当前推荐的现场部署方式是 **WinSW 双服务 + 独立 Runtime + localhost TCP IPC + 独立 GUI**。
-
-- `DobotRuntimeService`：后台生产服务，独占机器人、D405/D435i、Modbus 502、流程执行和 IPC。
-- `DobotRuntimeWatchdog`：独立看门狗服务，检测 Runtime 卡死后先尝试安全 `Stop()`，再通过 Windows Service Control Manager 重启 Runtime。
-- GUI 只作为工程调试和参数编辑工具，由登录用户手动启动；打开或关闭 GUI 不会占用硬件，也不会停止后台服务。
-- Runtime 服务异常重启后不会自动续跑旧流程；PLC 或人工必须重新触发流程。
-
-管理员 PowerShell 安装示例：
-
-```powershell
+# 使用默认路径 C:\DobotRuntime
 powershell -ExecutionPolicy Bypass `
   -File .\scripts\install_windows_services.ps1 `
-  -ProjectRoot C:\DobotRuntime `
+  -CreateServiceUser
+
+# 或使用自定义路径
+powershell -ExecutionPolicy Bypass `
+  -File .\scripts\install_windows_services.ps1 `
+  -ProjectRoot D:\DobotProd `
+  -PythonExe D:\DobotProd\.venv\Scripts\python.exe `
   -CreateServiceUser
 ```
 
-当前源码目录直接安装示例：
+安装过程会自动：
+1. 检查管理员权限、Python 和 WinSW 哈希
+2. 创建服务账户 `DobotRuntimeSvc`（自动生成强密码）
+3. 生成 IPC token 并限制文件权限
+4. 安装并启动 `DobotRuntimeService` + `DobotRuntimeWatchdog` 两个服务
+5. 验证服务状态、健康文件和 IPC 连通性
+
+#### 步骤 3：检查服务状态
 
 ```powershell
-powershell -ExecutionPolicy Bypass `
-  -File .\scripts\install_windows_services.ps1 `
-  -ProjectRoot D:\桌面\dobot_move_python `
-  -PythonExe D:\桌面\dobot_move_python\.venv\Scripts\python.exe `
-  -CreateServiceUser
-```
+# 查看服务状态
+Get-Service DobotRuntimeService
+Get-Service DobotRuntimeWatchdog
 
-安装后检查：
+# 查看健康文件
+Get-Content .\user_data\runtime_health.json
 
-```powershell
+# 查看 Runtime 日志（最后 100 行）
+Get-Content .\user_data\logs\runtime.log -Tail 100
+
+# 运行状态检查脚本
 powershell -ExecutionPolicy Bypass `
   -File .\scripts\test_windows_services.ps1 `
   -ProjectRoot C:\DobotRuntime
 ```
 
-完整服务部署、卸载和回滚说明见 [docs/windows_service.md](docs/windows_service.md)。
+#### 步骤 4：卸载与回滚
+
+```powershell
+# 仅卸载服务
+powershell -ExecutionPolicy Bypass `
+  -File .\scripts\uninstall_windows_services.ps1 `
+  -ProjectRoot C:\DobotRuntime
+
+# 卸载服务并恢复旧任务计划
+powershell -ExecutionPolicy Bypass `
+  -File .\scripts\rollback_windows_services.ps1 `
+  -ProjectRoot C:\DobotRuntime `
+  -StartLegacyTasks
+```
+
+> 完整的部署细节、安全说明和故障排查请参阅 **[docs/windows_service.md](docs/windows_service.md)**。
+
+### 快速开始 · Remote REST API（可选）
+
+Remote REST API 是独立 HTTP 服务，供外部平板/MES 只读查询机器人状态、30004 反馈、Modbus 寄存器和生产状态。
+
+```powershell
+# 使用默认配置（host=0.0.0.0, port=8000, 无 token）
+python -m dobot_move.remote_api
+
+# 或指定 host 和 port
+python -m dobot_move.remote_api --host 0.0.0.0 --port 8000
+
+# 或使用根目录入口脚本
+python remote_api.py
+```
+
+默认配置（可通过 `user_data/config.json` 的 `remote_api` 段覆盖）：
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `host` | `0.0.0.0` | 监听地址 |
+| `port` | `8000` | 监听端口 |
+| `token` | `""` | 为空时禁用 Token 认证 |
+| `feedback_port` | `30004` | Dobot 反馈端口 |
+| `modbus_host` | `127.0.0.1` | Modbus 读取地址 |
+
+> 完整的 API 端点和安全说明请参阅 **[docs/architecture.md](docs/architecture.md)** 的"Remote REST API"小节。
+
+### 配置文件位置速查表
+
+| 文件 | 默认路径 | 说明 |
+|------|----------|------|
+| 运行配置 | `<ProjectRoot>\user_data\config.json` | 机器人 IP、相机、标定、Modbus 等 |
+| 流程文件 | `<ProjectRoot>\user_data\grasp_flow_modules.json` | 生产流程定义 |
+| Runtime 健康 | `<ProjectRoot>\user_data\runtime_health.json` | 服务模式状态 |
+| Runtime 状态 | `<ProjectRoot>\user_data\runtime_state.json` | 运行时状态快照 |
+| IPC Token | `<ProjectRoot>\user_data\runtime_ipc.token` | 跨进程认证 token |
+| Runtime 日志 | `<ProjectRoot>\user_data\logs\runtime.log` | Runtime 主日志 |
+| Remote API 日志 | `<ProjectRoot>\user_data\logs\remote_api.log` | Remote API 日志 |
+| Remote API 健康 | `<ProjectRoot>\user_data\remote_api_health.json` | Remote API 状态 |
+| WinSW 日志 | `<ProjectRoot>\logs\` | 服务包装器日志 |
+| 报警历史 | `<ProjectRoot>\user_data\alarm_history.json` | 历史报警记录 |
+
+> 完整的安装、配置、标定、操作、部署和故障排查指南请参阅 **[USER_GUIDE.md](USER_GUIDE.md)**。
+
+## 文档导航
+
+| 文档 | 说明 |
+|------|------|
+| **[USER_GUIDE.md](USER_GUIDE.md)** | 用户使用指南 — 从安装到运维的完整流程 |
+| **[CODE_WIKI.md](CODE_WIKI.md)** | 代码 Wiki — 架构、模块、类与函数索引 |
+| [docs/architecture.md](docs/architecture.md) | 系统架构 — 分层设计、资源所有权、IPC |
+| [docs/runtime_agent.md](docs/runtime_agent.md) | Runtime 后台 — 无头运行、状态文件、异常恢复 |
+| [docs/windows_service.md](docs/windows_service.md) | WinSW 服务 — 双服务部署、安装卸载回滚 |
+| [docs/gpu_environment.md](docs/gpu_environment.md) | GPU 环境 — CUDA 部署、ONNX Runtime 验证 |
+| [docs/cpp_acceleration.md](docs/cpp_acceleration.md) | C++ 加速 — pybind11 构建与 API |
+| [docs/dev_workflow.md](docs/dev_workflow.md) | 开发工作流 — 依赖管理、启动命令 |
+| [docs/ui_spec.md](docs/ui_spec.md) | UI 规格 — 界面设计与交互 |
+| [docs/roadmap.md](docs/roadmap.md) | 路线图 — 开发计划 |
+
+## 许可证
+
+本项目基于 MIT 许可证授权——详见 [LICENSE](LICENSE) 文件。

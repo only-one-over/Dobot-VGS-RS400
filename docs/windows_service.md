@@ -1,5 +1,7 @@
 # WinSW 双服务部署
 
+> **快速开始见 [README.md](../README.md#快速开始--windows-service-部署)** — 包含默认路径表和精简安装步骤。
+
 生产环境使用两个独立 Windows Service：
 
 - `DobotRuntimeService`：独占机器人、D405、D435i、Modbus 502、流程执行器和 localhost IPC。

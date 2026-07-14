@@ -107,6 +107,7 @@ class RuntimeDebugPage(QWidget):
         for text, command in (
             ("进入维护", "enter_maintenance"),
             ("退出维护", "exit_maintenance"),
+            ("清除恢复锁", "clear_recovery"),
             ("刷新状态", "get_status"),
             ("发布状态", "get_publication_status"),
         ):

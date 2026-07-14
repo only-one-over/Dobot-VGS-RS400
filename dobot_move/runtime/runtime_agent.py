@@ -383,6 +383,7 @@ class RuntimeProgramRunner:
             "D405": threading.Lock(),
         }
         self._camera_serials: Optional[dict[str, str]] = None
+        self._last_camera_error: dict = {}
         self.current_flow_id: Optional[str] = None
         self.main_flow_id: Optional[str] = None
         self.main_flow_name: Optional[str] = None
@@ -596,6 +597,7 @@ class RuntimeProgramRunner:
         vision = getattr(self, attr)
         if vision is not None and getattr(vision, "is_available", True):
             if self._camera_preflight_ok(vision):
+                self._last_camera_error = {}
                 return True
         if vision is not None:
             try:
@@ -612,6 +614,11 @@ class RuntimeProgramRunner:
 
                 self._camera_serials = None
                 serial = self._detect_camera_serials().get(camera_type)
+                if serial is None:
+                    self._last_camera_error = {
+                        "stage": "not_detected",
+                        "detail": f"未检测到 {camera_type} 相机设备，请检查 USB 连接",
+                    }
                 logger.info(
                     "runtime connecting %s camera attempt=%d%s",
                     camera_type,
@@ -633,9 +640,18 @@ class RuntimeProgramRunner:
                         vision.close()
                         return False
                     setattr(self, attr, vision)
+                    self._last_camera_error = {}
                     return True
+                self._last_camera_error = {
+                    "stage": "preflight_failed",
+                    "detail": f"{camera_type} 预检捕获失败（{self.camera_preflight_attempts}次）",
+                }
                 vision.close()
-            except Exception:
+            except Exception as exc:
+                self._last_camera_error = {
+                    "stage": "init_failed",
+                    "detail": f"{camera_type} 初始化失败: {exc}",
+                }
                 logger.exception(
                     "runtime %s camera initialization/preflight failed attempt=%d",
                     camera_type,
@@ -1327,12 +1343,45 @@ class DobotRuntimeAgent:
             "D435i": bool(
                 self.program_runner.vision_d435i is not None
                 and getattr(self.program_runner.vision_d435i, "is_available", True)
+                and self._camera_physically_connected("D435i")
             ),
             "D405": bool(
                 self.program_runner.vision_d405 is not None
                 and getattr(self.program_runner.vision_d405, "is_available", True)
+                and self._camera_physically_connected("D405")
             ),
         }
+
+    def _camera_physically_connected(self, camera_type: str) -> bool:
+        """通过 RealSense context 查询设备是否仍物理连接。
+
+        查询失败或异常时保守返回 True（避免误报断开），仅当查询成功
+        且确认设备不在线时返回 False。
+        """
+        try:
+            import pyrealsense2 as rs
+            ctx = rs.context()
+            devices = list(ctx.query_devices())
+            if not devices:
+                return False
+            # D405 设备名含 "D405"，D435i 设备名含 "D435"
+            target_name = "D405" if camera_type == "D405" else "D435"
+            for dev in devices:
+                name = dev.get_info(rs.camera_info.name) if dev.is_sensor_streaming() else ""
+                # 备用：用 product_id 或 name 字段
+                try:
+                    name = dev.get_info(rs.camera_info.name)
+                except Exception:
+                    name = ""
+                if target_name in name:
+                    return True
+            return False
+        except ImportError:
+            # pyrealsense2 未安装，保守返回 True
+            return True
+        except Exception:
+            # 查询异常，保守返回 True
+            return True
 
     def _robot_connection_ready(self) -> bool:
         if (
@@ -1443,6 +1492,7 @@ class DobotRuntimeAgent:
             "get_status": self._ipc_get_status,
             "enter_maintenance": self._ipc_enter_maintenance,
             "exit_maintenance": self._ipc_exit_maintenance,
+            "clear_recovery": self._ipc_clear_recovery,
             "reload_config": self._ipc_reload_config,
             "publish_config": self._ipc_publish_config,
             "get_publication_status": self._ipc_get_publication_status,
@@ -1529,11 +1579,6 @@ class DobotRuntimeAgent:
                     "runtime_state": RuntimeState.MAINTENANCE.value,
                     "already_active": True,
                 }
-            if self.recovery_required:
-                raise IpcCommandError(
-                    "RECOVERY_REQUIRED",
-                    "Runtime处于恢复锁状态，需先由PLC执行复位",
-                )
             if state == RuntimeState.STOPPING.value:
                 raise IpcCommandError(
                     "RUNTIME_BUSY",
@@ -1597,6 +1642,24 @@ class DobotRuntimeAgent:
                 "already_inactive": False,
                 "auto_resumed": False,
             }
+
+    def _ipc_clear_recovery(self, _data=None) -> dict[str, Any]:
+        """清除 Runtime 恢复锁，无需 PLC 下发 40001=0。
+
+        触发 ``_on_recovery_cleared`` 回调，该回调会重新验证
+        startup_inputs：若仍无效则重新进入 RECOVERY_REQUIRED。
+        """
+        # 若未处于恢复锁状态，直接返回
+        if not self.recovery_required:
+            state = self.state_store.snapshot().get("state", "")
+            return {"recovery_cleared": True, "runtime_state": state}
+        # 清除恢复锁（触发 _on_recovery_cleared 回调）
+        self.controller._clear_runtime_recovery_required()
+        state = self.state_store.snapshot().get("state", "")
+        return {
+            "recovery_cleared": not self.recovery_required,
+            "runtime_state": state,
+        }
 
     def _ipc_reload_config(self, _data=None) -> dict[str, Any]:
         if self.program_runner.snapshot().get("running"):
@@ -1887,11 +1950,14 @@ class DobotRuntimeAgent:
     ) -> dict[str, Any]:
         from ..runtime.runtime_vision_debug import capture_vision_snapshot
 
-        self._require_maintenance()
-        if self.program_runner.snapshot().get("running"):
+        # 相机测试不再要求维护模式，仅检查流程是否运行中
+        if (
+            self.program_runner.snapshot().get("running")
+            or self._runtime_motion_busy()
+        ):
             raise IpcCommandError(
                 "RUNTIME_BUSY",
-                "Vision capture is unavailable while a flow is running",
+                "流程运行中，无法测试相机，请先停止当前任务",
             )
         vision = self._get_debug_vision(camera_type)
         lock = self.program_runner._camera_locks[camera_type]
@@ -2070,10 +2136,16 @@ class DobotRuntimeAgent:
         # and startup supervisor; reuse it so the camera is registered in
         # ``program_runner.vision_d435i`` / ``vision_d405``.
         if not self.program_runner._ensure_camera(camera_type):
-            raise IpcCommandError(
-                "CAMERA_NOT_READY",
-                f"{camera_type} camera connection failed",
-            )
+            err = self.program_runner._last_camera_error or {}
+            stage = err.get("stage", "unknown")
+            detail = err.get("detail", f"{camera_type} camera connection failed")
+            error_code_map = {
+                "not_detected": "CAMERA_NOT_DETECTED",
+                "init_failed": "CAMERA_INIT_FAILED",
+                "preflight_failed": "CAMERA_PREFLIGHT_FAILED",
+            }
+            code = error_code_map.get(stage, "CAMERA_NOT_READY")
+            raise IpcCommandError(code, detail)
         return {"connected": True, "camera_type": camera_type}
 
     def _ipc_disconnect_camera(self, data=None) -> dict[str, Any]:

@@ -119,9 +119,12 @@ class VisionMixin:
     def _on_camera_self_test_finished(self, camera_type, data):
         camera_ok = bool(data.get("camera_ok"))
         inference_ok = bool(data.get("inference_ok"))
+        provider = data.get("provider", "")  # 推理 provider，可能为空
         if camera_ok and inference_ok:
+            # 成功时追加 provider 信息，为空则不追加括号
+            suffix = f" ({provider})" if provider else ""
             self.statusBar().showMessage(
-                f"相机自检: {camera_type} 通过", 5000
+                f"相机自检: {camera_type} 通过{suffix}", 5000
             )
         else:
             reasons = []

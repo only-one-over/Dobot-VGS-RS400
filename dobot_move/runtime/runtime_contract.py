@@ -73,6 +73,9 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
     "exit_maintenance": _spec(
         "exit_maintenance", response_schema={"runtime_state": str}
     ),
+    "clear_recovery": _spec(
+        "clear_recovery", response_schema={"recovery_cleared": bool}
+    ),
     "reload_config": _spec("reload_config", response_schema={"reloaded": bool}),
     "publish_config": _spec("publish_config", response_schema={"published": bool}),
     "get_publication_status": _spec("get_publication_status"),

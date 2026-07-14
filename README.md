@@ -154,7 +154,121 @@ powershell -ExecutionPolicy Bypass `
   -StartLegacyTasks
 ```
 
+#### 步骤 5：更新代码后重启 Windows 服务
+
+修改 `dobot_move/runtime/runtime_agent.py`、`dobot_move/runtime/*.py` 或其他 Runtime 代码后，**必须重启 `DobotRuntimeService` 才能加载新代码**——Windows Service 进程在启动时已将旧代码载入内存，热替换文件不会立即生效。
+
+以**管理员身份**运行 PowerShell：
+
+```powershell
+# 1. 重启 Runtime 服务（Watchdog 会随后自动对齐，无需单独重启）
+Restart-Service DobotRuntimeService -Force
+
+# 2. 验证服务状态（应为 Running）
+Get-Service DobotRuntimeService
+
+# 3. 验证健康文件已重置为新会话
+Get-Content .\user_data\runtime_health.json
+```
+
+关键行为说明：
+
+- `Restart-Service -Force` 会先发送停止信号，等待最多 30 秒让 Runtime 完成优雅停止（关闭相机、机器人连接、Modbus、写入 `runtime_health.json` 中的 `clean_shutdown=true` 标记），再启动新进程。
+- 新进程启动时会读取 `runtime_health.json`，若上次未正常关闭（`clean_shutdown=false`、JSON 损坏或仍处于 ACTIVE 状态），Runtime 会进入 `RECOVERY_REQUIRED` 状态，等待操作员通过 PLC 寄存器 40001=0 或 IPC `clear_recovery` 命令清除恢复锁。
+- Watchdog 服务在 Runtime 停止期间不会误触发重启，因为它检测到 SCM 主动停止信号后会等待 Runtime 自行退出；只有在 Runtime 卡死（健康文件长时间未更新）时才会独立发送 `Stop()` 并通过 SCM 重启。
+- 仅修改 GUI 代码（`dobot_move/ui/*.py`）**无需重启服务**——GUI 是登录用户独立启动的进程，关闭并重新打开 GUI 即可加载新代码。
+- 修改 `scripts/install_windows_services.ps1` 等安装脚本后**无需重启服务**，下次执行安装/卸载脚本时自动生效。
+
 > 完整的部署细节、安全说明和故障排查请参阅 **[docs/windows_service.md](docs/windows_service.md)**。
+
+### 快速开始 · 内网工控机离线部署
+
+适用于无法访问互联网的工控机（产线内网环境）。核心思路：在联网开发机上下载所有依赖 wheel 并打包，再拷贝到工控机用 `pip install --no-index` 离线安装。
+
+#### 联网开发机：准备离线包
+
+```powershell
+# 1. 在开发机（与工控机相同的 Windows x64 + Python 3.11 x64）执行
+cd C:\path\to\Dobot-VGS-RS400
+
+# 2. 确认 requirements_lock.txt 存在（锁定精确版本，避免在线解析）
+# 若不存在，先在干净 venv 中生成：
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+pip freeze > requirements_lock.txt
+
+# 3. 下载所有依赖 wheel 到 wheels/ 目录
+pip download -r requirements_lock.txt -d wheels/
+
+# 4. 打包项目（含 wheels/ 但不含 .venv/、user_data/ 数据、logs/）
+Compress-Archive -Path .\dobot_move,.\scripts,.\docs,.\README.md,`
+  .\USER_GUIDE.md,.\requirements.txt,.\requirements_lock.txt,`
+  .\run.py,.\remote_api.py,.\runtime_agent.py,.\runtime_watchdog.py,`
+  .\build_cpp.py,.\wheels,.\dobot_move\windows_service\vendor `
+  -DestinationPath .\dobot-vgs-offline.zip -Force
+```
+
+可选：将 RealSense SDK、CUDA 12.x 独立安装包一并打包（工控机若无 CUDA，会自动回退到 CPU 推理，但帧率会显著下降）。
+
+#### 工控机：离线安装
+
+```powershell
+# 1. 解压离线包到 C:\DobotRuntime
+Expand-Archive .\dobot-vgs-offline.zip -DestinationPath C:\DobotRuntime -Force
+cd C:\DobotRuntime
+
+# 2. 创建虚拟环境（工控机已预装 Python 3.11 x64）
+python -m venv .venv
+.\.venv\Scripts\activate
+
+# 3. 离线安装依赖（--no-index 禁用 PyPI，--find-links 指向本地 wheels/）
+pip install --no-index --find-links=wheels\ -r requirements_lock.txt
+
+# 4. 验证关键依赖（GPU 推理可用性）
+python -c "import onnxruntime; print(onnxruntime.get_available_providers())"
+# 期望输出包含 'CUDAExecutionProvider'；若仅 'CPUExecutionProvider' 则检查 CUDA 安装
+
+# 5. 拷贝模型文件、标定参数、流程文件到 user_data/（离线环境手工拷贝）
+#    - user_data/config.json
+#    - user_data/grasp_flow_modules.json
+#    - user_data/<model>.onnx
+#    - user_data/hand_eye_calib_*.json
+
+# 6. 执行配置预检（必须通过才能安装服务）
+.\.venv\Scripts\python.exe -m dobot_move.runtime --check-config
+
+# 7. 安装 Windows Service（按上面"Windows Service 部署"章节的步骤 2 执行）
+powershell -ExecutionPolicy Bypass `
+  -File .\scripts\install_windows_services.ps1 `
+  -CreateServiceUser
+```
+
+#### 离线环境更新代码
+
+后续推送代码更新到工控机时，只需拷贝 `dobot_move/` 目录和入口脚本即可，**不要覆盖 `user_data/`**（保留生产配置和标定数据）：
+
+```powershell
+# 1. 暂停服务（避免文件被占用）
+Stop-Service DobotRuntimeService -Force
+
+# 2. 拷贝新的 dobot_move/、run.py、runtime_agent.py 等到 C:\DobotRuntime
+# （仅替换代码目录，保留 user_data/、.venv/、wheels/）
+
+# 3. 若依赖变化，离线更新 wheel
+pip install --no-index --find-links=wheels\ -r requirements_lock.txt --upgrade
+
+# 4. 重启服务加载新代码
+Start-Service DobotRuntimeService
+```
+
+#### 离线部署注意事项
+
+- **Python 版本一致**：开发机和工控机必须使用相同 Python 版本和位数（推荐 Python 3.11 x64），否则 wheel 不兼容。
+- **CUDA 版本匹配**：`onnxruntime-gpu` 1.16+ 要求 CUDA 12.x；工控机若装 CUDA 11.x，需下载对应 `onnxruntime-gpu==1.15` 的 wheel。
+- **wheel 完整性**：拷贝前在开发机执行 `pip install --no-index --find-links=wheels\ -r requirements_lock.txt` 验证一次，确保所有依赖齐全。
+- **不要复制 `.venv`**：每台工控机必须重新创建虚拟环境，直接复制其他机器的 `.venv` 会导致路径硬编码和 Python 解释器不匹配。
+- **user_data 隔离**：`user_data/` 目录包含工控机特定的 IP、标定参数、流程定义，绝对不要用开发机的同名文件覆盖。
 
 ### 快速开始 · Remote REST API（可选）
 

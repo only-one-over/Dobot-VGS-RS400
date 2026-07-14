@@ -42,3 +42,8 @@ user_data/*
 
 # Runtime logs (WinSW service output)
 logs/
+
+# Offline deployment artifacts (large binaries, do not commit)
+wheels/
+*.zip
+dobot-vgs-offline.zip

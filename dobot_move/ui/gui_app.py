@@ -555,6 +555,8 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
                 btn.clicked.connect(lambda _c=False, cmd="enter_maintenance": self._send_runtime_ipc(cmd))
             elif text == "退出维护":
                 btn.clicked.connect(lambda _c=False, cmd="exit_maintenance": self._send_runtime_ipc(cmd))
+            elif text == "清除恢复锁":
+                btn.clicked.connect(self._clear_recovery)
             elif text == "刷新状态":
                 btn.clicked.connect(lambda _c=False: self._send_runtime_ipc("get_status", on_success=self._cache_runtime_capabilities))
             elif text == "发布状态":
@@ -1266,6 +1268,11 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
 
     def _clear_alarm_history(self):
         success, msg = self._runtime_facade.clear_alarm_history()
+        self.statusBar().showMessage(msg, 3000)
+        return success
+
+    def _clear_recovery(self):
+        success, msg = self._runtime_facade.clear_recovery()
         self.statusBar().showMessage(msg, 3000)
         return success
     

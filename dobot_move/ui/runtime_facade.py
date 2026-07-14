@@ -128,6 +128,9 @@ class RuntimeFacade:
         except Exception as exc:
             return False, f"{action_name}失败：{exc}"
 
+    def clear_recovery(self) -> tuple[bool, str]:
+        return self._send("clear_recovery", action_name="清除恢复锁")
+
     # -- 运动 ------------------------------------------------------------
 
     def move_to_point(

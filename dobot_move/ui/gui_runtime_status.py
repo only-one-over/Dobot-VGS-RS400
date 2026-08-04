@@ -77,6 +77,7 @@ class RuntimeHealthSnapshot:
     runtime_state: str = "OFFLINE"
     robot_connected: bool = False
     robot_enabled: bool = False
+    software_emergency_active: bool = False
     d405_connected: bool = False
     d435i_connected: bool = False
     modbus_running: bool = False
@@ -134,6 +135,9 @@ class RuntimeHealthReader:
             runtime_state=runtime_state,
             robot_connected=online and bool(robot.get("connected", False)),
             robot_enabled=online and bool(robot.get("enabled", False)),
+            software_emergency_active=online and bool(
+                robot.get("software_emergency_active", False)
+            ),
             d405_connected=online
             and bool(flow_cameras.get("D405", startup_cameras.get("D405", False))),
             d435i_connected=online

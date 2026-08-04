@@ -9,6 +9,7 @@ from pathlib import Path
 
 RUNTIME_SERVICE_ID = "DobotRuntimeService"
 WATCHDOG_SERVICE_ID = "DobotRuntimeWatchdog"
+REMOTE_API_SERVICE_ID = "DobotRemoteApiService"
 WINSW_VERSION = "2.12.0"
 WINSW_X64_SHA256 = (
     "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da"
@@ -128,6 +129,41 @@ def build_watchdog_service_xml(
     account = ET.SubElement(root, "serviceaccount")
     _add_text(account, "username", "LocalSystem")
     ET.SubElement(root, "onfailure", action="restart", delay="30 sec")
+    ET.SubElement(root, "onfailure", action="none")
+    _add_text(root, "resetfailure", "10 min")
+    _add_text(root, "autoRefresh", "false")
+    return _serialize(root)
+
+
+def build_remote_api_service_xml(
+    project_root,
+    python_exe,
+    *,
+    service_id=REMOTE_API_SERVICE_ID,
+) -> str:
+    """生成 DobotRemoteApiService 的 WinSW XML 配置。
+
+    Remote API 作为独立服务运行，与 Runtime 解耦（无 <depend> 标签），
+    崩溃后由 WinSW 自动重启。服务账户由 install 脚本注入，此处不写
+    <serviceaccount> 节点。
+    """
+    project_root = Path(project_root).resolve()
+    root = _base_service(
+        service_id,
+        "Dobot Remote API Service",
+        "HTTP REST API service for tablet/MES clients (status, feedback, alarms, Modbus).",
+        python_exe,
+        project_root,
+        "-m dobot_move.remote_api",
+        project_root / "logs" / "winsw-remote-api",
+    )
+    _add_environment(
+        root,
+        {
+            "PYTHONUNBUFFERED": "1",
+        },
+    )
+    ET.SubElement(root, "onfailure", action="restart", delay="10 sec")
     ET.SubElement(root, "onfailure", action="none")
     _add_text(root, "resetfailure", "10 min")
     _add_text(root, "autoRefresh", "false")

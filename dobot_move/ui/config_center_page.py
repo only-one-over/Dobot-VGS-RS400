@@ -13,7 +13,7 @@ from ..ui.qt_compat import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QLabel,
     QComboBox, QLineEdit, QGroupBox, QScrollArea, QTableWidget,
     QTableWidgetItem, QHeaderView, QFrame, Qt, pyqtSignal, QMessageBox,
-    QDialog, QDialogButtonBox,
+    QDialog, QDialogButtonBox, QSpinBox,
 )
 from ..ui.ui_theme import COLORS, apply_status_visual, set_button_role
 
@@ -51,6 +51,9 @@ class ConfigCenterPage(QWidget):
     # ── 配置重载信号 ──
     reload_config_requested = pyqtSignal()
 
+    # ── 运动安全配置信号 ──
+    motion_safety_save_requested = pyqtSignal(dict)            # 15 字段 config dict
+
     BTN_HEIGHT = 38
 
     def __init__(self, parent=None):
@@ -85,11 +88,12 @@ class ConfigCenterPage(QWidget):
         layout.setSpacing(12)
         layout.setContentsMargins(12, 12, 12, 12)
 
-        # 依次构建 5 个配置组
+        # 依次构建 6 个配置组
         layout.addWidget(self._build_robot_group())
         layout.addWidget(self._build_camera_group())
         layout.addWidget(self._build_calib_group())
         layout.addWidget(self._build_modbus_group())
+        layout.addWidget(self._build_motion_safety_group())
         layout.addWidget(self._build_runtime_group())
         layout.addStretch()
 
@@ -111,7 +115,7 @@ class ConfigCenterPage(QWidget):
             f"color: {COLORS['muted']}; font-weight: 600; background: transparent; border: none;"
         )
         self.ip_input = QLineEdit()
-        self.ip_input.setPlaceholderText("例如 192.168.5.1")
+        self.ip_input.setPlaceholderText("例如 192.168.1.50")
         self.ip_input.setMaximumWidth(220)
         ip_row.addWidget(ip_label)
         ip_row.addWidget(self.ip_input, 1)
@@ -139,7 +143,7 @@ class ConfigCenterPage(QWidget):
         # 拍照位 [x, y, z, rx, ry, rz]
         photo_row = QHBoxLayout()
         photo_row.setSpacing(6)
-        photo_title = QLabel("拍照位 (x/y/z/rx/ry/rz):")
+        photo_title = QLabel("拍照位 (只读，请在点位管理修改) (x/y/z/rx/ry/rz):")
         photo_title.setStyleSheet(
             f"color: {COLORS['muted']}; font-weight: 600; background: transparent; border: none;"
         )
@@ -150,10 +154,44 @@ class ConfigCenterPage(QWidget):
             le = QLineEdit()
             le.setPlaceholderText("0.0")
             le.setMaximumWidth(90)
+            le.setReadOnly(True)
             photo_row.addWidget(le)
             self.photo_inputs.append(le)
         photo_row.addStretch()
         v.addLayout(photo_row)
+
+        # 工具坐标系 / 用户坐标系（Tool0 = 法兰坐标系，User0 = 基坐标系）
+        coord_row = QHBoxLayout()
+        coord_row.setSpacing(8)
+        coord_label_style = (
+            f"color: {COLORS['muted']}; font-weight: 600; "
+            "background: transparent; border: none;"
+        )
+
+        tool_label = QLabel("工具坐标系 (Tool Index):")
+        tool_label.setStyleSheet(coord_label_style)
+        coord_row.addWidget(tool_label)
+        self.tool_index_spin = QSpinBox()
+        self.tool_index_spin.setRange(0, 9)
+        self.tool_index_spin.setValue(0)
+        self.tool_index_spin.setMaximumWidth(80)
+        coord_row.addWidget(self.tool_index_spin)
+        coord_row.addWidget(self._readonly_hint("Tool0 = 法兰坐标系"))
+
+        coord_row.addSpacing(20)
+
+        user_label = QLabel("用户坐标系 (User Index):")
+        user_label.setStyleSheet(coord_label_style)
+        coord_row.addWidget(user_label)
+        self.user_index_spin = QSpinBox()
+        self.user_index_spin.setRange(0, 9)
+        self.user_index_spin.setValue(0)
+        self.user_index_spin.setMaximumWidth(80)
+        coord_row.addWidget(self.user_index_spin)
+        coord_row.addWidget(self._readonly_hint("User0 = 基坐标系"))
+
+        coord_row.addStretch()
+        v.addLayout(coord_row)
 
         # 保存并重载按钮
         self.robot_save_btn = QPushButton("保存并重载")
@@ -338,7 +376,67 @@ class ConfigCenterPage(QWidget):
         grid.setColumnStretch(3, 1)
         return group
 
-    # ── 5. Runtime 配置组 ───────────────────────────────────────────
+    # ── 5. 运动安全配置组 ──────────────────────────────────────────────
+    def _build_motion_safety_group(self):
+        """运动安全配置：workspace 边界 + delta 上限 + 姿态角 + 速度/加速度。"""
+        group = QGroupBox("运动安全配置")
+        grid = QGridLayout(group)
+        grid.setSpacing(8)
+
+        label_style = (
+            f"color: {COLORS['muted']}; font-weight: 600; "
+            "background: transparent; border: none;"
+        )
+        hint_style = "color: #86868b; font-size: 9pt; font-style: italic; background: transparent; border: none;"
+
+        # 收集所有输入框引用到 dict（key=字段名）
+        self.motion_safety_inputs = {}
+        field_specs = [
+            # (label, key, default_placeholder, row, col)
+            ("X 最小 (mm)", "workspace_x_min", "-1900.0", 0, 0),
+            ("X 最大 (mm)", "workspace_x_max", "1900.0", 0, 2),
+            ("Y 最小 (mm)", "workspace_y_min", "-1900.0", 1, 0),
+            ("Y 最大 (mm)", "workspace_y_max", "1900.0", 1, 2),
+            ("Z 最小 (mm)", "workspace_z_min", "-1200.0", 2, 0),
+            ("Z 最大 (mm)", "workspace_z_max", "1200.0", 2, 2),
+            ("姿态角最小 (度)", "orientation_min", "-360.0", 3, 0),
+            ("姿态角最大 (度)", "orientation_max", "360.0", 3, 2),
+            ("单段 XYZ 偏移上限 (mm)", "max_delta_xyz", "800.0", 4, 0),
+            ("单段姿态偏移上限 (度)", "max_delta_rot", "90.0", 4, 2),
+            ("速度最小 (v=百分比)", "speed_min", "1.0", 5, 0),
+            ("速度最大 (百分比)", "speed_max_percent", "100.0", 5, 2),
+            ("速度绝对最大 (mm/s)", "speed_max_abs", "2000.0", 6, 0),
+            ("加速度最小", "accel_min", "1.0", 6, 2),
+            ("加速度最大", "accel_max", "100.0", 7, 0),
+        ]
+
+        for label_text, key, placeholder, row, col in field_specs:
+            lbl = QLabel(label_text)
+            lbl.setStyleSheet(label_style)
+            le = QLineEdit()
+            le.setPlaceholderText(placeholder)
+            le.setMaximumWidth(120)
+            grid.addWidget(lbl, row, col)
+            grid.addWidget(le, row, col + 1)
+            self.motion_safety_inputs[key] = le
+
+        # 说明提示
+        hint = QLabel("修改后点击保存并重载，下次运动校验自动生效。feedback_max_age_* 属运行时参数，不在此处。")
+        hint.setStyleSheet(hint_style)
+        hint.setWordWrap(True)
+        grid.addWidget(hint, 8, 0, 1, 4)
+
+        # 保存按钮
+        self.motion_safety_save_btn = QPushButton("保存并重载")
+        set_button_role(self.motion_safety_save_btn, "primary")
+        self.motion_safety_save_btn.setMinimumHeight(self.BTN_HEIGHT)
+        self.motion_safety_save_btn.setMaximumWidth(200)
+        grid.addWidget(self.motion_safety_save_btn, 9, 0, 1, 4)
+
+        grid.setColumnStretch(4, 1)
+        return group
+
+    # ── 6. Runtime 配置组 ───────────────────────────────────────────
     def _build_runtime_group(self):
         """Runtime 配置：IPC 端口与 Stop 端口（只读，需修改 config.json）。"""
         group = QGroupBox("Runtime 配置")
@@ -425,6 +523,9 @@ class ConfigCenterPage(QWidget):
         self.calib_refresh_btn.clicked.connect(self._emit_calib_refresh)
         self.calib_import_matrix_btn.clicked.connect(self._open_matrix_dialog)
 
+        # 运动安全配置
+        self.motion_safety_save_btn.clicked.connect(self._emit_motion_safety_save)
+
         # Runtime 配置重载
         self.reload_config_btn.clicked.connect(self.reload_config_requested.emit)
 
@@ -432,19 +533,14 @@ class ConfigCenterPage(QWidget):
     # 信号发射辅助方法
     # ------------------------------------------------------------------
     def _emit_robot_save(self):
-        """收集机器人 IP 与拍照位，发出保存信号并触发重载。"""
+        """收集机器人 IP，发出保存信号并触发重载。"""
         ip = self.ip_input.text().strip()
         self.ip_save_requested.emit(ip)
 
-        # 收集拍照位 6 个值
-        pose_values = []
-        for le in self.photo_inputs:
-            text = le.text().strip()
-            try:
-                pose_values.append(float(text) if text else 0.0)
-            except ValueError:
-                pose_values.append(0.0)
-        self.photo_position_save_requested.emit(pose_values)
+        # 工具 / 用户坐标系索引写入 config.json（重启 Runtime 后生效）
+        from ..config import config_manager
+        config_manager.set_tool_index(int(self.tool_index_spin.value()))
+        config_manager.set_user_index(int(self.user_index_spin.value()))
 
         # 保存后自动触发 Runtime 配置重载
         self.reload_config_requested.emit()
@@ -468,6 +564,42 @@ class ConfigCenterPage(QWidget):
     def _emit_calib_refresh(self):
         """发出标定刷新信号。"""
         self.calib_refresh_requested.emit(self.calib_camera_combo.currentText())
+
+    def _emit_motion_safety_save(self):
+        """收集运动安全配置输入框值，校验后发出保存信号。"""
+        config_dict = {}
+        for key, le in self.motion_safety_inputs.items():
+            text = le.text().strip()
+            if not text:
+                # 空值用 placeholder 提示的默认值
+                text = le.placeholderText() or "0"
+            try:
+                config_dict[key] = float(text)
+            except ValueError:
+                QMessageBox.warning(
+                    self, "输入无效",
+                    f"字段 {key} 的值 '{text}' 不是有效数值",
+                )
+                return
+
+        # min <= max 校验（与 set_motion_safety_config 一致，但提前在 UI 拦截）
+        pair_checks = [
+            ("workspace_x_min", "workspace_x_max", "X"),
+            ("workspace_y_min", "workspace_y_max", "Y"),
+            ("workspace_z_min", "workspace_z_max", "Z"),
+            ("orientation_min", "orientation_max", "姿态角"),
+            ("speed_min", "speed_max_percent", "速度百分比"),
+            ("accel_min", "accel_max", "加速度"),
+        ]
+        for min_key, max_key, label in pair_checks:
+            if config_dict[min_key] > config_dict[max_key]:
+                QMessageBox.warning(
+                    self, "范围无效",
+                    f"{label} 最小值不能大于最大值: {min_key}={config_dict[min_key]}, {max_key}={config_dict[max_key]}",
+                )
+                return
+
+        self.motion_safety_save_requested.emit(config_dict)
 
     def _open_matrix_dialog(self):
         """打开 4×4 矩阵输入对话框。"""
@@ -494,14 +626,23 @@ class ConfigCenterPage(QWidget):
         config = config_manager.get_config()
 
         # 机器人 IP
-        robot_ip = config.get("robot_ip", "192.168.5.1")
+        robot_ip = config.get("robot_ip", "192.168.1.50")
         self.ip_input.setText(str(robot_ip))
 
-        # 拍照位 [x, y, z, rx, ry, rz]
-        photo = config_manager.get_photo_position()
+        # 拍照位 [x, y, z, rx, ry, rz]（只读显示，数据源为 points.initial_point.coords）
+        photo = None
+        initial_point = config_manager.get_point("initial_point")
+        if initial_point and isinstance(initial_point.get("coords"), (list, tuple)) and len(initial_point["coords"]) >= 6:
+            photo = initial_point["coords"]
+        else:
+            photo = config_manager.get_photo_position()
         if isinstance(photo, (list, tuple)) and len(photo) >= 6:
             for i in range(6):
                 self.photo_inputs[i].setText(str(photo[i]))
+
+        # 工具 / 用户坐标系索引
+        self.tool_index_spin.setValue(int(config_manager.get_tool_index()))
+        self.user_index_spin.setValue(int(config_manager.get_user_index()))
 
         # 相机模型路径
         for cam_type, path_edit in (("D435i", self.d435i_model_path),
@@ -522,10 +663,39 @@ class ConfigCenterPage(QWidget):
         self.modbus_port_input.setText(str(config_manager.get_modbus_port()))
         self.modbus_slave_id_input.setText(str(config_manager.get_modbus_slave_id()))
 
+        # 运动安全配置
+        try:
+            motion_safety = config_manager.get_motion_safety_config()
+            for key, le in self.motion_safety_inputs.items():
+                if key in motion_safety:
+                    le.setText(str(motion_safety[key]))
+        except Exception:
+            # 加载失败不阻塞，保持 placeholder
+            pass
+
         # Runtime 配置（只读显示）
         runtime = config_manager.get_runtime_config()
         self.runtime_ipc_port_input.setText(str(runtime.get("ipc_port", 8765)))
         self.runtime_stop_port_input.setText(str(runtime.get("ipc_stop_port", 8766)))
+
+    def refresh_photo_position_display(self):
+        """从 points.initial_point.coords 读取最新值并更新拍照位 6 个 QLineEdit 显示。
+
+        点位管理页保存 initial_point 后调用此方法刷新配置中心页的拍照位显示。
+        """
+        from ..config import config_manager
+        try:
+            initial_point = config_manager.get_point("initial_point")
+            if initial_point and isinstance(initial_point.get("coords"), (list, tuple)) and len(initial_point["coords"]) >= 6:
+                photo = initial_point["coords"]
+            else:
+                photo = config_manager.get_photo_position()
+            if isinstance(photo, (list, tuple)) and len(photo) >= 6:
+                for i in range(6):
+                    self.photo_inputs[i].setText(str(photo[i]))
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug("刷新拍照位显示失败: %s", e)
 
     def _load_calib_from_config(self, camera_type: str):
         """从配置加载指定相机的标定位姿与矩阵到 UI。"""
@@ -609,6 +779,31 @@ class ConfigCenterPage(QWidget):
         if model_path:
             path_edit.setText(model_path)
             path_edit.setToolTip(model_path)
+
+    def update_robot_connection_status(self, connected: bool, runtime_online: bool) -> None:
+        """更新机器人连接状态标签和连接按钮的启用状态。
+
+        Args:
+            connected: 机器人是否已连接
+            runtime_online: Runtime 是否在线
+        """
+        if not runtime_online:
+            status_text = "Runtime 离线"
+            color = COLORS['muted']
+            self.connect_robot_btn.setEnabled(False)
+        elif connected:
+            status_text = "已连接"
+            color = COLORS['success']
+            self.connect_robot_btn.setEnabled(False)
+        else:
+            status_text = "未连接"
+            color = COLORS['muted']
+            self.connect_robot_btn.setEnabled(True)
+
+        self.robot_conn_status_label.setText(status_text)
+        self.robot_conn_status_label.setStyleSheet(
+            f"color: {color}; font-weight: 600; background: transparent; border: none;"
+        )
 
     def update_calib_display(self, camera_type: str, pose_values: list, matrix: list):
         """更新标定显示（位姿值和矩阵）。

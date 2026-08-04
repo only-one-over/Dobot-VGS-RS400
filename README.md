@@ -61,7 +61,7 @@ python run.py
 
 ### 快速开始 · Windows Service 部署
 
-适用于生产环境 7×24 无人值守运行。使用 WinSW 将 Runtime + Watchdog 注册为 Windows 服务。
+适用于生产环境 7×24 无人值守运行。使用 WinSW 将 Runtime + Watchdog + Remote API 注册为 Windows 服务。
 
 #### 默认路径
 
@@ -75,6 +75,9 @@ python run.py
 | Runtime 日志 | `<ProjectRoot>\user_data\logs\` | — |
 | IPC Token | `<ProjectRoot>\user_data\runtime_ipc.token` | config `runtime.ipc_token_path` |
 | 健康文件 | `<ProjectRoot>\user_data\runtime_health.json` | — |
+| Runtime WinSW 配置 | `<ProjectRoot>\DobotRuntimeService.xml` | — |
+| Watchdog WinSW 配置 | `<ProjectRoot>\DobotRuntimeWatchdog.xml` | — |
+| Remote API WinSW 配置 | `<ProjectRoot>\DobotRemoteApiService.xml` | — |
 
 #### 步骤 1：准备项目目录和虚拟环境
 
@@ -115,9 +118,9 @@ powershell -ExecutionPolicy Bypass `
 
 安装过程会自动：
 1. 检查管理员权限、Python 和 WinSW 哈希
-2. 创建服务账户 `DobotRuntimeSvc`（自动生成强密码）
+2. 创建服务账户 `DobotRuntimeSvc`（自动生成强密码，复用于 Runtime 和 Remote API 两个服务）
 3. 生成 IPC token 并限制文件权限
-4. 安装并启动 `DobotRuntimeService` + `DobotRuntimeWatchdog` 两个服务
+4. 安装并启动 `DobotRuntimeService` + `DobotRuntimeWatchdog` + `DobotRemoteApiService` 三个服务，三者均随系统自启动
 5. 验证服务状态、健康文件和 IPC 连通性
 
 #### 步骤 3：检查服务状态
@@ -126,6 +129,7 @@ powershell -ExecutionPolicy Bypass `
 # 查看服务状态
 Get-Service DobotRuntimeService
 Get-Service DobotRuntimeWatchdog
+Get-Service DobotRemoteApiService
 
 # 查看健康文件
 Get-Content .\user_data\runtime_health.json
@@ -159,6 +163,8 @@ powershell -ExecutionPolicy Bypass `
 ### 快速开始 · Remote REST API（可选）
 
 Remote REST API 是独立 HTTP 服务，供外部平板/MES 只读查询机器人状态、30004 反馈、Modbus 寄存器和生产状态。
+
+> 通过 `install_windows_services.ps1` 安装后，`DobotRemoteApiService` 会随系统自启动并监听 8000 端口，无需手动运行 `python -m dobot_move.remote_api`；服务崩溃后 WinSW 会在 10 秒后自动重启。
 
 ```powershell
 # 使用默认配置（host=0.0.0.0, port=8000, 无 token）
@@ -208,7 +214,7 @@ python remote_api.py
 | **[CODE_WIKI.md](CODE_WIKI.md)** | 代码 Wiki — 架构、模块、类与函数索引 |
 | [docs/architecture.md](docs/architecture.md) | 系统架构 — 分层设计、资源所有权、IPC |
 | [docs/runtime_agent.md](docs/runtime_agent.md) | Runtime 后台 — 无头运行、状态文件、异常恢复 |
-| [docs/windows_service.md](docs/windows_service.md) | WinSW 服务 — 双服务部署、安装卸载回滚 |
+| [docs/windows_service.md](docs/windows_service.md) | WinSW 服务 — 三服务部署、安装卸载回滚 |
 | [docs/gpu_environment.md](docs/gpu_environment.md) | GPU 环境 — CUDA 部署、ONNX Runtime 验证 |
 | [docs/cpp_acceleration.md](docs/cpp_acceleration.md) | C++ 加速 — pybind11 构建与 API |
 | [docs/dev_workflow.md](docs/dev_workflow.md) | 开发工作流 — 依赖管理、启动命令 |

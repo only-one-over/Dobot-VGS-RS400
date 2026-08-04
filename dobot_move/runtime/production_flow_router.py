@@ -22,7 +22,8 @@ class ProductionFlowRouter:
     ----------
     flow_roles:
         ``dict[str, str]`` mapping role names to flow ids. Expected
-        keys: ``"low_hook"`` / ``"high_hook"`` / ``"error_recovery"``.
+        keys: ``"low_hook"`` / ``"high_hook"``; ``"error_recovery"``
+        is optional and no longer read by the runtime.
     """
 
     LOW_HOOK = 0
@@ -63,15 +64,6 @@ class ProductionFlowRouter:
         except KeyError as exc:
             raise ValueError(
                 f"flow_roles missing required role '{role}'"
-            ) from exc
-
-    def resolve_recovery(self) -> str:
-        """Resolve the error-recovery flow id."""
-        try:
-            return self.flow_roles["error_recovery"]
-        except KeyError as exc:
-            raise ValueError(
-                "flow_roles missing required role 'error_recovery'"
             ) from exc
 
 

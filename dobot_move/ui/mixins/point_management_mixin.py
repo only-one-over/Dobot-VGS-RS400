@@ -1,3 +1,5 @@
+import logging
+
 from ...ui.qt_compat import (
     Qt,
     QMessageBox, QInputDialog, QDoubleSpinBox, QCheckBox,
@@ -6,10 +8,12 @@ from ...ui.qt_compat import (
 
 from ...config.config_manager import (
     get_points, get_point, add_point, delete_point, resolve_point,
-    ConfigService,
+    set_photo_position, ConfigService,
 )
 
 from ...ui.ui_theme import COLORS
+
+logger = logging.getLogger(__name__)
 
 
 class PointManagementMixin:
@@ -28,12 +32,15 @@ class PointManagementMixin:
             self.save_point_btn.setEnabled(editing)
         if hasattr(self, "cancel_point_btn"):
             self.cancel_point_btn.setEnabled(editing)
-        if hasattr(self, "read_point_btn"):
-            self.read_point_btn.setEnabled(editing)
         if hasattr(self, "add_point_btn"):
             self.add_point_btn.setEnabled(not editing)
         if hasattr(self, "delete_point_btn"):
             self.delete_point_btn.setEnabled(not editing)
+
+    def set_point_buttons_runtime_online(self, online: bool):
+        """根据 runtime 在线状态切换 read_point_btn 启用状态。"""
+        if hasattr(self, "read_point_btn"):
+            self.read_point_btn.setEnabled(bool(online))
 
     def _on_add_point(self):
         name, ok = QInputDialog.getText(self, "添加点位", "点位名称:")
@@ -44,6 +51,11 @@ class PointManagementMixin:
                 return
             ConfigService.instance().add_point(name)
             self.refresh_points_table()
+            # 自动同步到 Runtime publication
+            try:
+                self._auto_sync_to_runtime()
+            except Exception:
+                pass
 
     def _on_delete_point(self):
         row = self.points_table.currentRow()
@@ -60,6 +72,11 @@ class PointManagementMixin:
             return
         ConfigService.instance().delete_point(name)
         self.refresh_points_table()
+        # 自动同步到 Runtime publication
+        try:
+            self._auto_sync_to_runtime()
+        except Exception:
+            pass
 
     def refresh_points_table(self):
         self.points_table.blockSignals(True)
@@ -153,10 +170,23 @@ class PointManagementMixin:
         point_data.setdefault("is_default", False)
         ConfigService.instance().set_point(name, point_data)
 
+        # 自动同步到 Runtime publication
+        try:
+            self._auto_sync_to_runtime()
+        except Exception:
+            # 同步失败不影响保存
+            pass
+
         if name == "initial_point":
-            resolved = resolve_point("initial_point")
-            if resolved and len(resolved) >= 6:
-                self.update_status("photo_position", resolved[:6])
+            try:
+                set_photo_position(coords)
+                # 刷新配置中心页的拍照位只读显示
+                try:
+                    self.config_center_page.refresh_photo_position_display()
+                except Exception as ce:
+                    logger.debug("刷新配置中心拍照位显示失败: %s", ce)
+            except Exception as e:
+                logger.warning("同步 photo_position 失败: %s", e)
 
         self._editing_point_row = -1
         self._editing_point_name = None
@@ -169,12 +199,54 @@ class PointManagementMixin:
         self.refresh_points_table()
 
     def _on_read_current_for_selected_point(self):
-        name = getattr(self, "_editing_point_name", None)
-        if name:
-            success, msg = self._runtime_facade.get_point(name)
-        else:
-            success, msg = self._runtime_facade.get_current_pose()
-        self.statusBar().showMessage(msg, 3000)
+        editing_row = getattr(self, "_editing_point_row", -1)
+        editing_name = getattr(self, "_editing_point_name", None)
+
+        if editing_row < 0 or not editing_name:
+            # 非编辑模式
+            current_row = self.points_table.currentRow()
+            if current_row < 0:
+                QMessageBox.warning(self, "提示", "请先选择一行或进入编辑模式")
+                return
+            # 有选中行但未编辑：异步获取位姿弹框显示
+            def on_success(payload):
+                pose = payload.get("pose") if isinstance(payload, dict) else None
+                if pose and len(pose) >= 6:
+                    msg = f"X: {pose[0]:.2f}\nY: {pose[1]:.2f}\nZ: {pose[2]:.2f}\nRx: {pose[3]:.2f}\nRy: {pose[4]:.2f}\nRz: {pose[5]:.2f}"
+                else:
+                    msg = "未获取到有效位姿"
+                QMessageBox.information(self, "当前位姿", msg)
+
+            def on_failure(err):
+                QMessageBox.warning(self, "读取失败", str(err))
+
+            success, msg = self._runtime_facade.get_current_pose(
+                on_success=on_success, on_failure=on_failure
+            )
+            if not success:
+                self.statusBar().showMessage(msg, 3000)
+            return
+
+        # 编辑模式：异步获取位姿回写 spin box
+        def on_success(payload):
+            pose = payload.get("pose") if isinstance(payload, dict) else None
+            if not pose or len(pose) < 6:
+                return
+            # 回写当前编辑行的 6 个 spin box
+            for col_idx in range(6):
+                spin = self.points_table.cellWidget(editing_row, col_idx + 1)
+                if spin is not None:
+                    spin.setValue(float(pose[col_idx]))
+            self.statusBar().showMessage("已读取当前位姿到点位", 3000)
+
+        def on_failure(err):
+            QMessageBox.warning(self, "读取失败", str(err))
+
+        success, msg = self._runtime_facade.get_current_pose(
+            on_success=on_success, on_failure=on_failure
+        )
+        if not success:
+            self.statusBar().showMessage(msg, 3000)
         return success
 
     def _on_point_selection_changed(self):
@@ -259,3 +331,31 @@ class PointManagementMixin:
         success, msg = self._runtime_facade.get_current_pose()
         self.statusBar().showMessage(msg, 3000)
         return success
+
+    def _auto_sync_to_runtime(self):
+        """点位保存后通知 Runtime 重载配置（单一数据源模型）。"""
+        # 1. flush 配置确保草稿落盘
+        try:
+            from ...config.config_manager import ConfigService
+            ConfigService.instance().flush()
+        except Exception:
+            pass
+
+        # 2. 通知 Runtime 重载配置（失效内存缓存，重新读磁盘）
+        try:
+            top_window = self.window() if hasattr(self, 'window') else None
+            if top_window is None:
+                top_window = getattr(self, 'gui_app', None) or getattr(self, 'main_window', None)
+
+            if top_window is None:
+                return
+
+            ipc_client = getattr(top_window, '_runtime_ipc_client', None)
+            if ipc_client is not None and hasattr(ipc_client, 'request'):
+                ipc_client.request("reload_config")
+            elif hasattr(top_window, '_send_runtime_ipc'):
+                top_window._send_runtime_ipc("reload_config")
+            elif hasattr(top_window, 'send_runtime_ipc'):
+                top_window.send_runtime_ipc("reload_config")
+        except Exception:
+            pass

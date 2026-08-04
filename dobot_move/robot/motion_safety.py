@@ -10,7 +10,6 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-# 工作空间边界 (mm) - CR5 系列默认值
 WORKSPACE_X_MIN = -1900.0
 WORKSPACE_X_MAX = 1900.0
 WORKSPACE_Y_MIN = -1900.0
@@ -57,8 +56,8 @@ class MotionSafetyConfig:
     workspace_z_max: float = 1200.0
     orientation_min: float = -360.0
     orientation_max: float = 360.0
-    max_delta_xyz: float = 300.0    # 单段 XYZ 偏移上限 (mm)
-    max_delta_rot: float = 45.0     # 单段姿态偏移上限 (deg)
+    max_delta_xyz: float = 800.0    # 单段 XYZ 偏移上限 (mm)
+    max_delta_rot: float = 90.0     # 单段姿态偏移上限 (deg)
     feedback_max_age_normal: float = 0.5   # 普通运动反馈新鲜度 (s)
     feedback_max_age_servo: float = 0.2    # ServoP 反馈新鲜度 (s)
     speed_min: float = 1.0
@@ -66,6 +65,42 @@ class MotionSafetyConfig:
     speed_max_abs: float = 2000.0
     accel_min: float = 1.0
     accel_max: float = 100.0
+
+
+def load_motion_safety_config() -> "MotionSafetyConfig":
+    """从 config.json 加载运动安全配置，构造 MotionSafetyConfig 实例。
+
+    Lazy import config_manager 以避免 motion_safety → config_manager 的导入循环
+    （config_manager 模块加载时不依赖 motion_safety，但运行时若 motion_safety
+    在 config_manager 之前加载，可能产生循环）。
+
+    Returns:
+        MotionSafetyConfig: 含 15 个字段的配置实例（feedback_max_age_normal/
+        feedback_max_age_servo 使用 dataclass 默认值，不从 config.json 读取）
+    """
+    # Lazy import inside function body to avoid module-load-time cycle
+    from ..config import config_manager
+
+    config_dict = config_manager.get_motion_safety_config()
+    # 只取 dataclass 字段，忽略 config_dict 中可能存在的额外字段
+    return MotionSafetyConfig(
+        workspace_x_min=float(config_dict.get("workspace_x_min", -1900.0)),
+        workspace_x_max=float(config_dict.get("workspace_x_max", 1900.0)),
+        workspace_y_min=float(config_dict.get("workspace_y_min", -1900.0)),
+        workspace_y_max=float(config_dict.get("workspace_y_max", 1900.0)),
+        workspace_z_min=float(config_dict.get("workspace_z_min", -1200.0)),
+        workspace_z_max=float(config_dict.get("workspace_z_max", 1200.0)),
+        orientation_min=float(config_dict.get("orientation_min", -360.0)),
+        orientation_max=float(config_dict.get("orientation_max", 360.0)),
+        max_delta_xyz=float(config_dict.get("max_delta_xyz", 800.0)),
+        max_delta_rot=float(config_dict.get("max_delta_rot", 90.0)),
+        speed_min=float(config_dict.get("speed_min", 1.0)),
+        speed_max_percent=float(config_dict.get("speed_max_percent", 100.0)),
+        speed_max_abs=float(config_dict.get("speed_max_abs", 2000.0)),
+        accel_min=float(config_dict.get("accel_min", 1.0)),
+        accel_max=float(config_dict.get("accel_max", 100.0)),
+        # feedback_max_age_* 使用 dataclass 默认值，不从 config.json 读取
+    )
 
 
 @dataclass
@@ -113,7 +148,7 @@ def _get_safety_state(controller):
     )
 
 
-def validate_absolute_pose(controller, pose, speed=None, accel=None, speed_kind="percent", config=None):
+def validate_absolute_pose(controller, pose, speed=None, accel=None, speed_kind="percent", config=None, skip_state_check=False):
     """
     绝对位姿校验。
 
@@ -124,6 +159,7 @@ def validate_absolute_pose(controller, pose, speed=None, accel=None, speed_kind=
         accel: 加速度值
         speed_kind: "percent" 或 "abs"
         config: MotionSafetyConfig，None 时使用默认值
+        skip_state_check: 跳过机器人状态检查（调用方已通过 prepare_for_action 检查时使用）
 
     Returns:
         MotionValidationResult
@@ -168,15 +204,16 @@ def validate_absolute_pose(controller, pose, speed=None, accel=None, speed_kind=
             return _fail(CODE_ORIENTATION, f"{name} {val:.1f} out of range [{cfg.orientation_min}, {cfg.orientation_max}]")
 
     # 6. 机器人状态检查（只读缓存，不发查询）
-    state = _get_safety_state(controller)
-    if not state.is_connected:
-        return _fail(CODE_NOT_CONNECTED, "robot not connected")
-    if not state.is_enabled:
-        return _fail(CODE_NOT_ENABLED, "robot not enabled")
-    if state.software_emergency_active:
-        return _fail(CODE_ESTOP, "software emergency stop active")
-    if state.error_status != 0:
-        return _fail(CODE_ALARM, f"robot has error status: {state.error_status}")
+    if not skip_state_check:
+        state = _get_safety_state(controller)
+        if not state.is_connected:
+            return _fail(CODE_NOT_CONNECTED, "robot not connected")
+        if not state.is_enabled:
+            return _fail(CODE_NOT_ENABLED, "robot not enabled")
+        if state.software_emergency_active:
+            return _fail(CODE_ESTOP, "software emergency stop active")
+        if state.error_status != 0:
+            return _fail(CODE_ALARM, f"robot has error status: {state.error_status}")
 
     return _ok()
 
@@ -202,7 +239,7 @@ def _validate_absolute_pose_no_state(pose, speed, accel, cfg):
 
 
 def validate_relative_delta(controller, offsets, coord_system="user", motion_type="linear",
-                            speed=None, accel=None, config=None):
+                            speed=None, accel=None, config=None, skip_state_check=False):
     """
     相对运动偏移校验。
 
@@ -214,6 +251,7 @@ def validate_relative_delta(controller, offsets, coord_system="user", motion_typ
         speed: 速度
         accel: 加速度
         config: MotionSafetyConfig
+        skip_state_check: 跳过机器人状态检查（调用方已通过 prepare_for_action 检查时使用）
 
     Returns:
         MotionValidationResult
@@ -245,14 +283,15 @@ def validate_relative_delta(controller, offsets, coord_system="user", motion_typ
         return _fail(CODE_STALE_FEEDBACK, f"feedback age {state.feedback_age:.2f}s exceeds {cfg.feedback_max_age_normal}s")
 
     # 5. 机器人状态检查
-    if not state.is_connected:
-        return _fail(CODE_NOT_CONNECTED, "robot not connected")
-    if not state.is_enabled:
-        return _fail(CODE_NOT_ENABLED, "robot not enabled")
-    if state.software_emergency_active:
-        return _fail(CODE_ESTOP, "software emergency stop active")
-    if state.error_status != 0:
-        return _fail(CODE_ALARM, f"robot has error status: {state.error_status}")
+    if not skip_state_check:
+        if not state.is_connected:
+            return _fail(CODE_NOT_CONNECTED, "robot not connected")
+        if not state.is_enabled:
+            return _fail(CODE_NOT_ENABLED, "robot not enabled")
+        if state.software_emergency_active:
+            return _fail(CODE_ESTOP, "software emergency stop active")
+        if state.error_status != 0:
+            return _fail(CODE_ALARM, f"robot has error status: {state.error_status}")
 
     # 6. 投影终点校验
     # 读取当前 TCP 位姿

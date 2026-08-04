@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import uuid
 import copy
 import contextvars
@@ -48,6 +49,9 @@ DEFAULT_CAMERA_MODEL_PATH = os.path.join(_PACKAGE_DIR, "best.onnx")
 SUPPORTED_CAMERA_TYPES = ("D435i", "D405")
 _config_cache = None
 _cache_valid = False
+# 保护 _config_cache / _cache_valid 的多线程访问；
+# 使用 RLock 是因为 load_config 在备份恢复路径中会递归调用 save_config
+_config_lock = threading.RLock()
 _execution_config_snapshot = contextvars.ContextVar(
     "execution_config_snapshot",
     default=None,
@@ -286,6 +290,8 @@ DEFAULT_RUNTIME_CONFIG = {
     "ipc_host": "127.0.0.1",
     "ipc_port": 8765,
     "ipc_command_timeout_s": 5.0,
+    "tool_index": 0,
+    "user_index": 0,
 }
 
 
@@ -317,6 +323,51 @@ DEFAULT_VISUAL_SERVO_CONFIG = {
 }
 
 
+DEFAULT_CAMERA_CONFIG = {
+    # 是否执行 RealSense 深度→彩色对齐（align.process），CPU 重活。
+    # 诊断 16fps 瓶颈时可设为 false 跳过对齐做对比。默认 true 保持原行为。
+    "enable_align": True,
+    # 是否执行深度滤波链（spatial/temporal/hole_filling），CPU 重活。
+    # 诊断时可设为 false 跳过滤波做对比。默认 true 保持原行为。
+    "enable_depth_filter": True,
+}
+
+
+DEFAULT_PIPELINE_CONFIG = {
+    # 是否启用 PositionWorker 异步化（高风险，默认禁用）。
+    # 启用后 InferenceWorker 只跑 run_detection_tracked（GPU 推理），
+    # calculate_object_position_smoothed（深度对齐 + 点云 + Kalman）由独立
+    # PositionWorker 线程执行，避免 CPU 位置计算阻塞 GPU 推理，提升 inference_fps。
+    # 注意：启用后 run_detection_tracked 与 calculate_object_position_smoothed 会
+    # 并发访问 VisionSystem 的 kalman_3d / _kalman_last_time / last_valid_position
+    # 等状态，存在潜在线程安全风险（仅诊断/实验用，生产环境保持 false）。
+    "position_worker_enabled": False,
+}
+
+
+DEFAULT_MOTION_SAFETY_CONFIG = {
+    # 工作空间边界 (mm) - CR20A 机器人默认值
+    "workspace_x_min": -1900.0,
+    "workspace_x_max": 1900.0,
+    "workspace_y_min": -1900.0,
+    "workspace_y_max": 1900.0,
+    "workspace_z_min": -1200.0,
+    "workspace_z_max": 1200.0,
+    # 姿态角边界 (度)
+    "orientation_min": -360.0,
+    "orientation_max": 360.0,
+    # 单段运动偏移上限
+    "max_delta_xyz": 800.0,   # 单段 XYZ 偏移上限 (mm)
+    "max_delta_rot": 90.0,    # 单段姿态偏移上限 (度)
+    # 速度/加速度范围
+    "speed_min": 1.0,
+    "speed_max_percent": 100.0,
+    "speed_max_abs": 2000.0,
+    "accel_min": 1.0,
+    "accel_max": 100.0,
+}
+
+
 def get_visual_servo_config():
     """获取视觉伺服配置，优先从 config.json 读取，缺失时使用默认值"""
     config = load_config()
@@ -328,52 +379,56 @@ def get_visual_servo_config():
 
 
 def load_config():
-    """加载配置文件（支持备份恢复 + 环境变量覆盖）"""
-    global _config_cache, _cache_valid
-    execution_snapshot = _execution_config_snapshot.get()
-    if execution_snapshot is not None:
-        return execution_snapshot
-    if _cache_valid and _config_cache is not None:
-        return _config_cache
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                _config_cache = json.load(f)
-            _cache_valid = True
-            logger.info("✅ 配置文件加载成功: %s", CONFIG_FILE)
-        except (json.JSONDecodeError, Exception) as e:
-            logger.error("❌ 配置文件加载失败: %s，尝试从备份恢复", e)
-            # 尝试从备份恢复
-            bak_file = CONFIG_FILE + ".bak"
-            if os.path.exists(bak_file):
-                try:
-                    with open(bak_file, 'r', encoding='utf-8') as f:
-                        _config_cache = json.load(f)
-                    _cache_valid = True
-                    logger.info("✅ 从备份恢复配置成功: %s", bak_file)
-                    # 恢复成功后立即保存回主文件
-                    save_config(_config_cache)
-                except Exception as bak_e:
-                    logger.error("❌ 备份文件也损坏: %s", bak_e)
-                    _config_cache = {}
-            else:
-                _config_cache = {}
-    else:
-        logger.warning("⚠️ 配置文件不存在，使用默认配置: %s", CONFIG_FILE)
-        _config_cache = {}
+    """加载配置文件（支持备份恢复 + 环境变量覆盖）
 
-    # 应用环境变量覆盖（不写回文件，仅影响内存）
-    if _config_cache:
-        _config_cache = _apply_env_overrides(_config_cache)
-        _cache_valid = True
-    return _config_cache
+    单一数据源：永远读 user_data/config.json 草稿文件。
+    use_config_snapshot 已废弃为 no-op shim，不再切换快照。
+    """
+    global _config_cache, _cache_valid
+    with _config_lock:
+        if _cache_valid and _config_cache is not None:
+            return _config_cache
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    _config_cache = json.load(f)
+                _cache_valid = True
+                logger.info("✅ 配置文件加载成功: %s", CONFIG_FILE)
+            except (json.JSONDecodeError, Exception) as e:
+                logger.error("❌ 配置文件加载失败: %s，尝试从备份恢复", e)
+                # 尝试从备份恢复
+                bak_file = CONFIG_FILE + ".bak"
+                if os.path.exists(bak_file):
+                    try:
+                        with open(bak_file, 'r', encoding='utf-8') as f:
+                            _config_cache = json.load(f)
+                        _cache_valid = True
+                        logger.info("✅ 从备份恢复配置成功: %s", bak_file)
+                        # 恢复成功后立即保存回主文件
+                        save_config(_config_cache)
+                    except Exception as bak_e:
+                        logger.error("❌ 备份文件也损坏: %s", bak_e)
+                        _config_cache = {}
+                else:
+                    _config_cache = {}
+        else:
+            logger.warning("⚠️ 配置文件不存在，使用默认配置: %s", CONFIG_FILE)
+            _config_cache = {}
+
+        # 应用环境变量覆盖（不写回文件，仅影响内存）
+        # 注意：用 `is not None` 判断，确保空 dict 也应用环境变量覆盖
+        if _config_cache is not None:
+            _config_cache = _apply_env_overrides(_config_cache)
+            _cache_valid = True
+        return _config_cache
 
 
 def invalidate_config_cache():
     """Invalidate this process's config cache without changing the file."""
     global _config_cache, _cache_valid
-    _config_cache = None
-    _cache_valid = False
+    with _config_lock:
+        _config_cache = None
+        _cache_valid = False
 
 
 def reload_config():
@@ -384,71 +439,69 @@ def reload_config():
 
 @contextmanager
 def use_config_snapshot(config):
-    """Pin config reads in the current execution context to one snapshot."""
-    if not isinstance(config, dict):
-        raise TypeError("config snapshot must be a dict")
-    token = _execution_config_snapshot.set(copy.deepcopy(config))
-    try:
-        yield
-    finally:
-        _execution_config_snapshot.reset(token)
+    """Deprecated no-op shim.
+
+    单一数据源模型下，load_config() 永远读 user_data/config.json 草稿文件。
+    此函数保留为向后兼容 shim，不再激活任何 ContextVar。
+    传入的 config 参数被忽略。
+    """
+    del config  # 参数忽略，仅保留签名兼容
+    yield
 
 
 def save_config(config):
-    """保存配置文件（原子写入 + 备份）"""
+    """保存配置文件（原子写入 + 备份）
+
+    单一数据源：永远写 user_data/config.json 草稿文件。
+    """
     global _config_cache, _cache_valid
-    execution_snapshot = _execution_config_snapshot.get()
-    if execution_snapshot is not None:
-        updated = copy.deepcopy(config)
-        execution_snapshot.clear()
-        execution_snapshot.update(updated)
-        return True
-    try:
-        # 写入前备份旧文件
-        if os.path.exists(CONFIG_FILE):
-            bak_file = CONFIG_FILE + ".bak"
-            try:
-                shutil.copy2(CONFIG_FILE, bak_file)
-            except Exception as e:
-                logger.warning("备份配置文件失败: %s", e)
-        
-        # tempfile.mkstemp may spin for a very long time on Windows when the
-        # directory reports writable but rejects files created with mode 0o600.
-        dir_name = os.path.dirname(CONFIG_FILE)
-        tmp_path = None
+    with _config_lock:
         try:
-            for _ in range(10):
-                candidate = os.path.join(
-                    dir_name,
-                    f".{os.path.basename(CONFIG_FILE)}.{uuid.uuid4().hex}.tmp",
-                )
+            # 写入前备份旧文件
+            if os.path.exists(CONFIG_FILE):
+                bak_file = CONFIG_FILE + ".bak"
                 try:
-                    with open(candidate, 'x', encoding='utf-8') as f:
-                        tmp_path = candidate
-                        json.dump(config, f, indent=2, ensure_ascii=False)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    break
-                except FileExistsError:
-                    continue
-            if tmp_path is None:
-                raise FileExistsError("无法创建唯一的配置临时文件")
-            os.replace(tmp_path, CONFIG_FILE)
+                    shutil.copy2(CONFIG_FILE, bak_file)
+                except Exception as e:
+                    logger.warning("备份配置文件失败: %s", e)
+
+            # tempfile.mkstemp may spin for a very long time on Windows when the
+            # directory reports writable but rejects files created with mode 0o600.
+            dir_name = os.path.dirname(CONFIG_FILE)
             tmp_path = None
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-        
-        _config_cache = config
-        _cache_valid = True
-        logger.info("✅ 配置文件保存成功: %s", CONFIG_FILE)
-        return True
-    except Exception as e:
-        logger.error("❌ 配置文件保存失败: %s", e)
-        return False
+            try:
+                for _ in range(10):
+                    candidate = os.path.join(
+                        dir_name,
+                        f".{os.path.basename(CONFIG_FILE)}.{uuid.uuid4().hex}.tmp",
+                    )
+                    try:
+                        with open(candidate, 'x', encoding='utf-8') as f:
+                            tmp_path = candidate
+                            json.dump(config, f, indent=2, ensure_ascii=False)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        break
+                    except FileExistsError:
+                        continue
+                if tmp_path is None:
+                    raise FileExistsError("无法创建唯一的配置临时文件")
+                os.replace(tmp_path, CONFIG_FILE)
+                tmp_path = None
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+            _config_cache = config
+            _cache_valid = True
+            logger.info("✅ 配置文件保存成功: %s", CONFIG_FILE)
+            return True
+        except Exception as e:
+            logger.error("❌ 配置文件保存失败: %s", e)
+            return False
 
 
 def get_photo_position():
@@ -461,6 +514,9 @@ def set_photo_position(position):
     """设置拍照位置"""
     config = load_config()
     config['photo_position'] = position
+    initial_point = config.get("points", {}).get("initial_point")
+    if initial_point is not None:
+        initial_point["coords"] = list(position)
     return save_config(config)
 
 
@@ -471,7 +527,7 @@ def get_grasp_flow_file():
 def get_robot_ip():
     """获取机器人IP地址"""
     config = load_config()
-    return config.get('robot_ip', "192.168.5.1")
+    return config.get('robot_ip', "192.168.1.50")
 
 
 def set_robot_ip(ip):
@@ -510,6 +566,67 @@ def set_modbus_slave_id(slave_id):
     """设置Modbus从站地址"""
     config = load_config()
     config['modbus_slave_id'] = int(slave_id)
+    return save_config(config)
+
+
+def set_motion_safety_config(config_dict: dict) -> bool:
+    """保存运动安全配置，带字段校验。
+
+    Args:
+        config_dict: 包含 15 个数值字段的 dict（见 DEFAULT_MOTION_SAFETY_CONFIG）
+
+    Returns:
+        True 保存成功，False 校验失败
+
+    Raises:
+        ValueError: 字段非数值 / min > max / 必填字段缺失
+    """
+    if not isinstance(config_dict, dict):
+        raise ValueError("config_dict 必须为 dict")
+
+    # 字段白名单（与 DEFAULT_MOTION_SAFETY_CONFIG 的 key 一致）
+    allowed_keys = set(DEFAULT_MOTION_SAFETY_CONFIG.keys())
+
+    # 过滤掉未知 key（如用户误传的 _note 字段）
+    filtered = {}
+    for k, v in config_dict.items():
+        if k not in allowed_keys:
+            continue
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            raise ValueError(f"字段 {k} 必须为数值，当前: {v!r}")
+        filtered[k] = float(v)
+
+    # 必填字段检查（至少 15 个字段都应在 filtered 中）
+    missing = allowed_keys - set(filtered.keys())
+    if missing:
+        raise ValueError(f"缺少必填字段: {sorted(missing)}")
+
+    # min <= max 校验
+    pair_checks = [
+        ("workspace_x_min", "workspace_x_max", "X"),
+        ("workspace_y_min", "workspace_y_max", "Y"),
+        ("workspace_z_min", "workspace_z_max", "Z"),
+        ("orientation_min", "orientation_max", "姿态角"),
+        ("speed_min", "speed_max_percent", "速度百分比"),
+        ("accel_min", "accel_max", "加速度"),
+    ]
+    for min_key, max_key, label in pair_checks:
+        if filtered[min_key] > filtered[max_key]:
+            raise ValueError(f"{label} 最小值不能大于最大值: {min_key}={filtered[min_key]}, {max_key}={filtered[max_key]}")
+
+    # 正数范围校验（speed/accel/delta 必须 > 0）
+    positive_fields = [
+        "max_delta_xyz", "max_delta_rot",
+        "speed_min", "speed_max_percent", "speed_max_abs",
+        "accel_min", "accel_max",
+    ]
+    for field in positive_fields:
+        if filtered[field] <= 0:
+            raise ValueError(f"字段 {field} 必须为正数，当前: {filtered[field]}")
+
+    # 写入 config
+    config = load_config()
+    config["motion_safety"] = filtered
     return save_config(config)
 
 
@@ -557,12 +674,81 @@ def get_runtime_config():
     return runtime
 
 
+def get_tool_index() -> int:
+    """获取工具坐标系索引（runtime.tool_index），默认 0（法兰坐标系）。"""
+    return int(get_runtime_config().get("tool_index", 0))
+
+
+def set_tool_index(idx: int) -> None:
+    """写入 runtime.tool_index。重启 Runtime 后生效。"""
+    config = load_config()
+    if not isinstance(config.get("runtime"), dict):
+        config["runtime"] = {}
+    config["runtime"]["tool_index"] = int(idx)
+    save_config(config)
+
+
+def get_user_index() -> int:
+    """获取用户坐标系索引（runtime.user_index），默认 0（基坐标系）。"""
+    return int(get_runtime_config().get("user_index", 0))
+
+
+def set_user_index(idx: int) -> None:
+    """写入 runtime.user_index。重启 Runtime 后生效。"""
+    config = load_config()
+    if not isinstance(config.get("runtime"), dict):
+        config["runtime"] = {}
+    config["runtime"]["user_index"] = int(idx)
+    save_config(config)
+
+
 def get_remote_api_config():
     config = load_config()
     remote_api = dict(DEFAULT_REMOTE_API_CONFIG)
     if isinstance(config.get("remote_api"), dict):
         remote_api.update(config["remote_api"])
     return remote_api
+
+
+def get_camera_config():
+    """获取相机配置，优先从 config.json 读取，缺失时使用默认值。
+
+    返回的 dict 至少包含 enable_align / enable_depth_filter 两个键
+    （来自 DEFAULT_CAMERA_CONFIG），并合并 config["camera"] 中的其它字段
+    （如 models / depth_range / max_camera_z_mm）。
+    """
+    config = load_config()
+    camera = dict(DEFAULT_CAMERA_CONFIG)
+    if isinstance(config.get("camera"), dict):
+        camera.update(config["camera"])
+    return camera
+
+
+def get_pipeline_config():
+    """获取流水线配置，优先从 config.json 读取，缺失时使用默认值。
+
+    返回的 dict 至少包含 position_worker_enabled 键（来自
+    DEFAULT_PIPELINE_CONFIG），并合并 config["pipeline"] 中的其它字段。
+    """
+    config = load_config()
+    pipeline = dict(DEFAULT_PIPELINE_CONFIG)
+    if isinstance(config.get("pipeline"), dict):
+        pipeline.update(config["pipeline"])
+    return pipeline
+
+
+def get_motion_safety_config():
+    """获取运动安全配置，优先从 config.json 读取，缺失时使用默认值。
+
+    返回的 dict 包含 15 个字段：6 个 workspace 边界、2 个 delta 上限、
+    2 个姿态角边界、3 个速度范围、2 个加速度范围。
+    feedback_max_age_normal / feedback_max_age_servo 不在此处（属运行时性能参数）。
+    """
+    config = load_config()
+    motion_safety = dict(DEFAULT_MOTION_SAFETY_CONFIG)
+    if isinstance(config.get("motion_safety"), dict):
+        motion_safety.update(config["motion_safety"])
+    return motion_safety
 
 
 def _validate_camera_type(camera_type):
@@ -718,7 +904,8 @@ def set_calibration(camera_type, cam_to_flange_pose):
         "cam_to_flange_pose": cam_to_flange_pose,
     }
     result = save_config(config)
-    _cache_valid = False
+    with _config_lock:
+        _cache_valid = False
     return result
 
 
@@ -730,8 +917,8 @@ def get_all_calibrations():
 def get_camera_handeye_matrix(camera_type="D435i"):
     calib = get_calibration(camera_type)
     cam_to_flange_pose = calib.get("cam_to_flange_pose", _DEFAULT_CAM_TO_FLANGE_POSE)
-    T_cam2gripper = _pose2matrix(*cam_to_flange_pose)
-    return T_cam2gripper
+    T_cam2flange = _pose2matrix(*cam_to_flange_pose)
+    return T_cam2flange
 
 
 _DEFAULT_POINTS = {
@@ -760,6 +947,7 @@ _DEFAULT_POINTS = {
 
 
 def get_points():
+    global _config_cache
     config = load_config()
     points = config.get("points", None)
     if points is None:
@@ -767,7 +955,8 @@ def get_points():
         config["points"]["initial_point"]["coords"] = list(
             config.get("photo_position", _DEFAULT_POINTS["initial_point"]["coords"])
         )
-        save_config(config)
+        with _config_lock:
+            _config_cache = config
         points = config["points"]
     changed = False
     for name, default_data in _DEFAULT_POINTS.items():
@@ -778,7 +967,8 @@ def get_points():
             changed = True
     if changed:
         config["points"] = points
-        save_config(config)
+        with _config_lock:
+            _config_cache = config
     return points
 
 
@@ -832,6 +1022,9 @@ def resolve_point(name, visited=None):
     point = get_point(name)
     if point is None:
         return None
+    # 如果 point 是 list 格式，直接返回（不支持相对点位）
+    if isinstance(point, list):
+        return list(point)
     if not point.get("is_relative", False):
         return list(point.get("coords", [0, 0, 0, 0, 0, 0]))
     base_name = point.get("relative_to")

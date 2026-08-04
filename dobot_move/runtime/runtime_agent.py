@@ -45,6 +45,8 @@ from ..communication.modbus_server import (
     CMD_HOOK,
     CMD_RESET,
     CMD_STOP,
+    HOOK_TYPE_HIGH,
+    HOOK_TYPE_LOW,
     MODE_AUTO,
     MODE_MANUAL,
     STATUS_HOOK_ERR,
@@ -83,7 +85,6 @@ from ..runtime.production_state import (
 from ..flow.flow_result import FailureKind, FlowResult
 from ..runtime.production_context import ProductionTaskContext
 from ..runtime.production_flow_router import ProductionFlowRouter
-from ..runtime.recovery_policy import RecoveryPolicy
 from ..runtime.reset_strategy import ResetStrategy
 
 logger = logging.getLogger(__name__)
@@ -373,7 +374,8 @@ class RuntimeProgramRunner:
         self.controller = controller
         self.state_store = state_store
         self.camera_preflight_attempts = max(1, int(camera_preflight_attempts))
-        self.publication_provider = publication_provider
+        # publication_provider 已废弃（单一数据源模型下不再使用），保留形参仅为签名兼容
+        self.publication_provider = None
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self.vision_d435i = None
@@ -383,6 +385,7 @@ class RuntimeProgramRunner:
             "D405": threading.Lock(),
         }
         self._camera_serials: Optional[dict[str, str]] = None
+        self._last_camera_error: dict = {}
         self.current_flow_id: Optional[str] = None
         self.main_flow_id: Optional[str] = None
         self.main_flow_name: Optional[str] = None
@@ -534,18 +537,11 @@ class RuntimeProgramRunner:
         self,
         flow_id: str | None = None,
     ) -> tuple[dict[str, Any], FlowLibrary, str]:
-        if self.publication_provider is None:
-            config = get_config()
-            library = FlowLibrary.load(get_grasp_flow_file())
-            revision = "legacy-draft"
-        else:
-            publication = self.publication_provider()
-            config = publication["config"]
-            library = FlowLibrary(
-                publication["flow_library"],
-                path="published-flow.json",
-            )
-            revision = str(publication["revision"])
+        # 单一数据源：永远读 user_data/config.json + grasp_flow_modules.json
+        # publication_provider 已废弃为兼容形参，不再使用。
+        config = get_config()
+        library = FlowLibrary.load(get_grasp_flow_file())
+        revision = "draft"
         if flow_id is not None:
             library.get_flow(flow_id)
         return config, library, revision
@@ -561,6 +557,43 @@ class RuntimeProgramRunner:
             self.vision_d405,
             modules,
         )
+
+    def _prepare_for_action_with_cameras(
+        self,
+        modules: list[dict[str, Any]],
+        *,
+        auto_clear_error: bool = True,
+        auto_enable: bool = True,
+    ) -> tuple[bool, str]:
+        """动作运行前统一预检查 + 自动恢复（机械臂 + 相机）。
+
+        在 ``check_flow_readiness`` 之前调用：
+        1. 调用 ``controller.prepare_for_action`` 做机械臂侧预检（清报警 + 使能）
+        2. 对 ``required_camera_types(modules)`` 中每个相机尝试 ``_ensure_camera`` 恢复
+
+        与 ``check_flow_readiness`` 的区别：本方法会主动恢复，前者只读检查。
+        """
+        # 1. 机械臂侧预检
+        if not self.controller.prepare_for_action(
+            auto_clear_error=auto_clear_error,
+            auto_enable=auto_enable,
+        ):
+            return False, self.controller.last_error or "机器人预检查失败"
+
+        # 2. 相机侧恢复
+        camera_types = required_camera_types(modules)
+        if not camera_types:
+            return True, ""
+
+        for camera_type in camera_types:
+            try:
+                if not self._ensure_camera(camera_type):
+                    return False, f"相机{camera_type}恢复失败"
+            except Exception as exc:
+                logger.exception("_prepare_for_action_with_cameras: _ensure_camera(%s) 抛异常", camera_type)
+                return False, f"相机{camera_type}恢复异常: {exc}"
+
+        return True, ""
 
     def _detect_camera_serials(self) -> dict[str, str]:
         if self._camera_serials is not None:
@@ -596,6 +629,7 @@ class RuntimeProgramRunner:
         vision = getattr(self, attr)
         if vision is not None and getattr(vision, "is_available", True):
             if self._camera_preflight_ok(vision):
+                self._last_camera_error = {}
                 return True
         if vision is not None:
             try:
@@ -612,6 +646,11 @@ class RuntimeProgramRunner:
 
                 self._camera_serials = None
                 serial = self._detect_camera_serials().get(camera_type)
+                if serial is None:
+                    self._last_camera_error = {
+                        "stage": "not_detected",
+                        "detail": f"未检测到 {camera_type} 相机设备，请检查 USB 连接",
+                    }
                 logger.info(
                     "runtime connecting %s camera attempt=%d%s",
                     camera_type,
@@ -633,9 +672,18 @@ class RuntimeProgramRunner:
                         vision.close()
                         return False
                     setattr(self, attr, vision)
+                    self._last_camera_error = {}
                     return True
+                self._last_camera_error = {
+                    "stage": "preflight_failed",
+                    "detail": f"{camera_type} 预检捕获失败（{self.camera_preflight_attempts}次）",
+                }
                 vision.close()
-            except Exception:
+            except Exception as exc:
+                self._last_camera_error = {
+                    "stage": "init_failed",
+                    "detail": f"{camera_type} 初始化失败: {exc}",
+                }
                 logger.exception(
                     "runtime %s camera initialization/preflight failed attempt=%d",
                     camera_type,
@@ -691,6 +739,14 @@ class RuntimeProgramRunner:
             running = self._thread is not None and self._thread.is_alive()
         return {
             "running": running,
+            # PR-FIX-3 Task 3 Bug 3: 暴露当前 RuntimeState，供
+            # _is_in_delay_release_wait 等判断使用（延时期间状态为
+            # WAITING_DELAY，而非依赖恒非 None 的 _release_event）。
+            "state": (
+                self.state_store.snapshot().get("state")
+                if self.state_store is not None
+                else None
+            ),
             "flow_id": self.current_flow_id,
             "main_flow_id": self.main_flow_id,
             "main_flow_name": self.main_flow_name,
@@ -744,6 +800,11 @@ class RuntimeProgramRunner:
         try:
             from ..flow.flow_executor import FlowExecutor, validate_grasp_flow_modules
 
+            # PR-FIX-3 Task 3 Bug 2: 尽早同步 self.task_mode，确保
+            # readiness 预检失败提前 return 时 finally 块与外部观察者
+            # (snapshot/production 状态机) 看到的是本次任务的模式，
+            # 而非上一次残留的值。
+            self.task_mode = task_mode
             if request is not None:
                 config_snapshot = request.config
                 modules = request.modules
@@ -752,7 +813,6 @@ class RuntimeProgramRunner:
                 self.main_flow_name = request.flow_name
                 task_mode = request.mode
                 self.task_id = request.task_id
-                self.task_mode = task_mode
             elif self.publication_provider is None:
                 config_snapshot = get_config()
                 modules = self._load_modules()
@@ -772,6 +832,23 @@ class RuntimeProgramRunner:
                 message = "; ".join(errors)
                 logger.error("runtime flow validation failed: %s", message)
                 self.controller.record_alarm("Runtime流程", "VALIDATION_FAILED", "故障", message)
+                return
+
+            # 动作运行前预检查 + 自动恢复（机械臂清报警+使能，相机恢复）
+            prepare_ok, prepare_msg = self._prepare_for_action_with_cameras(modules)
+            if not prepare_ok:
+                self.controller.record_alarm(
+                    "Runtime流程",
+                    "PREPARE_FAILED",
+                    "故障",
+                    prepare_msg,
+                )
+                primary_result = FlowResult.failure(
+                    code="PREPARE_FAILED",
+                    message=prepare_msg,
+                    failure_kind=FailureKind.ROBOT,  # 默认归为 ROBOT 类故障
+                    recoverable=False,
+                )
                 return
 
             readiness = check_flow_readiness(
@@ -1016,65 +1093,6 @@ class RuntimeProgramRunner:
                         logger.exception("on_production_finished callback raised")
         return primary_result
 
-    def run_recovery_sync(self, request: RuntimeExecutionRequest) -> FlowResult:
-        """PR 4 Task 6 — run a recovery flow synchronously (no new thread).
-
-        Executes the recovery flow's modules in the CURRENT thread,
-        returning the structured :class:`FlowResult`. This is the
-        serial-execution path used by the production state machine's
-        ``ERROR_RECOVERY`` state.
-
-        Deliberately does NOT:
-          * dispatch :attr:`on_production_finished` (anti-recursion);
-          * call ``mark_modbus_program_finished`` (preserve original
-            error code on 40001);
-          * transition ``RuntimeState`` (caller owns state).
-        """
-        from ..flow.flow_executor import FlowExecutor, validate_grasp_flow_modules
-
-        config_snapshot = request.config
-        modules = request.modules
-        errors = validate_grasp_flow_modules(modules)
-        if errors:
-            message = "; ".join(errors)
-            logger.error("recovery flow validation failed: %s", message)
-            self.controller.record_alarm(
-                "Recovery流程", "VALIDATION_FAILED", "故障", message
-            )
-            return FlowResult.failure(
-                code="RECOVERY_VALIDATION_FAILED",
-                message=message,
-                failure_kind="flow",
-                recoverable=False,
-            )
-
-        self._pause_ref = [False]
-        flow = FlowExecutor(
-            self.controller,
-            self.vision_d435i,
-            self.vision_d405,
-            modules,
-            self._pause_ref,
-        )
-        self._active_flow = flow
-        flow.on_log = lambda msg: logger.info("recovery flow: %s", msg)
-        # on_finished is left unset — flow.run() returns the FlowResult
-        # directly and we do not want to re-enter the production callback.
-        try:
-            with use_config_snapshot(config_snapshot):
-                return flow.run()
-        except Exception as e:
-            logger.exception("recovery flow runner raised")
-            return FlowResult.failure(
-                code="RECOVERY_EXCEPTION",
-                message=str(e),
-                failure_kind="flow",
-                recoverable=False,
-            )
-        finally:
-            self._active_flow = None
-            self._pause_ref = None
-
 
 class DobotRuntimeAgent:
     """Unattended production runtime: Modbus server + robot reconnect watchdog."""
@@ -1084,7 +1102,7 @@ class DobotRuntimeAgent:
         controller: Optional[DobotController] = None,
         health_path: Path = DEFAULT_HEALTH_PATH,
         state_path: Path = DEFAULT_STATE_PATH,
-        startup_delay: float = 10.0,
+        startup_delay: float = 30.0,
         poll_interval: float = 1.0,
         ipc_server: Optional[RuntimeIpcServer] = None,
     ):
@@ -1096,19 +1114,18 @@ class DobotRuntimeAgent:
         self.publication_path = Path(
             draft_runtime.get("publication_path", str(DEFAULT_PUBLICATION_PATH))
         )
-        self.publication_store = RuntimePublicationStore(self.publication_path)
-        config = self.publication_store.snapshot()["config"]
-        with use_config_snapshot(config):
-            performance = get_performance_config()
-            runtime_config = get_runtime_config()
+        # 单一数据源：直接读 user_data/config.json，不再构造 publication_store
+        self.publication_store = None
+        config = get_config()
+        performance = get_performance_config()
+        runtime_config = get_runtime_config()
+        self.controller = controller or DobotController(
+            str(config.get("robot_ip", "192.168.1.50")),
+            enforce_single_instance=True,
+        )
         raw_runtime = config.get("runtime", {})
         if isinstance(raw_runtime, dict):
             runtime_config.update(raw_runtime)
-
-        self.controller = controller or DobotController(
-            str(config.get("robot_ip", "192.168.5.1")),
-            enforce_single_instance=True,
-        )
         self.health_path = Path(runtime_config.get("health_path", str(health_path)))
         self.state_path = Path(runtime_config.get("state_path", str(state_path)))
         self.startup_delay = float(runtime_config.get("startup_delay", startup_delay))
@@ -1177,7 +1194,6 @@ class DobotRuntimeAgent:
             self.controller,
             state_store=self.state_store,
             camera_preflight_attempts=self.camera_preflight_attempts,
-            publication_provider=self.publication_store.snapshot,
         )
         self.stop_event = threading.Event()
         self.last_error = ""
@@ -1218,6 +1234,15 @@ class DobotRuntimeAgent:
         # PR-C Task 6: handlers dict is an instance attribute so
         # ``_ipc_get_status`` can advertise ``capabilities``.
         self._handlers: dict[str, Any] = self._build_ipc_handlers()
+        # Task 4: diagnostic vision stream state. ``_vision_stream_worker``
+        # holds the standalone pipeline when the production flow isn't
+        # running; ``_diagnostic_cache`` is the single-frame cache shared
+        # between the worker fan-out and the production InferenceWorker
+        # fan-out; ``_vision_stream_active`` tracks whether the UI is in
+        # streaming mode (set on start, cleared on explicit stop).
+        self._vision_stream_worker = None
+        self._diagnostic_cache = None
+        self._vision_stream_active = False
         # PR 3: production state machine. ``flow_router`` is built from
         # the published flow_library's ``flow_roles`` mapping (PR 2);
         # ``reset_strategy`` is stateless and shared. ``production_state``
@@ -1240,15 +1265,9 @@ class DobotRuntimeAgent:
         self._modbus_command_queue: "queue.Queue[Optional[tuple]]" = queue.Queue()
         self._command_worker_thread: Optional[threading.Thread] = None
         self._command_worker_stop = threading.Event()
-        # PR 4: recovery policy decides whether the error-recovery hook
-        # may run after a primary flow failure. Stateless and shared.
-        self.recovery_policy: RecoveryPolicy = RecoveryPolicy()
         try:
-            _publication_for_roles = self.publication_store.snapshot()
-            _library_for_roles = FlowLibrary(
-                _publication_for_roles["flow_library"],
-                path="published-flow.json",
-            )
+            # 单一数据源：直接读 grasp_flow_modules.json 构建 flow_router
+            _library_for_roles = FlowLibrary.load(get_grasp_flow_file())
             self.flow_router: ProductionFlowRouter = ProductionFlowRouter(
                 _library_for_roles.flow_roles
             )
@@ -1296,11 +1315,8 @@ class DobotRuntimeAgent:
             )
 
     def _refresh_startup_requirements(self, force=False) -> None:
-        publication = self.publication_store.snapshot()
-        library = FlowLibrary(
-            publication["flow_library"],
-            path="published-flow.json",
-        )
+        # 单一数据源：直接读 grasp_flow_modules.json
+        library = FlowLibrary.load(get_grasp_flow_file())
         main_flow = library.get_main_flow()
         flow_id = main_flow["id"]
         cameras = required_camera_types(main_flow.get("modules", []))
@@ -1443,9 +1459,8 @@ class DobotRuntimeAgent:
             "get_status": self._ipc_get_status,
             "enter_maintenance": self._ipc_enter_maintenance,
             "exit_maintenance": self._ipc_exit_maintenance,
+            "clear_recovery": self._ipc_clear_recovery,
             "reload_config": self._ipc_reload_config,
-            "publish_config": self._ipc_publish_config,
-            "get_publication_status": self._ipc_get_publication_status,
             "validate_flow": self._ipc_validate_flow,
             "get_current_pose": self._ipc_get_current_pose,
             "get_runtime_logs": self._ipc_get_runtime_logs,
@@ -1461,9 +1476,14 @@ class DobotRuntimeAgent:
             "test_d435i": self._ipc_test_d435i,
             "test_detection": self._ipc_test_detection,
             "get_vision_snapshot": self._ipc_get_vision_snapshot,
+            "start_vision_stream": self._ipc_start_vision_stream,
+            "stop_vision_stream": self._ipc_stop_vision_stream,
+            "get_vision_stream_frame": self._ipc_get_vision_stream_frame,
             "get_visual_servo_telemetry": self._ipc_get_visual_servo_telemetry,
             "stop_current_task": self._ipc_stop_current_task,
             "safe_stop": self._ipc_safe_stop,
+            "release_safe_stop": self._ipc_release_safe_stop,
+            "release_delay": self._ipc_release_delay,
             # PR-C Task 2: hardware-facing handlers.
             "enable_robot": self._ipc_enable_robot,
             "disable_robot": self._ipc_disable_robot,
@@ -1475,6 +1495,11 @@ class DobotRuntimeAgent:
             "start_modbus": self._ipc_start_modbus,
             "stop_modbus": self._ipc_stop_modbus,
             "clear_alarm_history": self._ipc_clear_alarm_history,
+            # Debug motion / modbus register handlers.
+            "jog_move": self._ipc_jog_move,
+            "move_to_pose": self._ipc_move_to_pose,
+            "write_modbus_register": self._ipc_write_modbus_register,
+            "get_modbus_registers": self._ipc_get_modbus_registers,
         }
 
     def _ipc_ping(self, _data=None) -> dict[str, Any]:
@@ -1513,9 +1538,14 @@ class DobotRuntimeAgent:
             "current_step": flow.get("module_name") if flow_running else None,
             "flow_running": flow_running,
             "last_error": self.last_error or self.supervisor.last_error,
-            "publication": self.publication_store.status(),
+            "publication": {
+                "revision": "draft",
+                "published_at": "",
+                "main_flow_id": "",
+                "main_flow_name": "",
+            },
             "current_task_revision": flow.get("current_revision"),
-            "next_task_revision": self.publication_store.status()["revision"],
+            "next_task_revision": "draft",
             # PR-C Task 6: advertise supported commands so the GUI can
             # gray out buttons whose command isn't available.
             "capabilities": list(self._handlers.keys()),
@@ -1529,11 +1559,6 @@ class DobotRuntimeAgent:
                     "runtime_state": RuntimeState.MAINTENANCE.value,
                     "already_active": True,
                 }
-            if self.recovery_required:
-                raise IpcCommandError(
-                    "RECOVERY_REQUIRED",
-                    "Runtime处于恢复锁状态，需先由PLC执行复位",
-                )
             if state == RuntimeState.STOPPING.value:
                 raise IpcCommandError(
                     "RUNTIME_BUSY",
@@ -1598,39 +1623,88 @@ class DobotRuntimeAgent:
                 "auto_resumed": False,
             }
 
+    def _ipc_clear_recovery(self, _data=None) -> dict[str, Any]:
+        """清除 Runtime 恢复锁，无需 PLC 下发 40001=0。
+
+        触发 ``_on_recovery_cleared`` 回调，该回调会重新验证
+        startup_inputs：若仍无效则重新进入 RECOVERY_REQUIRED。
+        """
+        # 若未处于恢复锁状态，直接返回
+        if not self.recovery_required:
+            state = self.state_store.snapshot().get("state", "")
+            return {"recovery_cleared": True, "runtime_state": state}
+        # 清除恢复锁（触发 _on_recovery_cleared 回调）
+        self.controller._clear_runtime_recovery_required()
+        state = self.state_store.snapshot().get("state", "")
+        return {
+            "recovery_cleared": not self.recovery_required,
+            "runtime_state": state,
+        }
+
     def _ipc_reload_config(self, _data=None) -> dict[str, Any]:
         if self.program_runner.snapshot().get("running"):
             raise IpcCommandError(
                 "RUNTIME_BUSY",
                 "流程运行期间不允许重载配置",
             )
-        if (
-            not self.publication_store.path.exists()
-            and self.publication_store.status()["revision"] == "legacy-draft"
-        ):
-            publication = self.publication_store.snapshot()
-        else:
-            try:
-                publication = self.publication_store.reload_published()
-            except PublicationError as exc:
-                raise IpcCommandError("INVALID_CONFIG", str(exc)) from exc
-        if publication["revision"] == "legacy-draft":
-            config = reload_config()
-            self.controller._user_index = int(config.get("user_index", 0))
-            self.controller._tool_index = int(config.get("tool_index", 0))
-        self.program_runner.next_revision = publication["revision"]
+        # 单一数据源：失效内存缓存并重新读 user_data/config.json
+        config = reload_config()
+        self.controller._user_index = int(config.get("user_index", 0))
+        self.controller._tool_index = int(config.get("tool_index", 0))
+        self.controller.set_robot_ip(str(config.get("robot_ip", self.controller.robot_ip)))
+        self.program_runner.next_revision = "draft"
         self.program_runner._camera_serials = None
-        self._pending_camera_reload_revision = publication["revision"]
+        self._pending_camera_reload_revision = "draft"
         self._refresh_startup_requirements(force=True)
+        # 重建 flow_router：reload_config 可能让用户在 UI 中改动了
+        # flow_roles 角色绑定（high_hook/low_hook → flow_id），
+        # 必须从磁盘重新读取以保持 Modbus 触发路径一致。
+        try:
+            _library_for_roles = FlowLibrary.load(get_grasp_flow_file())
+            self.flow_router = ProductionFlowRouter(
+                _library_for_roles.flow_roles
+            )
+        except Exception as exc:
+            logger.warning(
+                "reload_config: flow_router 重建失败，保留旧映射: %s",
+                exc,
+            )
+        # Task 5: if the arm is already connected, sync the (possibly
+        # updated) tool/user index to the controller so the new config
+        # takes effect immediately. Failures are non-fatal — only warn.
+        controller = self.controller
+        if getattr(controller, "is_connected", False) and getattr(controller, "dashboard", None) is not None:
+            try:
+                controller.dashboard.Tool(controller._tool_index)
+            except Exception as exc:
+                logger.warning(
+                    "reload_config: Tool(%s) 同步失败: %s",
+                    controller._tool_index,
+                    exc,
+                )
+            try:
+                controller.dashboard.User(controller._user_index)
+            except Exception as exc:
+                logger.warning(
+                    "reload_config: User(%s) 同步失败: %s",
+                    controller._user_index,
+                    exc,
+                )
         return {
             "reloaded": True,
             "applies_to_running_task": False,
             "main_flow_id": self._startup_main_flow_id,
             "main_flow_name": self._startup_main_flow_name,
-            "revision": publication["revision"],
+            "revision": "draft",
         }
 
     def _ipc_publish_config(self, _data=None) -> dict[str, Any]:
+        # Deprecated: 单一数据源模型下 publish_config 不再支持
+        if self.publication_store is None:
+            raise IpcCommandError(
+                "DEPRECATED",
+                "publish_config is no longer supported; use reload_config",
+            )
         try:
             publication = self.publication_store.publish_drafts(
                 self._validate_publication_inputs
@@ -1648,6 +1722,18 @@ class DobotRuntimeAgent:
         }
 
     def _ipc_get_publication_status(self, _data=None) -> dict[str, Any]:
+        # Deprecated: 单一数据源模型下返回向后兼容的固定值
+        if self.publication_store is None:
+            flow = self.program_runner.snapshot()
+            return {
+                "revision": "draft",
+                "published_at": "",
+                "main_flow_id": "",
+                "main_flow_name": "",
+                "current_task_revision": flow.get("current_revision"),
+                "next_task_revision": "draft",
+                "publication_load_error": "",
+            }
         flow = self.program_runner.snapshot()
         status = self.publication_store.status()
         return {
@@ -1677,17 +1763,16 @@ class DobotRuntimeAgent:
             )
 
     def _get_published_library(self) -> FlowLibrary:
-        publication = self.publication_store.snapshot()
-        return FlowLibrary(
-            publication["flow_library"],
-            path="published-flow.json",
-        )
+        # Deprecated: 单一数据源模型下应直接读 grasp_flow_modules.json
+        # 保留方法仅为向后兼容，返回当前草稿流程库。
+        return FlowLibrary.load(get_grasp_flow_file())
 
     def _ipc_validate_flow(self, data=None) -> dict[str, Any]:
         from ..flow.flow_executor import validate_grasp_flow_modules
 
         data = data or {}
-        library = self._get_published_library()
+        # 单一数据源：直接读 grasp_flow_modules.json
+        library = FlowLibrary.load(get_grasp_flow_file())
         flow_id = str(data.get("flow_id") or library.main_flow_id)
         try:
             flow = library.get_flow(flow_id)
@@ -1701,7 +1786,7 @@ class DobotRuntimeAgent:
             "module_count": len(flow["modules"]),
             "required_cameras": sorted(required_camera_types(flow["modules"])),
             "errors": errors,
-            "revision": self.publication_store.status()["revision"],
+            "revision": "draft",
         }
 
     def _ipc_get_current_pose(self, _data=None) -> dict[str, Any]:
@@ -1731,19 +1816,45 @@ class DobotRuntimeAgent:
             lines = handle.readlines()[-limit:]
         return {"lines": [line.rstrip("\r\n") for line in lines], "path": str(path)}
 
+    def _prepare_and_check(
+        self,
+        modules: list[dict[str, Any]],
+    ) -> tuple[bool, str]:
+        """公共预检：清报警+使能+相机恢复+就绪检查。
+
+        供 ``_start_debug_request`` 和 ``start_new_task`` 复用，确保
+        Production / Debug 路径在进入 RUNNING 前完成统一的预检。
+
+        Returns:
+            (ok, message): 成功时 ok=True, message=""; 失败时 ok=False,
+            message=错误描述（供调用方写入 IPC 错误或 40001 状态码）。
+        """
+        try:
+            prepare_ok, prepare_msg = (
+                self.program_runner._prepare_for_action_with_cameras(modules)
+            )
+            if not prepare_ok:
+                return False, prepare_msg
+            readiness = check_flow_readiness(
+                self.controller,
+                self.program_runner.vision_d435i,
+                self.program_runner.vision_d405,
+                modules,
+            )
+            if not readiness.ok:
+                return False, readiness.message
+            return True, ""
+        except Exception as exc:
+            logger.warning("预检异常: %s", exc)
+            return False, str(exc)
+
     def _start_debug_request(self, request: RuntimeExecutionRequest) -> dict[str, Any]:
         self._require_maintenance()
         self._require_debug_robot()
-        readiness = check_flow_readiness(
-            self.controller,
-            self.program_runner.vision_d435i,
-            self.program_runner.vision_d405,
-            request.modules,
-        )
-        if not readiness.ok:
-            if any(item in {"D405", "D435i"} for item in readiness.missing_devices):
-                raise IpcCommandError("CAMERA_NOT_READY", readiness.message)
-            raise IpcCommandError("ROBOT_NOT_CONNECTED", readiness.message)
+        # 动作运行前预检查 + 自动恢复（机械臂清报警+使能，相机恢复）
+        prepare_ok, prepare_msg = self._prepare_and_check(request.modules)
+        if not prepare_ok:
+            raise IpcCommandError("PREPARE_FAILED", prepare_msg)
         if not self.program_runner.start_request(request):
             raise IpcCommandError(
                 "TASK_ALREADY_RUNNING",
@@ -1812,9 +1923,10 @@ class DobotRuntimeAgent:
                 modules=[module],
                 flow_name=module["name"],
             )
-            with use_config_snapshot(request.config):
-                if resolve_point(point_name) is None:
-                    raise ValueError(f"point does not exist: {point_name}")
+            # 单一数据源：直接 resolve_point（永远读草稿 config.json）
+            resolved = resolve_point(point_name)
+            if resolved is None:
+                raise ValueError(f"point does not exist: {point_name}")
         except (TypeError, ValueError) as exc:
             raise IpcCommandError("INVALID_CONFIG", str(exc)) from exc
         return self._start_debug_request(request)
@@ -1870,9 +1982,18 @@ class DobotRuntimeAgent:
             else self.program_runner.vision_d435i
         )
         if vision is None or not getattr(vision, "is_available", False):
+            last_err = getattr(self.program_runner, "_last_camera_error", None) or {}
+            stage = last_err.get("stage") if isinstance(last_err, dict) else None
+            detail = last_err.get("detail") if isinstance(last_err, dict) else None
+            if stage and detail:
+                message = f"{camera_type} 相机未连接（{stage}: {detail}）"
+            elif detail:
+                message = f"{camera_type} 相机未连接（{detail}）"
+            else:
+                message = f"{camera_type} 相机未连接，请点击'连接相机'按钮"
             raise IpcCommandError(
                 "CAMERA_NOT_READY",
-                f"{camera_type} is not ready",
+                message,
             )
         return vision
 
@@ -1946,6 +2067,100 @@ class DobotRuntimeAgent:
             include_mask=bool(data.get("include_mask", True)),
             run_detection=bool(data.get("run_detection", True)),
         )
+
+    def _ipc_start_vision_stream(self, data=None) -> dict[str, Any]:
+        """Start the diagnostic vision stream.
+
+        When the production flow is running, only registers the fan-out
+        cache on the vision object (``source="production"``) so the
+        InferenceWorker publishes each inferred frame. When production is
+        idle, launches a standalone VisionStreamWorker pipeline
+        (``source="diagnostic"``).
+        """
+        # Lazy import: same pattern as ``capture_vision_snapshot`` above.
+        from .diagnostic_frame_cache import DiagnosticFrameCache
+        from .vision_stream_worker import VisionStreamWorker
+
+        data = data or {}
+        camera_type = str(data.get("camera_type", "D405"))
+        # 检查相机已连接（_get_debug_vision 会抛 IpcCommandError 若未连接）
+        vision = self._get_debug_vision(camera_type)
+        # 检查生产流是否在跑
+        production_running = bool(self.program_runner.snapshot().get("running"))
+        if production_running:
+            # 生产流在跑：注册 fan-out，不启动 worker
+            cache = DiagnosticFrameCache()
+            vision._diagnostic_cache = cache
+            self._diagnostic_cache = cache
+            self._vision_stream_active = True
+            return {"started": True, "source": "production"}
+        # 生产流未跑：启动 VisionStreamWorker
+        if self._vision_stream_worker is not None and self._vision_stream_worker.is_running:
+            return {"started": True, "source": "diagnostic"}
+        cache = DiagnosticFrameCache()
+        self._vision_stream_worker = VisionStreamWorker(
+            vision=vision,
+            controller=self.controller,
+            camera_type=camera_type,
+            cache=cache,
+        )
+        if not self._vision_stream_worker.start():
+            self._vision_stream_worker = None
+            raise IpcCommandError("INTERNAL_ERROR", "Vision stream worker failed to start")
+        self._diagnostic_cache = cache
+        self._vision_stream_active = True
+        return {"started": True, "source": "diagnostic"}
+
+    def _ipc_stop_vision_stream(self, _data=None) -> dict[str, Any]:
+        """Stop the diagnostic vision stream and tear down all state.
+
+        Idempotent: safe to call when no stream is active. Stops the
+        standalone worker (if running), unregisters the fan-out cache
+        from both vision objects, clears the cache, and resets the
+        active flag.
+        """
+        # 停止 VisionStreamWorker（若在运行）
+        if self._vision_stream_worker is not None:
+            try:
+                self._vision_stream_worker.stop()
+            except Exception:
+                logger.exception("stop_vision_stream: worker.stop 抛异常")
+            self._vision_stream_worker = None
+        # 注销生产流 fan-out + 清理 cache
+        for attr in ("vision_d405", "vision_d435i"):
+            vision = getattr(self.program_runner, attr, None)
+            if vision is not None:
+                vision._diagnostic_cache = None
+        if self._diagnostic_cache is not None:
+            self._diagnostic_cache.clear()
+            self._diagnostic_cache = None
+        self._vision_stream_active = False
+        return {"stopped": True}
+
+    def _ipc_get_vision_stream_frame(self, data=None) -> dict[str, Any]:
+        """Fetch the latest diagnostic frame as base64 JPEG.
+
+        Returns ``available=False`` when the stream hasn't been started.
+        When the caller is up-to-date (``last_seq_seen`` matches the
+        cache seq), returns ``no_new_frame=True`` so the UI can skip
+        re-rendering.
+        """
+        data = data or {}
+        last_seq_seen = int(data.get("last_seq_seen", 0))
+        if self._diagnostic_cache is None:
+            return {"available": False, "reason": "stream_not_started"}
+        frame = self._diagnostic_cache.get_latest(last_seq_seen)
+        if frame is None:
+            # 无新帧，返回当前 seq 让 UI 不重复渲染
+            return {"seq": last_seq_seen, "no_new_frame": True}
+        import base64
+
+        return {
+            "seq": frame["seq"],
+            "jpeg_base64": base64.b64encode(frame["jpeg_bytes"]).decode("ascii"),
+            "metadata": frame["metadata"],
+            "source": "production" if self._vision_stream_worker is None else "diagnostic",
+        }
 
     def _ipc_get_visual_servo_telemetry(self, _data=None) -> dict[str, Any]:
         flow = self.program_runner._active_flow
@@ -2025,19 +2240,60 @@ class DobotRuntimeAgent:
             "error": error_msg,
         }
 
+    def _ipc_release_safe_stop(self, _data=None) -> dict[str, Any]:
+        """Best-effort release of a software emergency stop.
+
+        Mirrors ``_ipc_safe_stop``'s tolerant style: never raises
+        ``IpcCommandError`` so the GUI always receives a response. Any
+        failure is reported in ``error``.
+        """
+        released = False
+        cleared = False
+        enabled = False
+        error_msg = ""
+
+        controller = self.controller
+
+        # 1. Release the software emergency stop (EmergencyStop(0)).
+        try:
+            released = bool(controller.release_emergency_stop())
+        except Exception as exc:
+            logger.exception("release_safe_stop: release_emergency_stop() 失败")
+            error_msg = str(exc)
+
+        # 2. Clear any latched alarms and auto-enable the robot.
+        try:
+            cleared = bool(controller.clear_error(auto_enable=True))
+        except Exception as exc:
+            logger.exception("release_safe_stop: clear_error() 失败")
+            error_msg = f"{error_msg}; {exc}".strip("; ") if error_msg else str(exc)
+
+        # 3. Reflect the post-release enable state (best-effort read).
+        try:
+            enabled = bool(controller.is_enabled)
+        except Exception:
+            enabled = False
+
+        return {
+            "released": released,
+            "cleared": cleared,
+            "enabled": enabled,
+            "error": error_msg,
+        }
+
     # -- PR-C Task 2: hardware-facing IPC handlers -------------------------
 
     def _ipc_enable_robot(self, _data=None) -> dict[str, Any]:
-        self.controller.enable_robot()
-        return {"enabled": True}
+        ok = bool(self.controller.enable_robot())
+        return {"enabled": ok, "error": "" if ok else (self.controller.last_error or "enable failed")}
 
     def _ipc_disable_robot(self, _data=None) -> dict[str, Any]:
-        self.controller.disable_robot()
-        return {"enabled": False}
+        ok = bool(self.controller.disable_robot())
+        return {"disabled": ok, "error": "" if ok else (self.controller.last_error or "disable failed")}
 
     def _ipc_clear_alarms(self, _data=None) -> dict[str, Any]:
-        self.controller.clear_error()
-        return {"cleared": True}
+        ok = bool(self.controller.clear_error())
+        return {"cleared": ok, "error": "" if ok else (self.controller.last_error or "clear error failed")}
 
     def _ipc_connect_robot(self, data=None) -> dict[str, Any]:
         data = data or {}
@@ -2070,10 +2326,16 @@ class DobotRuntimeAgent:
         # and startup supervisor; reuse it so the camera is registered in
         # ``program_runner.vision_d435i`` / ``vision_d405``.
         if not self.program_runner._ensure_camera(camera_type):
-            raise IpcCommandError(
-                "CAMERA_NOT_READY",
-                f"{camera_type} camera connection failed",
-            )
+            err = self.program_runner._last_camera_error or {}
+            stage = err.get("stage", "unknown")
+            detail = err.get("detail", f"{camera_type} camera connection failed")
+            error_code_map = {
+                "not_detected": "CAMERA_NOT_DETECTED",
+                "init_failed": "CAMERA_INIT_FAILED",
+                "preflight_failed": "CAMERA_PREFLIGHT_FAILED",
+            }
+            code = error_code_map.get(stage, "CAMERA_NOT_READY")
+            raise IpcCommandError(code, detail)
         return {"connected": True, "camera_type": camera_type}
 
     def _ipc_disconnect_camera(self, data=None) -> dict[str, Any]:
@@ -2121,6 +2383,161 @@ class DobotRuntimeAgent:
         if self.alarm_history is not None:
             self.alarm_history.clear()
         return {"cleared": True}
+
+    # -- Debug motion / modbus handlers ------------------------------------
+
+    def _ipc_jog_move(self, data=None) -> dict[str, Any]:
+        """沿工具坐标系单轴相对运动（jog）。
+
+        校验 axis/direction/step/motion_type，构造单轴 offset 后调用
+        ``RelMovJTool`` / ``RelMovLTool``。返回 ``{ok: bool, error?: str}``，
+        不抛 ``IpcCommandError``，便于 GUI 直接展示校验失败原因。
+        """
+        data = data or {}
+        axis = str(data.get("axis", "")).lower()
+        if axis not in ("x", "y", "z", "rx", "ry", "rz"):
+            return {"ok": False, "error": "invalid axis"}
+        direction = data.get("direction")
+        if direction not in (1, -1):
+            return {"ok": False, "error": "invalid direction"}
+        try:
+            step = float(data.get("step"))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "invalid step"}
+        if step <= 0:
+            return {"ok": False, "error": "invalid step"}
+        motion_type = str(data.get("motion_type", "MovJ"))
+        if motion_type not in ("MovJ", "MovL"):
+            return {"ok": False, "error": "invalid motion_type"}
+        if not self.controller.is_connected or not self.controller.is_enabled:
+            return {"ok": False, "error": "robot not enabled"}
+        axis_index = {"x": 0, "y": 1, "z": 2, "rx": 3, "ry": 4, "rz": 5}[axis]
+        delta = step * direction
+        offset = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        offset[axis_index] = delta
+        try:
+            api = self.controller.dashboard
+            if motion_type == "MovL":
+                api.RelMovLTool(*offset)
+            else:
+                api.RelMovJTool(*offset)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
+
+    def _ipc_move_to_pose(self, data=None) -> dict[str, Any]:
+        """绝对运动到 6 维位姿（x,y,z,rx,ry,rz）。
+
+        调用 ``MovJ`` / ``MovL``，``coordinateMode=0`` 表示位姿模式。
+        返回 ``{ok: bool, error?: str}``。
+        """
+        data = data or {}
+        pose = data.get("pose")
+        if not isinstance(pose, list) or len(pose) != 6:
+            return {"ok": False, "error": "invalid pose"}
+        try:
+            pose_vals = [float(v) for v in pose]
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "invalid pose"}
+        motion_type = str(data.get("motion_type", "MovJ"))
+        if motion_type not in ("MovJ", "MovL"):
+            return {"ok": False, "error": "invalid motion_type"}
+        try:
+            speed = float(data.get("speed", 10.0))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "invalid speed"}
+        if speed <= 0:
+            return {"ok": False, "error": "invalid speed"}
+        if not self.controller.is_connected or not self.controller.is_enabled:
+            return {"ok": False, "error": "robot not enabled"}
+        try:
+            api = self.controller.dashboard
+            # coordinateMode=0 -> pose (x,y,z,rx,ry,rz); 1 -> joint.
+            if motion_type == "MovL":
+                api.MovL(*pose_vals, 0, v=int(speed))
+            else:
+                api.MovJ(*pose_vals, 0, v=int(speed))
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
+
+    def _ipc_write_modbus_register(self, data=None) -> dict[str, Any]:
+        """写入单个保持寄存器（40001-40004）。
+
+        委托给 ``controller.modbus_server.write_register_value``。服务未
+        运行或写入失败时返回 ``{ok: False, error}``，不抛异常。
+        """
+        data = data or {}
+        addr = data.get("addr")
+        if isinstance(addr, bool) or not isinstance(addr, int):
+            return {"ok": False, "error": "invalid addr"}
+        if addr not in (40001, 40002, 40003, 40004):
+            return {"ok": False, "error": "invalid addr"}
+        value = data.get("value")
+        if isinstance(value, bool) or not isinstance(value, int):
+            return {"ok": False, "error": "invalid value"}
+        if value < 0 or value > 65535:
+            return {"ok": False, "error": "invalid value"}
+        simulate_external = bool(data.get("simulate_external", False))
+        modbus_server = self.controller.modbus_server
+        if modbus_server is None or not modbus_server.is_running():
+            return {"ok": False, "error": "Modbus 服务未运行"}
+        try:
+            ok = modbus_server.write_register_value(addr, value)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        if not ok:
+            return {"ok": False, "error": "write failed"}
+
+        # 如果 simulate_external=True 且是命令寄存器（40001）且值是命令码（0/1/3），
+        # 走与外部 PLC 完全一致的命令分派链路。
+        if simulate_external:
+            if addr != 40001:
+                return {"ok": True, "simulated": False, "reason": "仅 40001 支持命令分派"}
+            if value not in (0, 1, 3):
+                return {
+                    "ok": True,
+                    "simulated": False,
+                    "reason": f"value={value} 不在命令码 (0,1,3) 范围内",
+                }
+            # addr==40001 且 value in (0,1,3)
+            try:
+                # 读取当前 40002（mode）和 40004（hook_type）的值
+                regs = modbus_server.get_register_values()
+                mode = 0
+                hook_type = 0
+                if isinstance(regs, dict):
+                    mode_entry = regs.get(40002)
+                    if isinstance(mode_entry, dict):
+                        mode = mode_entry.get("value") or 0
+                    hook_entry = regs.get(40004)
+                    if isinstance(hook_entry, dict):
+                        hook_type = hook_entry.get("value") or 0
+                # 调用 controller._on_modbus_command，走与外部 PLC 完全一致的路径
+                self.controller._on_modbus_command(
+                    cmd=value, mode=mode, hook_type=hook_type
+                )
+                return {"ok": True, "simulated": True}
+            except Exception as exc:
+                # _on_modbus_command 调用失败不影响寄存器值已更新
+                logger.warning("simulate_external 调用 _on_modbus_command 失败: %s", exc)
+                return {"ok": True, "simulated": False, "error": str(exc)}
+
+        return {"ok": True}
+
+    def _ipc_get_modbus_registers(self, data=None) -> dict[str, Any]:
+        """返回当前 Modbus 保持寄存器快照及服务运行状态。
+
+        委托给 ``controller.get_modbus_stats()``，仅做字段投影与类型
+        规整。``get_modbus_stats`` 抛出的异常不吞，由既有
+        ``_handle_ipc_command`` 统一捕获并转为 ``IpcCommandError``。
+        """
+        stats = self.controller.get_modbus_stats()
+        return {
+            "registers": stats.get("registers") or {},
+            "is_running": bool(stats.get("is_running", False)),
+            "port": int(stats.get("port", 502)),
+        }
 
     # -- PR-C Task 5: Production flow handler ------------------------------
 
@@ -2219,9 +2636,9 @@ class DobotRuntimeAgent:
 
         Logs the transition and writes the PLC-facing 40001 status code
         (via :data:`MODBUS_STATUS_MAP`) when the new state has a mapping.
-        States without a mapping (``MANUAL_OFFLINE`` / ``RESETTING`` /
-        ``ERROR_RECOVERY``) skip the 40001 write — the caller is
-        responsible for any PLC signal in those transitions.
+        States without a mapping (``MANUAL_OFFLINE`` / ``RESETTING``)
+        skip the 40001 write — the caller is responsible for any PLC
+        signal in those transitions.
 
         PR 5 Task 3: emits a structured transition log that includes the
         ``task_id`` (when a task is active) so operators can correlate
@@ -2430,20 +2847,35 @@ class DobotRuntimeAgent:
             )
             return
         if cmd == CMD_HOOK:
-            self._handle_hook_command(hook_type)
+            ok = self._handle_hook_command(hook_type)
+            if not ok:
+                logger.warning(
+                    "cmd=3 在 state=%s 下被忽略",
+                    self.production_state.name,
+                )
             return
         if cmd == CMD_STOP:
-            self._handle_pause_command()
+            ok = self._handle_pause_command()
+            if not ok:
+                logger.warning(
+                    "cmd=0 在 state=%s 下被忽略（非 RUNNING 状态无需暂停）",
+                    self.production_state.name,
+                )
             return
         if cmd == CMD_RESET:
             # 延时放行检查：如果当前正在延时放行等待中，触发放行而非复位
             if self._is_in_delay_release_wait():
                 self._release_delay_wait()
                 return
-            self._handle_reset_command()
+            ok = self._handle_reset_command()
+            if not ok:
+                logger.warning(
+                    "cmd=1 在 state=%s 下被忽略（需先 cmd=0 暂停）",
+                    self.production_state.name,
+                )
             return
 
-    def _handle_hook_command(self, hook_type: int) -> None:
+    def _handle_hook_command(self, hook_type: int) -> bool:
         """40001=3 dispatch — state-dependent hook command handling.
 
         * PAUSED → resume current task
@@ -2452,27 +2884,33 @@ class DobotRuntimeAgent:
         * HOLDING_HOOK → reject command (log only)
         * STANDBY / IDLE → start a new task
         * other states → reject command
+
+        Returns ``True`` when the command was handled (PAUSED resume /
+        STANDBY/IDLE start); ``False`` when it was ignored or rejected
+        (RUNNING / STARTING / HOLDING_HOOK / other), so
+        :meth:`_dispatch_command` can record a top-level warning.
         """
         state = self.production_state
         if state == ProductionState.PAUSED:
             self._resume_current_task()
-            return
+            return True
         if state == ProductionState.RUNNING:
             logger.info("40001=3 收到但 state=RUNNING，忽略重复命令")
-            return
+            return False
         if state == ProductionState.STARTING:
             logger.warning("40001=3 收到但 state=STARTING，忽略重复命令（任务启动中）")
-            return
+            return False
         if state == ProductionState.HOLDING_HOOK:
             logger.warning("40001=3 在 HOLDING_HOOK 状态下被拒绝（请先 40001=1 复位）")
-            return
+            return False
         if state in (ProductionState.STANDBY, ProductionState.IDLE):
             self.start_new_task(hook_type)
-            return
+            return True
         logger.warning(
             "40001=3 在 state=%s 下被拒绝",
             state.value,
         )
+        return False
 
     def start_new_task(self, hook_type: int) -> None:
         """Create a ProductionTaskContext and start the primary flow.
@@ -2499,10 +2937,29 @@ class DobotRuntimeAgent:
         The context is assigned to ``self.production_task`` BEFORE
         ``start_request`` so the finished-callback can always find it.
         """
+        # Task 4: 生产流启动时自动停止诊断流（避免相机独占冲突）。
+        # UI 若要继续看实时流，可在生产流启动事件后重新调
+        # start_vision_stream（此时走 "production" 分支注册 fan-out）。
+        if self._vision_stream_worker is not None:
+            try:
+                self._vision_stream_worker.stop()
+            except Exception:
+                logger.exception("start_new_task: 停止 VisionStreamWorker 失败")
+            self._vision_stream_worker = None
+        # 钩子类型合法性预检（从 _action_callback 协议层下沉）：
+        # hook_type 必须在 [HOOK_TYPE_LOW, HOOK_TYPE_HIGH] (即 0/1) 范围内，
+        # 非法值直接写 40001=110 并返回，不进入 STARTING/RUNNING。
+        if hook_type < HOOK_TYPE_LOW or hook_type > HOOK_TYPE_HIGH:
+            logger.error(
+                "[start_new_task] 40004 钩子类型非法: %d (合法范围 0/1)，拒绝启动",
+                hook_type,
+            )
+            self._write_production_40001(110)
+            return
         with self._maintenance_lock:
             if self.maintenance_mode:
-                logger.warning("维护模式下拒绝启动新生产任务")
-                return
+                logger.warning("维护模式下启动生产任务（调试场景）")
+                # 不再 return，继续执行
         if self.program_runner.task_mode == "debug":
             logger.warning("调试流程运行中，拒绝启动新生产任务")
             return
@@ -2517,6 +2974,20 @@ class DobotRuntimeAgent:
             if pending_flow is not None and len(pending_flow.get("modules", [])) == 0:
                 logger.error("生产流程 %s 模块为空，拒绝启动", pending_flow_id)
                 return
+            # Spec Task 4: 前置预检（清报警+使能+相机恢复+就绪检查），
+            # 与 _start_debug_request 路径一致。预检失败时直接写
+            # 40001=110 并返回，不进入 STARTING/RUNNING。
+            if pending_flow is not None:
+                prepare_ok, prepare_msg = self._prepare_and_check(
+                    pending_flow["modules"]
+                )
+                if not prepare_ok:
+                    logger.warning(
+                        "start_new_task 预检失败: %s，写 40001=110",
+                        prepare_msg,
+                    )
+                    self._write_production_40001(110)
+                    return
             # PR-FIX-2 Task 3: signal "starting" to the PLC and reject
             # duplicate 40001=3 dispatches via _handle_hook_command.
             self._set_production_state(
@@ -2525,7 +2996,6 @@ class DobotRuntimeAgent:
             )
             try:
                 primary_flow_id = self.flow_router.resolve_primary(hook_type)
-                recovery_flow_id = self.flow_router.resolve_recovery()
             except ValueError as exc:
                 logger.error("无法解析生产流程: %s", exc)
                 self._set_production_state(
@@ -2539,7 +3009,6 @@ class DobotRuntimeAgent:
             self.production_task = ProductionTaskContext.create(
                 hook_type=hook_type,
                 primary_flow_id=primary_flow_id,
-                recovery_flow_id=recovery_flow_id,
                 state=ProductionState.STARTING.value,
             )
             try:
@@ -2604,19 +3073,17 @@ class DobotRuntimeAgent:
         """检查当前是否处于延时放行等待状态。
 
         判据：production_state 为 RUNNING（延时期间不改变生产状态），
-        且 program_runner 的 release_event 存在，
-        且 program_runner 的当前模块是 delay + modbus_or_timeout。
+        且 program_runner 的 RuntimeState 为 WAITING_DELAY。
+        不再依赖 _release_event——运行中它恒非 None，会导致 RUNNING
+        状态下 40001=1 永远走放行分支而非复位。
         """
         if self.production_state != ProductionState.RUNNING:
             return False
         runner = self.program_runner
-        if runner is None or runner._release_event is None:
+        if runner is None:
             return False
-        # 检查当前模块是否为 delay + modbus_or_timeout
-        # 通过 RuntimeState 判断更可靠：WAITING_DELAY 状态表示在延时放行中
-        # 但 RuntimeState 在 program_runner 上，不在 agent 上
-        # 简化判据：release_event 存在即可能在延时中
-        return True
+        snapshot = runner.snapshot()
+        return snapshot.get("state") == RuntimeState.WAITING_DELAY
 
     def _release_delay_wait(self) -> None:
         """放行当前延时等待，让流程继续下一步。"""
@@ -2629,6 +3096,24 @@ class DobotRuntimeAgent:
         # 放行后重置 release_event 以备下次使用
         # 注意：不能立即 clear，因为 FlowExecutor 还在等待循环中检查
         # clear 操作在 on_progress 下次进入 delay 模块时处理
+
+    def _ipc_release_delay(self, _data=None) -> dict[str, Any]:
+        """释放延时等待，让流程继续执行。
+
+        Spec Task 5: 供 UI 调试 ``modbus_or_timeout`` 延时模块时
+        即时放行，无需等待超时。与 ``_release_delay_wait`` 共享
+        ``program_runner._release_event``。
+        """
+        runner = self.program_runner
+        if runner is not None and runner._release_event is not None:
+            runner._release_event.set()
+            logger.info("release_delay IPC: release_event.set() 已触发")
+            return {"ok": True, "released": True}
+        return {
+            "ok": True,
+            "released": False,
+            "reason": "当前没有等待中的延时模块",
+        }
 
     def _handle_pause_command(self) -> bool:
         """40001=0 in auto mode — pause when RUNNING (PR 3 Task 8).
@@ -2663,9 +3148,9 @@ class DobotRuntimeAgent:
         """40001=1 — state-aware reset via ResetStrategy (PR 3 Task 13).
 
         Returns ``True`` when the state machine owns this reset (state is
-        HOLDING_HOOK / PAUSED / ERROR_STATES / MANUAL_OFFLINE); ``False``
-        to fall through to the controller's default ``_modbus_move_initial``
-        path (used for IDLE / STANDBY).
+        IDLE / STANDBY / HOLDING_HOOK / PAUSED / ERROR_STATES / MANUAL_OFFLINE);
+        ``False`` to fall through (RUNNING / STARTING / RESETTING
+        不被 cmd=1 打断).
         """
         state = self.production_state
         if state == ProductionState.MANUAL_OFFLINE:
@@ -2674,11 +3159,15 @@ class DobotRuntimeAgent:
             # the re-online sequence.
             self._handle_reonline()
             return True
+        if state in (ProductionState.IDLE, ProductionState.STANDBY):
+            # IDLE/STANDBY 状态下 PLC 写 40001=1：执行预检 + 回原点 + 状态写回
+            return self._reset_from_idle_or_standby(state)
         if state not in (
             ProductionState.HOLDING_HOOK,
             ProductionState.PAUSED,
             *ERROR_STATES,
         ):
+            # RUNNING / STARTING / RESETTING 不被 cmd=1 打断
             return False
         # Enter RESETTING; prohibit other commands until reset completes.
         self._set_production_state(
@@ -2694,6 +3183,71 @@ class DobotRuntimeAgent:
         except Exception:
             logger.exception("ResetStrategy.execute raised")
             success = False
+        if success:
+            self.production_task = None
+            # PR-FIX-3 Task 3 Bug 1: 清除孤儿流标志，否则 start_request
+            # 会因上次 flow_worker 超时未退出而永久拒绝新任务。
+            self.program_runner.orphaned_flow = False
+            self._set_production_state(
+                ProductionState.STANDBY,
+                reason="reset complete",
+            )
+            self._write_production_40001(2)  # STATUS_STANDBY
+        else:
+            self._set_production_state(
+                ProductionState.FLOW_ERROR,
+                reason="reset failed",
+            )
+            self._write_production_40001(110)  # STATUS_HOOK_ERR
+        return True
+
+    def _reset_from_idle_or_standby(self, source_state: ProductionState) -> bool:
+        """IDLE/STANDBY 状态下 PLC 写 40001=1 的完整复位流程。
+
+        预检 → 回原点 → 状态写回。预检或运动失败时进入 FLOW_ERROR
+        并写 40001=110 (STATUS_HOOK_ERR)。
+        """
+        if not self.controller.prepare_for_action(
+            auto_clear_error=True,
+            auto_enable=True,
+        ):
+            message = self.controller.last_error or "机器人预检查失败"
+            logger.error("IDLE/STANDBY 复位预检失败: %s", message)
+            self.controller.record_alarm(
+                "Modbus回原点",
+                "ROBOT_NOT_READY",
+                "故障",
+                message,
+            )
+            self._set_production_state(
+                ProductionState.FLOW_ERROR,
+                reason=f"prepare_for_action failed: {message}",
+            )
+            self._write_production_40001(110)  # STATUS_HOOK_ERR
+            return True
+
+        self._set_production_state(
+            ProductionState.RESETTING,
+            reason=f"reset from {source_state.value}",
+        )
+        try:
+            success = bool(
+                self.controller.move_to_initial_position(
+                    verify_start_pose=False,
+                    verify_end_pose=False,
+                )
+            )
+        except Exception as exc:
+            logger.exception("IDLE/STANDBY 复位运动抛异常")
+            self.controller.record_alarm(
+                "Modbus回原点",
+                "EXCEPTION",
+                "故障",
+                "回原点执行异常",
+                raw=exc,
+            )
+            success = False
+
         if success:
             self.production_task = None
             self._set_production_state(
@@ -2758,19 +3312,37 @@ class DobotRuntimeAgent:
             )
             self._pending_reonline = True
             return
+
+        reonline_success = False
         try:
-            self.reset_strategy.execute(
+            reonline_success = bool(self.reset_strategy.execute(
                 source_state=ProductionState.MANUAL_OFFLINE,
                 controller=self.controller,
                 program_runner=self.program_runner,
-            )
+            ))
         except Exception:
             logger.exception("ResetStrategy.execute failed during re-online")
-        self._set_production_state(
-            ProductionState.STANDBY,
-            reason="re-online complete",
-        )
-        self._write_production_40001(2)  # STATUS_STANDBY
+            reonline_success = False
+
+        if reonline_success:
+            self._set_production_state(
+                ProductionState.STANDBY,
+                reason="re-online complete",
+            )
+            self._write_production_40001(2)  # STATUS_STANDBY
+        else:
+            logger.error("重新上线复位失败，进入 FLOW_ERROR")
+            self.controller.record_alarm(
+                "重新上线",
+                "RESET_FAILED",
+                "故障",
+                "reset_strategy.execute 失败或抛异常",
+            )
+            self._set_production_state(
+                ProductionState.FLOW_ERROR,
+                reason="re-online reset failed",
+            )
+            self._write_production_40001(110)  # STATUS_HOOK_ERR
         # PR-FIX-3 Task 9: defensive clear — the deferred path in tick()
         # also clears this flag, but clear here too in case the flag was
         # left set from a prior deferred attempt that succeeded directly.
@@ -2781,26 +3353,13 @@ class DobotRuntimeAgent:
 
         On success: transition to HOLDING_HOOK (40001=5).
 
-        On failure: classify by ``result.failure_kind`` and decide
-        whether the error-recovery hook may run:
+        On failure: classify by ``result.failure_kind`` and land in the
+        corresponding terminal error state:
 
-          * ``robot``         → ROBOT_ERROR (40001=111), never recover.
-          * ``camera``        → CAMERA_ERROR (40001=112), recover if
-                                 policy allows and recovery flow does
-                                 not need the failed camera.
+          * ``robot``         → ROBOT_ERROR (40001=111).
+          * ``camera``        → CAMERA_ERROR (40001=112).
           * ``vision_process``/``flow``/``protocol``/other
-                              → FLOW_ERROR (40001=110), recover if
-                                 policy allows.
-
-        Recovery (when allowed) runs synchronously via
-        :meth:`RuntimeProgramRunner.run_recovery_sync` in the SAME
-        orchestration context — no new async Runner. Recovery success
-        does NOT clear the original error code: the final state is
-        still FLOW_ERROR (110) / CAMERA_ERROR (112).
-
-        Anti-recursion: if ``production_task.recovery_started`` is
-        already ``True``, recovery is skipped and the final error
-        state is entered directly.
+                              → FLOW_ERROR (40001=110).
         """
         if self.production_state not in (
             ProductionState.RUNNING,
@@ -2848,88 +3407,14 @@ class DobotRuntimeAgent:
             # MODBUS_STATUS_MAP.
             return
 
-        # 110 / 112 — flow or camera failure: pick the final state now
-        # so we know where to land after recovery (or if we skip it).
+        # 110 / 112 — flow or camera failure: land directly in final state.
         if failure_kind == FailureKind.CAMERA:
             final_state = ProductionState.CAMERA_ERROR
         else:
             final_state = ProductionState.FLOW_ERROR
-
-        # Anti-recursion: never trigger recovery twice for the same task.
-        if task is not None and task.recovery_started:
-            logger.warning(
-                "recovery_already_started: skipping recovery for failure_kind=%s code=%s",
-                failure_kind,
-                result.code,
-            )
-            self._set_production_state(
-                final_state,
-                reason=f"recovery already attempted (code={result.code})",
-            )
-            return
-
-        # Consult the recovery policy.
-        try:
-            can_recover = self.recovery_policy.can_recover(result, self.controller)
-        except Exception:
-            logger.exception("RecoveryPolicy.can_recover raised; treating as non-recoverable")
-            can_recover = False
-
-        if not can_recover:
-            self._set_production_state(
-                final_state,
-                reason=f"non-recoverable: code={result.code} kind={failure_kind}",
-            )
-            return
-
-        # ---- Enter ERROR_RECOVERY and run the hook synchronously --------
-        if task is not None:
-            task.recovery_started = True
-        self._set_production_state(
-            ProductionState.ERROR_RECOVERY,
-            reason=f"recovery for {failure_kind}: code={result.code}",
-        )
-
-        recovery_flow_id = task.recovery_flow_id if task is not None else None
-        recovery_result: Optional[FlowResult] = None
-        if recovery_flow_id:
-            try:
-                recovery_request = self.program_runner.build_production_request(
-                    recovery_flow_id
-                )
-            except Exception:
-                logger.exception("build_production_request failed for recovery flow")
-                recovery_request = None
-            if recovery_request is not None:
-                try:
-                    recovery_result = self.program_runner.run_recovery_sync(
-                        recovery_request
-                    )
-                except Exception:
-                    logger.exception("run_recovery_sync raised")
-                    recovery_result = None
-        else:
-            logger.warning("no recovery_flow_id on task; skipping recovery execution")
-
-        recovery_ok = bool(recovery_result.success) if recovery_result is not None else False
-        logger.info(
-            "recovery completed: success=%s; original failure_kind=%s code=%s",
-            recovery_ok,
-            failure_kind,
-            result.code,
-        )
-
-        # Task 8: recovery success does NOT change the final error code.
-        # The runtime still lands in FLOW_ERROR (110) / CAMERA_ERROR (112)
-        # so the PLC sees the original failure. Only the task state
-        # advances; 40001 is written by _set_production_state via
-        # MODBUS_STATUS_MAP.
         self._set_production_state(
             final_state,
-            reason=(
-                f"recovery success={recovery_ok}; "
-                f"original failure_kind={failure_kind} code={result.code}"
-            ),
+            reason=f"failure_kind={failure_kind} code={result.code}",
         )
 
     def _validate_publication_inputs(
@@ -2972,17 +3457,10 @@ class DobotRuntimeAgent:
         return errors
 
     def validate_startup_inputs(self) -> list[str]:
-        publication = self.publication_store.snapshot()
-        library = FlowLibrary(
-            publication["flow_library"],
-            path="published-flow.json",
-        )
-        errors = self._validate_publication_inputs(
-            publication["config"],
-            library,
-        )
-        if self.publication_store.load_error:
-            errors.append(self.publication_store.load_error)
+        # 单一数据源：直接读 config.json + grasp_flow_modules.json
+        config = get_config()
+        library = FlowLibrary.load(get_grasp_flow_file())
+        errors = self._validate_publication_inputs(config, library)
         return errors
 
     def _validate_legacy_startup_inputs(self) -> list[str]:
@@ -3056,17 +3534,10 @@ class DobotRuntimeAgent:
                 "recovery_started": None,
                 "failure_code": None,
             }
-        # Determine the currently-active flow_id and its role. When
-        # recovery has started, the active flow is the recovery flow;
-        # otherwise it's the primary flow latched at task creation.
-        if task.recovery_started and task.recovery_flow_id:
-            active_flow_id = task.recovery_flow_id
-            active_flow_role: Optional[str] = "error_recovery"
-        else:
-            active_flow_id = task.primary_flow_id
-            active_flow_role = self._reverse_lookup_flow_role(
-                task.primary_flow_id
-            )
+        # The active flow is always the primary flow latched at task
+        # creation; the error-recovery hook has been removed.
+        active_flow_id = task.primary_flow_id
+        active_flow_role = self._reverse_lookup_flow_role(task.primary_flow_id)
         return {
             "state": state_value,
             "task_id": task.task_id,
@@ -3074,7 +3545,7 @@ class DobotRuntimeAgent:
             "hook_name": self._HOOK_NAME_MAP.get(int(task.hook_type)),
             "flow_role": active_flow_role,
             "flow_id": active_flow_id,
-            "recovery_started": bool(task.recovery_started),
+            "recovery_started": None,
             "failure_code": task.failure_code,
         }
 
@@ -3108,14 +3579,31 @@ class DobotRuntimeAgent:
         except Exception as e:
             modbus_stats = {"is_running": False, "error": str(e)}
 
+        # Derive ``enabled`` from the real RobotMode feedback when
+        # available: mode 5 (enabled) / 7 (motion) → True, other modes
+        # → False. Falls back to the cached ``is_enabled`` flag when the
+        # feedback is not yet ready (mode 0) or the read raises.
+        enabled_value = bool(self.controller.is_enabled)
+        try:
+            safety_state = self.controller.get_motion_safety_state()
+            robot_mode = int(getattr(safety_state, "robot_mode", 0))
+            if robot_mode == 0:
+                # Feedback not ready — keep the cached fallback.
+                pass
+            else:
+                enabled_value = robot_mode in (5, 7)
+        except Exception:
+            logger.debug("build_health_payload: get_motion_safety_state 失败，使用 is_enabled fallback")
+
         state = self.state_store.snapshot()
         runner = self.program_runner.snapshot()
         metrics = get_process_metrics(self.health_path)
-        now = time.time()
+        now_wall = time.time()  # 用于顶层 timestamp 和其他 wall clock 用途
+        now_mono = time.monotonic()  # 用于 feedback_age_s 计算
         feedback_timestamp = float(feedback.get("timestamp", 0.0) or 0.0)
         return {
             "schema_version": 2,
-            "timestamp": time.time(),
+            "timestamp": now_wall,
             "timestamp_iso": datetime.now().isoformat(timespec="seconds"),
             "boot_id": state.get("boot_id"),
             "runtime": {
@@ -3141,10 +3629,13 @@ class DobotRuntimeAgent:
                 "ip": self.controller.robot_ip,
                 "supervisor_state": self.supervisor.state,
                 "connected": bool(self.controller.is_connected),
-                "enabled": bool(self.controller.is_enabled),
+                "enabled": enabled_value,
+                "software_emergency_active": bool(
+                    self.controller.software_emergency_active
+                ),
                 "feedback": feedback,
                 "feedback_age_s": (
-                    round(max(0.0, now - feedback_timestamp), 3)
+                    round(max(0.0, now_mono - feedback_timestamp), 3)
                     if feedback_timestamp > 0
                     else None
                 ),
@@ -3163,10 +3654,13 @@ class DobotRuntimeAgent:
             },
             "ipc": self.ipc_server.snapshot(),
             "publication": {
-                **self.publication_store.status(),
+                "revision": "draft",
+                "published_at": "",
+                "main_flow_id": "",
+                "main_flow_name": "",
                 "current_task_revision": runner.get("current_revision"),
-                "next_task_revision": self.publication_store.status()["revision"],
-                "load_error": self.publication_store.load_error,
+                "next_task_revision": "draft",
+                "load_error": "",
             },
             "flow": runner,
             "production": self._build_production_telemetry(),
@@ -3345,17 +3839,23 @@ class DobotRuntimeAgent:
         except Exception:
             startup_requirements_ready = False
             logger.exception("startup main-flow requirements are unavailable")
+        # Startup delay for TIME_WAIT expiry (restored)
+        if self.startup_delay > 0:
+            logger.info(
+                "runtime startup delay %.1fs for network/robot boot stabilization",
+                self.startup_delay,
+            )
+            startup_deadline = time.monotonic() + self.startup_delay
+            while not self.stop_event.is_set() and time.monotonic() < startup_deadline:
+                self.write_health()
+                remaining = startup_deadline - time.monotonic()
+                self.stop_event.wait(min(self.poll_interval, max(0.0, remaining)))
+
         if not self.stop_event.is_set():
             self.supervisor.request_connect()
             if startup_requirements_ready:
                 self._start_required_camera_connections()
         self.write_health()
-
-        if self.startup_delay > 0:
-            logger.warning(
-                "runtime.startup_delay=%.1f 已弃用；首次设备连接已立即开始",
-                self.startup_delay,
-            )
 
         while not self.stop_event.is_set():
             try:
@@ -3450,12 +3950,49 @@ class DobotRuntimeAgent:
             except Exception:
                 logger.exception("command worker join failed during shutdown")
             self._command_worker_thread = None
-        self.program_runner.close_cameras()
-        self.controller.set_runtime_maintenance(False)
-        self.maintenance_mode = False
-        self.supervisor.shutdown()
-        if hasattr(self.controller, "release_control_lease"):
-            self.controller.release_control_lease()
+        _robot_conn_closed = False
+        _lease_released = False
+        try:
+            # Step 8: close_cameras (NEW try/except)
+            try:
+                self.program_runner.close_cameras()
+            except Exception:
+                logger.warning("close_cameras failed during stop", exc_info=True)
+
+            # Step 9: set_runtime_maintenance (NEW try/except)
+            try:
+                self.controller.set_runtime_maintenance(False)
+                self.maintenance_mode = False
+            except Exception:
+                logger.warning("set_runtime_maintenance(False) failed during stop", exc_info=True)
+
+            # Step 10: supervisor.shutdown() (MOVED into try)
+            try:
+                self.supervisor.shutdown()
+                _robot_conn_closed = True
+            except Exception:
+                logger.warning("supervisor.shutdown() failed during stop", exc_info=True)
+
+            # Step 11: release_control_lease() (MOVED into try)
+            if hasattr(self.controller, "release_control_lease"):
+                try:
+                    self.controller.release_control_lease()
+                    _lease_released = True
+                except Exception:
+                    logger.warning("release_control_lease() failed during stop", exc_info=True)
+        finally:
+            # Guarantee 29999 close even if steps 8/9 threw before step 10 ran
+            if not _robot_conn_closed:
+                try:
+                    self.supervisor.shutdown()
+                except Exception:
+                    logger.warning("supervisor.shutdown() fallback failed during stop", exc_info=True)
+            # Guarantee lease release
+            if not _lease_released and hasattr(self.controller, "release_control_lease"):
+                try:
+                    self.controller.release_control_lease()
+                except Exception:
+                    logger.warning("release_control_lease() fallback failed during stop", exc_info=True)
         if clean and self._state_initialized:
             try:
                 self.state_store.mark_clean_shutdown()
@@ -3469,7 +4006,7 @@ class DobotRuntimeAgent:
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Dobot unattended runtime agent.")
-    parser.add_argument("--startup-delay", type=float, default=None, help="Deprecated compatibility option; initial connection starts immediately.")
+    parser.add_argument("--startup-delay", type=float, default=None, help="Seconds to wait before first robot connection (default 30, allows TIME_WAIT expiry)")
     parser.add_argument("--poll-interval", type=float, default=1.0, help="Runtime watchdog interval in seconds.")
     parser.add_argument("--health-path", type=Path, default=DEFAULT_HEALTH_PATH, help="Path to runtime health JSON.")
     parser.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH, help="Path to durable runtime state JSON.")
@@ -3498,7 +4035,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         agent = DobotRuntimeAgent(
             health_path=args.health_path,
             state_path=args.state_path,
-            startup_delay=0.0 if args.startup_delay is None else args.startup_delay,
+            startup_delay=30.0 if args.startup_delay is None else args.startup_delay,
             poll_interval=args.poll_interval,
         )
 

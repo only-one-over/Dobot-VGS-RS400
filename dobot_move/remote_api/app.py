@@ -29,6 +29,7 @@ from ..runtime.runtime_resilience import atomic_write_json
 from .config import get_remote_api_config
 from .feedback_worker import FeedbackWorker
 from .handlers import (
+    build_alarms,
     build_feedback_all,
     build_health,
     build_production_status,
@@ -191,6 +192,9 @@ class APIHandler(BaseHTTPRequestHandler):
             elif path == "/api/v1/production/status":
                 data = build_production_status(app.runtime_health_path)
                 self._send_ok(data)
+            elif path == "/api/v1/alarms":
+                data = build_alarms(config_manager.ALARM_HISTORY_FILE)
+                self._send_ok(data)
             else:
                 self._send_error(f"未知路径: {path}")
                 app.record_request(ok=False, error=f"unknown path {path}")
@@ -198,6 +202,50 @@ class APIHandler(BaseHTTPRequestHandler):
             app.record_request(ok=True)
         except Exception as e:  # noqa: BLE001 - top-level guard for HTTP handlers
             logger.exception("处理请求 %s 失败", path)
+            self._send_error(f"内部错误: {e}", status=500)
+            app.record_request(ok=False, error=str(e))
+
+    def do_POST(self) -> None:
+        """Handle POST requests (e.g. shutdown)."""
+        app = self.server.app
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path
+
+        # token required
+        if not self._check_token():
+            self._send_error("未授权: token 无效或缺失", status=401)
+            app.record_request(ok=False, error="auth failed")
+            return
+
+        try:
+            if path == "/api/v1/shutdown":
+                import subprocess
+                # 延时 10 秒关机，可用 shutdown /a 取消
+                result = subprocess.run(
+                    ["shutdown", "/s", "/t", "10"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    logger.warning("收到远程关机指令，PC 将在 10 秒后关机")
+                    self._send_ok({
+                        "success": True,
+                        "message": "PC 将在 10 秒后关机，可在 PC 上执行 shutdown /a 取消",
+                        "delay_seconds": 10,
+                    })
+                else:
+                    self._send_error(
+                        f"关机命令执行失败: {result.stderr or result.stdout}",
+                        status=500,
+                    )
+                    app.record_request(ok=False, error="shutdown failed")
+                    return
+            else:
+                self._send_error(f"未知路径: {path}")
+                app.record_request(ok=False, error=f"unknown path {path}")
+                return
+            app.record_request(ok=True)
+        except Exception as e:
+            logger.exception("处理 POST 请求 %s 失败", path)
             self._send_error(f"内部错误: {e}", status=500)
             app.record_request(ok=False, error=str(e))
 
@@ -294,6 +342,34 @@ class RemoteApiServer:
             self._write_health("running")
 
     # ---- lifecycle ----
+    def _ensure_modbus_server(self) -> None:
+        """Probe whether a Modbus slave is listening on 502.
+
+        Used for status reporting only. If 502 is already in use (typically
+        by the runtime process's DobotModbusServer with full callbacks),
+        callers read from the existing server via ModbusTcpClient. If 502
+        is free, the Runtime is assumed to not be running — callers should
+        surface an error when they attempt to read registers. No fallback
+        slave is started here.
+        """
+        import socket
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.settimeout(0.5)
+        try:
+            result = probe.connect_ex(("127.0.0.1", self.modbus_port))
+        finally:
+            probe.close()
+        if result == 0:
+            logger.info(
+                "%d 已被外部进程监听，复用现有 Modbus 从站",
+                self.modbus_port,
+            )
+            return
+        logger.warning(
+            "%d 端口未监听，Runtime 可能未运行",
+            self.modbus_port,
+        )
+
     def start(self) -> None:
         host = self.config.get("host", "0.0.0.0")
         port = int(self.config.get("port", 8000))
@@ -307,6 +383,7 @@ class RemoteApiServer:
                 pass
             return
 
+        self._ensure_modbus_server()
         self.feedback_worker.start()
         self._health_thread = threading.Thread(
             target=self._health_loop,
@@ -323,6 +400,8 @@ class RemoteApiServer:
         logger.info("  GET /api/v1/feedback/all      - 完整反馈快照")
         logger.info("  GET /api/v1/modbus/registers  - Modbus 寄存器")
         logger.info("  GET /api/v1/production/status - 产线/运行时状态")
+        logger.info("  GET /api/v1/alarms            - 报警历史记录")
+        logger.info("  POST /api/v1/shutdown         - 远程关机 (延时10秒)")
         logger.info("机器人 IP: %s", self.robot_ip)
         logger.info("Modbus: %s:%d (slave_id=%d)",
                     self.config.get("modbus_host", "127.0.0.1"),
@@ -341,27 +420,45 @@ class RemoteApiServer:
             return
         self._stopped = True
 
-        # shutdown() must run in a different thread than serve_forever()
-        # to avoid deadlock; fire-and-forget a daemon to signal the loop.
-        if self._http_server is not None:
-            threading.Thread(
-                target=self._http_server.shutdown,
-                daemon=True,
-                name="remote-api-http-shutdown",
-            ).start()
-
+        _server_closed = False
         try:
-            self.feedback_worker.stop(timeout=5.0)
-        except Exception:
-            logger.warning("feedback worker 停止失败", exc_info=True)
+            # shutdown() must run in a different thread than serve_forever()
+            # to avoid deadlock; fire-and-forget a daemon to signal the loop.
+            if self._http_server is not None:
+                shutdown_thread = threading.Thread(
+                    target=self._http_server.shutdown,
+                    daemon=True,
+                    name="remote-api-http-shutdown",
+                )
+                shutdown_thread.start()
+                shutdown_thread.join(timeout=2.0)
+                if shutdown_thread.is_alive():
+                    logger.warning("remote-api shutdown 超时，强制关闭监听 socket")
 
-        self._health_stop_event.set()
-        if self._health_thread is not None:
-            self._health_thread.join(timeout=2.0)
+                # explicitly close listening socket (shutdown() only stops
+                # the serve_forever loop, not the socket itself)
+                self._http_server.server_close()
+                _server_closed = True
 
-        # final health snapshot with stopped status
-        self._write_health(status="stopped")
-        logger.info("REST API 服务已停止")
+            try:
+                self.feedback_worker.stop(timeout=5.0)
+            except Exception:
+                logger.warning("feedback worker 停止失败", exc_info=True)
+
+            self._health_stop_event.set()
+            if self._health_thread is not None:
+                self._health_thread.join(timeout=2.0)
+
+            # final health snapshot with stopped status
+            self._write_health(status="stopped")
+            logger.info("REST API 服务已停止")
+        finally:
+            # Guarantee server_close() even if feedback_worker.stop() throws
+            if not _server_closed and self._http_server is not None:
+                try:
+                    self._http_server.server_close()
+                except Exception:
+                    logger.warning("server_close() fallback failed", exc_info=True)
 
 
 # ============================ entrypoint ============================

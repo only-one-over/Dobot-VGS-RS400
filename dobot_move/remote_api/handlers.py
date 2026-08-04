@@ -203,3 +203,39 @@ def build_production_status(health_path: str, stale_threshold_s: float = 3.0) ->
         "failure_latched": bool(flow.get("failure_latched", False)),
         "health_age_s": round(age_s, 1),
     }
+
+
+def build_alarms(alarm_history_path: str, limit: int = 50) -> dict[str, Any]:
+    """Build /api/v1/alarms response data by reading alarm_history.json.
+
+    直接读取 JSON 文件，不依赖 AlarmHistory 类实例化，避免与主程序的锁竞争。
+    返回最近 ``limit`` 条记录（倒序，最新的在前）。
+    """
+    if not os.path.exists(alarm_history_path):
+        return {
+            "available": True,
+            "total": 0,
+            "records": [],
+        }
+
+    try:
+        with open(alarm_history_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            data = []
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("读取报警历史失败: %s", e)
+        return {
+            "available": False,
+            "error": str(e),
+            "total": 0,
+            "records": [],
+        }
+
+    # 倒序：最新的报警排在最前
+    records = list(reversed(data))[:limit]
+    return {
+        "available": True,
+        "total": len(data),
+        "records": records,
+    }

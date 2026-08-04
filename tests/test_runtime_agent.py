@@ -3,7 +3,6 @@ import json
 import shutil
 import sys
 import threading
-import time
 import types
 import uuid
 from contextlib import contextmanager
@@ -44,8 +43,6 @@ _install_modbus_stub()
 import dobot_move.runtime.runtime_agent as runtime_module  # noqa: E402
 from dobot_move.runtime.runtime_agent import (  # noqa: E402
     DobotRuntimeAgent,
-    RobotConnectionState,
-    RobotConnectionSupervisor,
     RuntimeProgramRunner,
 )
 from dobot_move.runtime.runtime_resilience import RuntimeState, RuntimeStateStore  # noqa: E402
@@ -92,6 +89,8 @@ class _FakeController:
         self._active_flow_thread = None
         self.runtime_recovery_required = None
         self.runtime_maintenance = False
+        self.software_emergency_active = False
+        self.prepare_for_action_calls = []
 
     def connect(self):
         self.connect_calls += 1
@@ -111,6 +110,17 @@ class _FakeController:
 
     def get_modbus_stats(self):
         return {"is_running": self.modbus_running, "port": 502, "cycle_count": 0, "last_duration_ms": 0}
+
+    def get_motion_safety_state(self):
+        robot_mode = 5 if self.is_enabled else 1
+        return types.SimpleNamespace(robot_mode=robot_mode)
+
+    def set_robot_ip(self, ip):
+        self.robot_ip = str(ip)
+
+    def prepare_for_action(self, **kwargs):
+        self.prepare_for_action_calls.append(dict(kwargs))
+        return True, "ok"
 
     def start_modbus(self, port=502, slave_id=5):
         self.modbus_start_calls += 1
@@ -393,124 +403,6 @@ def test_gui_client_reaches_runtime_agent_through_command_queue():
             server.stop()
 
 
-def test_supervisor_reconnects_with_backoff():
-    controller = _FakeController()
-    supervisor = RobotConnectionSupervisor(controller, reconnect_delays=(1.0, 2.0))
-
-    supervisor.step(now=100.0)
-    supervisor._connect_thread.join(timeout=1.0)
-    supervisor.step(now=100.0)
-    assert controller.connect_calls == 1
-    assert supervisor.state == RobotConnectionState.DISCONNECTED
-    assert supervisor.next_attempt_at == 101.0
-
-    supervisor.step(now=100.5)
-    assert controller.connect_calls == 1
-
-    supervisor.step(now=101.1)
-    supervisor._connect_thread.join(timeout=1.0)
-    supervisor.step(now=101.1)
-    assert controller.connect_calls == 2
-    assert supervisor.next_attempt_at == 103.1
-
-
-def test_supervisor_marks_connected_after_successful_reconnect():
-    controller = _FakeController()
-    controller.connect_results = [True]
-    supervisor = RobotConnectionSupervisor(controller, reconnect_delays=(1.0,))
-
-    supervisor.step(now=200.0)
-    supervisor._connect_thread.join(timeout=1.0)
-    supervisor.step(now=200.0)
-
-    assert controller.connect_calls == 1
-    assert supervisor.state == RobotConnectionState.CONNECTED
-    assert supervisor.next_attempt_at == 0.0
-
-
-def test_supervisor_step_stays_responsive_while_connect_blocks():
-    controller = _FakeController()
-    release = threading.Event()
-
-    def blocking_connect():
-        controller.connect_calls += 1
-        release.wait(1.0)
-        return False
-
-    controller.connect = blocking_connect
-    supervisor = RobotConnectionSupervisor(controller, reconnect_delays=(1.0,))
-
-    started_at = time.monotonic()
-    supervisor.step(now=250.0)
-    elapsed = time.monotonic() - started_at
-
-    assert elapsed < 0.2
-    assert supervisor.state == RobotConnectionState.CONNECTING
-    release.set()
-    supervisor._connect_thread.join(timeout=1.0)
-
-
-def test_supervisor_discards_late_connect_result_after_shutdown():
-    controller = _FakeController()
-    release = threading.Event()
-
-    def blocking_connect():
-        controller.connect_calls += 1
-        release.wait(1.0)
-        controller.is_connected = True
-        return True
-
-    controller.connect = blocking_connect
-    supervisor = RobotConnectionSupervisor(controller, reconnect_delays=(1.0,))
-
-    supervisor.request_connect(now=260.0)
-    supervisor.shutdown()
-    release.set()
-    supervisor._connect_thread.join(timeout=1.0)
-
-    assert supervisor._connect_result is None
-    assert controller.is_connected is False
-
-
-def test_supervisor_closes_robot_connection_when_feedback_disconnected():
-    controller = _FakeController()
-    controller.is_connected = True
-    controller.feedback_health = {"health": "disconnected"}
-    dashboard = controller.dashboard
-    supervisor = RobotConnectionSupervisor(controller, reconnect_delays=(1.0,))
-
-    supervisor.step(now=300.0)
-
-    assert controller.is_connected is False
-    assert controller.stop_feedback_calls == 0
-    assert dashboard.closed is False
-    assert supervisor.state == RobotConnectionState.DISCONNECTED
-
-    supervisor.step(now=301.0)
-    supervisor._connect_thread.join(timeout=1.0)
-    assert controller.stop_feedback_calls >= 1
-    assert dashboard.closed is True
-
-
-def test_supervisor_stops_active_flow_before_feedback_reconnect():
-    controller = _FakeController()
-    controller.is_connected = True
-    controller.feedback_health = {"health": "disconnected"}
-    dashboard = controller.dashboard
-    stop_event = threading.Event()
-    controller._active_flow_thread = types.SimpleNamespace(
-        _ctx=types.SimpleNamespace(stop_event=stop_event)
-    )
-    supervisor = RobotConnectionSupervisor(controller, reconnect_delays=(1.0,))
-
-    supervisor.step(now=300.0)
-
-    assert stop_event.is_set()
-    assert dashboard.stop_calls == 1
-    assert controller.status_writes[-1][0] == 110
-    assert controller.is_connected is False
-
-
 def test_runtime_agent_writes_health_file():
     controller = _FakeController()
     controller.modbus_running = True
@@ -574,6 +466,11 @@ def test_runtime_runner_camera_failure_writes_flow_error(monkeypatch):
         "_load_modules",
         lambda: [{"type": "camera", "params": {"camera_type": "D405"}}],
     )
+    monkeypatch.setattr(
+        runner,
+        "_prepare_for_action_with_cameras",
+        lambda modules: (True, "ok"),
+    )
     dispatched: list = []
     runner.on_production_finished = lambda result: dispatched.append(result)
     runner._run_once()
@@ -617,6 +514,11 @@ def test_runtime_runner_passes_reused_cameras_to_flow(monkeypatch):
         runner,
         "_load_modules",
         lambda: [{"type": "camera", "params": {"camera_type": "D405"}}],
+    )
+    monkeypatch.setattr(
+        runner,
+        "_prepare_for_action_with_cameras",
+        lambda modules: (True, "ok"),
     )
     monkeypatch.setattr(flow_executor, "FlowExecutor", FakeFlowExecutor)
 

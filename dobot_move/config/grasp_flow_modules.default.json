@@ -4,8 +4,7 @@
   "last_edited_flow_id": "flow-low-hook",
   "flow_roles": {
     "low_hook": "flow-low-hook",
-    "high_hook": "flow-high-hook",
-    "error_recovery": "flow-error-recovery"
+    "high_hook": "flow-high-hook"
   },
   "flows": [
     {
@@ -16,11 +15,6 @@
     {
       "id": "flow-high-hook",
       "name": "高钩子提钩",
-      "modules": []
-    },
-    {
-      "id": "flow-error-recovery",
-      "name": "错误回钩",
       "modules": []
     }
   ]

@@ -77,6 +77,10 @@ class ResetStrategy:
         program_runner: Optional[Any],
     ) -> bool:
         logger.info("ResetStrategy: HOLDING_HOOK 路径 — 扶钩位安全缩回")
+        # 预检：清错+使能+反馈健康+报警状态检查
+        if not controller.prepare_for_action(auto_clear_error=True, auto_enable=True):
+            logger.warning("_reset_from_holding_hook: prepare_for_action 失败")
+            return False
         # No active flow should be running in HOLDING_HOOK, but stop
         # defensively in case the program_runner thread hasn't exited.
         self._best_effort_stop_flow(program_runner)
@@ -95,6 +99,10 @@ class ResetStrategy:
         program_runner: Optional[Any],
     ) -> bool:
         logger.info("ResetStrategy: PAUSED 路径 — 终止任务 + Stop + 撤离")
+        # 预检：清错+使能+反馈健康+报警状态检查
+        if not controller.prepare_for_action(auto_clear_error=True, auto_enable=True):
+            logger.warning("_reset_from_paused: prepare_for_action 失败")
+            return False
         # Terminate the paused task first so its stop_event is set and
         # the flow thread can exit before we move the robot.
         self._best_effort_stop_flow(program_runner)

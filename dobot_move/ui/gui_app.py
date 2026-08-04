@@ -46,7 +46,6 @@ from ..ui.runtime_facade import RuntimeFacade
 from ..runtime.runtime_ipc import DEFAULT_IPC_TOKEN_PATH
 from .mixins import (
     RobotControlMixin,
-    VisionMixin,
     ModbusMixin,
     PointManagementMixin,
     GraspFlowMixin,
@@ -57,13 +56,13 @@ from .production_monitor_page import ProductionMonitorPage
 from .config_center_page import ConfigCenterPage
 from ..ui.main_control_panel import MainControlPanel
 from ..flow.flow_library import FlowLibrary
-from ..ui.gui_debug_widgets import ErrorTrendPlot
 from .motion_editor_page import MotionEditorPage
 from .point_management_page import PointManagementPage
 from .modbus_comm_page import ModbusCommPage
 from .alarm_history_page import AlarmHistoryPage
-from .camera_test_page import CameraTestPage
+from .command_console_page import CommandConsolePage
 from .runtime_debug_page import RuntimeDebugPage
+from .motion_debug_page import MotionDebugPage
 
 logger = logging.getLogger(__name__)
 
@@ -112,17 +111,17 @@ _CAM_COORD_STYLE = (
 )
 
 
-class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManagementMixin, GraspFlowMixin, QMainWindow):
+class DobotMainWindow(RobotControlMixin, ModbusMixin, PointManagementMixin, GraspFlowMixin, QMainWindow):
     """机器人控制GUI"""
-    
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Dobot VGS — 工业机器人仪表盘")
         self.setGeometry(100, 100, 1200, 750)
         self.setMinimumSize(1100, 760)
-        
+
         self.set_dark_theme()
-        
+
         self.robot_ip = get_robot_ip()
         runtime_config = get_runtime_config()
         health_path = runtime_config.get(
@@ -161,9 +160,9 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         # (treated as "all supported" to avoid false-disabling on legacy
         # Runtime builds that don't advertise capabilities).
         self._runtime_capabilities: list[str] = []
-        
+
         self._load_grasp_flow_modules()
-        
+
         self.is_paused = False
         self._flow_running = False
         self._flow_started_by_modbus = False
@@ -172,7 +171,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self._active_flow_modules = []
         self._editing_point_row = -1
         self._editing_point_name = None
-        
+
         self.init_ui()
         self._start_status_timer()
         # PR-C Task 6.2: fetch Runtime capabilities once the UI is live so
@@ -189,6 +188,22 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             self.flow_library = FlowLibrary.load(
                 file_path,
                 default_modules=_DEFAULT_GRASP_FLOW_MODULES,
+            )
+        except ValueError as e:
+            # 流程库文件损坏且备份不可用：仅用默认流程构造内存中的
+            # library 供本次会话使用，不调用 save() 以免覆盖损坏的原
+            # 文件，给用户留出手动恢复的机会。
+            logger.error(f"流程库文件损坏且备份不可用: {e}")
+            QMessageBox.warning(
+                self,
+                "流程库损坏",
+                f"流程库文件损坏且备份不可用，已临时回退到默认流程。\n\n"
+                f"请手动恢复文件后重启程序：\n{file_path}\n\n"
+                f"在恢复前请勿保存当前流程，否则损坏的文件将被覆盖。",
+            )
+            self.flow_library = FlowLibrary.from_modules(
+                _DEFAULT_GRASP_FLOW_MODULES,
+                file_path,
             )
         except Exception as e:
             logger.error(f"加载抓取流程失败: {e}")
@@ -235,7 +250,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
     def set_dark_theme(self):
         """设置深色主题"""
         apply_theme(self)
-    
+
     def init_ui(self):
         """初始化UI"""
         self._nav_buttons = []
@@ -243,12 +258,12 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         central_widget = QWidget()
         central_widget.setObjectName("appRoot")
         self.setCentralWidget(central_widget)
-        
+
         # 主布局
         main_layout = QVBoxLayout(central_widget)
         main_layout.setSpacing(8)
         main_layout.setContentsMargins(12, 12, 12, 8)
-        
+
         # ── 精简顶栏：仅标题 ──
         # 系统状态卡片组与生产上下文面板已迁移到「生产监控」导航页
         # 安全停止按钮已移除，停止功能由 Modbus 40001=0 或 IPC safe_stop 提供
@@ -274,7 +289,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         sidebar_layout = QVBoxLayout(self.sidebar)
         sidebar_layout.setSpacing(2)
         sidebar_layout.setContentsMargins(6, 12, 6, 12)
-        
+
         # 侧边栏标题
         nav_header = QLabel("DOBOT VGS")
         nav_header.setStyleSheet(
@@ -299,7 +314,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
 
         content_layout.addWidget(self.sidebar)
         content_layout.addWidget(self.stacked_widget, 1)
-        
+
         # ── Page 1: 生产监控页（系统状态卡片 + 生产上下文，从顶部迁移） ──
         self.production_monitor_page = ProductionMonitorPage()
         self.production_monitor_page.realtime_requested.connect(self.open_realtime_feedback)
@@ -397,6 +412,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.remove_module_btn = me.remove_module_btn
         self.param_group = me.param_group
         self.param_layout = me.param_layout
+        self.linear_params = me.linear_params
         self.linear_target_combo = me.linear_target_combo
         self.linear_point_combo = me.linear_point_combo
         self.linear_point_preview = me.linear_point_preview
@@ -476,31 +492,16 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.move_to_point_btn = pm.move_to_point_btn
 
         # ── Page 6: Modbus 通信页 ──
-        self.modbus_comm_page = ModbusCommPage(
-            modbus_port=str(get_modbus_port()),
-            modbus_slave_id=str(get_modbus_slave_id()),
-        )
+        self.modbus_comm_page = ModbusCommPage()
         # 连接信号
-        self.modbus_comm_page.modbus_port_input.editingFinished.connect(
-            lambda: ConfigService.instance().set('modbus_port', int(self.modbus_comm_page.modbus_port_input.text().strip() or 502))
+        self.modbus_comm_page.write_register_triggered.connect(
+            self._on_modbus_write_register
         )
-        self.modbus_comm_page.modbus_slave_id_input.editingFinished.connect(
-            lambda: ConfigService.instance().set('modbus_slave_id', int(self.modbus_comm_page.modbus_slave_id_input.text().strip() or 5))
-        )
-        self.modbus_comm_page.modbus_start_btn.clicked.connect(self.start_modbus_server)
-        self.modbus_comm_page.modbus_stop_btn.clicked.connect(self.stop_modbus_server)
         self._add_nav_page("Modbus 通信", self._wrap_in_scroll(self.modbus_comm_page))
 
         # 向后兼容属性别名：Modbus 通信页
         mc = self.modbus_comm_page
-        self.modbus_port_input = mc.modbus_port_input
-        self.modbus_slave_id_input = mc.modbus_slave_id_input
-        self.modbus_start_btn = mc.modbus_start_btn
-        self.modbus_stop_btn = mc.modbus_stop_btn
         self.modbus_status_label = mc.modbus_status_label
-        self.modbus_cycle_label = mc.modbus_cycle_label
-        self.modbus_duration_label = mc.modbus_duration_label
-        self.modbus_status_panel_label = mc.modbus_status_panel_label
         self.modbus_table = mc.modbus_table
 
         # ── Page 7: 报警记录页 ──
@@ -514,31 +515,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.alarm_refresh_btn = self.alarm_history_page.alarm_refresh_btn
         self.alarm_clear_btn = self.alarm_history_page.alarm_clear_btn
 
-        # ── Page 8: 相机测试页 ──
-        self.camera_test_page = CameraTestPage()
-        self.camera_test_page.cam_test_start_btn.clicked.connect(self._start_camera_test)
-        self.camera_test_page.cam_test_stop_btn.clicked.connect(self._stop_camera_test)
-        self.camera_test_page.cam_self_test_btn.clicked.connect(self._run_camera_self_test)
-        self._add_nav_page("相机测试", self._wrap_in_scroll(self.camera_test_page))
-
-        # 向后兼容属性别名：相机测试页
-        ct = self.camera_test_page
-        self.cam_test_combo = ct.cam_test_combo
-        self.cam_test_start_btn = ct.cam_test_start_btn
-        self.cam_test_stop_btn = ct.cam_test_stop_btn
-        self.cam_self_test_btn = ct.cam_self_test_btn
-        self.cam_test_image_label = ct.cam_test_image_label
-        self.cam_test_status_label = ct.cam_test_status_label
-        self.cam_test_cam_coords = ct.cam_test_cam_coords
-        self.cam_test_end_coords = ct.cam_test_end_coords
-        self.cam_test_base_coords = ct.cam_test_base_coords
-        self.cam_test_confidence = ct.cam_test_confidence
-        self.cam_test_d405_group = ct.cam_test_d405_group
-        self.cam_test_handle_coords = ct.cam_test_handle_coords
-        self.cam_test_tip_coords = ct.cam_test_tip_coords
-        self.cam_test_hook_length = ct.cam_test_hook_length
-        self.cam_test_worker = ct.cam_test_worker
-
         # ── Page 9: Runtime 调试页 ──
         self.runtime_debug_page = RuntimeDebugPage()
         # 连接显式属性按钮
@@ -547,6 +523,9 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.runtime_debug_page.debug_start_btn.clicked.connect(self._start_debug_flow)
         self.runtime_debug_page.debug_step_btn.clicked.connect(self._run_debug_step)
         self.runtime_debug_page.debug_live_button.toggled.connect(self._toggle_live_vision)
+        # Spec Task 7: 视觉遥测 / 检测测试 / 实时日志信号
+        self.runtime_debug_page.fetch_detection_test.connect(self._on_fetch_detection_test)
+        self.runtime_debug_page.camera_connect_requested.connect(self._on_config_camera_connect)
 
         # Connect runtime debug page buttons by text matching
         for btn in self.runtime_debug_page.findChildren(QPushButton):
@@ -555,10 +534,12 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
                 btn.clicked.connect(lambda _c=False, cmd="enter_maintenance": self._send_runtime_ipc(cmd))
             elif text == "退出维护":
                 btn.clicked.connect(lambda _c=False, cmd="exit_maintenance": self._send_runtime_ipc(cmd))
+            elif text == "清除恢复锁":
+                btn.clicked.connect(self._clear_recovery)
             elif text == "刷新状态":
                 btn.clicked.connect(lambda _c=False: self._send_runtime_ipc("get_status", on_success=self._cache_runtime_capabilities))
             elif text == "发布状态":
-                btn.clicked.connect(lambda _c=False, cmd="get_publication_status": self._send_runtime_ipc(cmd))
+                btn.clicked.connect(lambda _c=False, cmd="reload_config": self._send_runtime_ipc(cmd))
             elif text == "采集诊断快照":
                 btn.clicked.connect(self._request_vision_snapshot)
             elif text == "读取 Runtime 日志":
@@ -585,32 +566,48 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self.debug_step_btn = rd.debug_step_btn
         self.debug_camera_combo = rd.debug_camera_combo
         self.debug_image_label = rd.debug_image_label
-        self.debug_depth_label = rd.debug_depth_label
-        self.debug_depth_checkbox = rd.debug_depth_checkbox
         self.debug_live_button = rd.debug_live_button
-        self.debug_telemetry_table = rd.debug_telemetry_table
-        self.debug_error_time_plot = rd.debug_error_time_plot
-        self.debug_error_iteration_plot = rd.debug_error_iteration_plot
         self.debug_output = rd.debug_output
 
-        # Modbus 数据刷新定时器
-        self._modbus_refresh_timer = QTimer()
-        self._modbus_refresh_timer.timeout.connect(self._refresh_modbus_table)
+        # ── Page 10: 命令控制台页 ──
+        self.command_console_page = CommandConsolePage()
+        self.command_console_page.send_requested.connect(
+            self._on_command_console_send
+        )
+        self._add_nav_page(
+            "命令控制台", self._wrap_in_scroll(self.command_console_page)
+        )
 
-        # Debug telemetry timer
-        self._debug_telemetry_timer = QTimer(self)
-        self._debug_telemetry_timer.timeout.connect(
-            lambda: self._send_runtime_ipc(
-                "get_visual_servo_telemetry",
-                on_success=self._append_servo_telemetry,
-                quiet=True,
+        # ── Page 11: 运动调试页 ──
+        self.motion_debug_page = MotionDebugPage()
+        # 页面只发信号，由 gui_app 转发到 runtime_facade
+        self.motion_debug_page.jog_triggered.connect(self._on_jog_move)
+        self.motion_debug_page.move_to_pose_triggered.connect(self._on_move_to_pose)
+        self.motion_debug_page.safe_stop_triggered.connect(self._on_safe_stop)
+        self.motion_debug_page.refresh_pose_btn.clicked.connect(
+            lambda: self._runtime_facade.get_current_pose(
+                on_success=self._on_pose_received
             )
         )
-        self._debug_telemetry_timer.start(1000)
+        self._add_nav_page("运动调试", self._wrap_in_scroll(self.motion_debug_page))
+
+        # 向后兼容属性别名：运动调试页
+        md = self.motion_debug_page
+        self.jog_step_spin = md.jog_step_spin
+        self.jog_motion_combo = md.jog_motion_combo
+        self.move_speed_spin = md.move_speed_spin
+        self.move_motion_combo = md.move_motion_combo
+        self.move_to_pose_btn = md.move_to_pose_btn
+        self.safe_stop_btn = md.safe_stop_btn
+
+        # Modbus 数据刷新由 _status_timer（1000ms）驱动 _poll_status →
+        # _refresh_modbus_table，不再单独维护 _modbus_refresh_timer。
 
         # Debug live vision timer
         self._debug_live_timer = QTimer(self)
         self._debug_live_timer.timeout.connect(self._poll_live_vision)
+        # Spec Task 5: 流模式轮询的上一次 seq，用于增量取帧
+        self._last_stream_frame_seq = 0
 
         # 任务状态轮询定时器（SubTask 7.3：每 2 秒查询 get_debug_task_status）
         self._debug_task_status_timer = QTimer(self)
@@ -622,6 +619,21 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             )
         )
         self._debug_task_status_timer.start(2000)
+
+        # Spec Task 7: Runtime 实时日志拉取定时器（500ms 增量拉取）
+        self._runtime_log_timer = QTimer(self)
+        self._runtime_log_timer.setInterval(500)
+        self._runtime_log_timer.timeout.connect(self._fetch_runtime_logs)
+        self._runtime_log_timer.start()
+
+        # 运动调试页：200ms 轮询当前位姿（IPC 自带去重，不会堆积请求）
+        self._motion_pose_timer = QTimer(self)
+        self._motion_pose_timer.timeout.connect(
+            lambda: self._runtime_facade.get_current_pose(
+                on_success=self._on_pose_received
+            )
+        )
+        self._motion_pose_timer.start(200)
 
         self.refresh_points_table()
 
@@ -659,7 +671,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             "run_task_btn", "connect_robot_btn", "pause_btn", "continue_btn",
             "editor_pause_btn", "editor_continue_btn", "emergency_stop_btn",
             "realtime_btn", "read_point_btn", "linear_read_current_btn",
-            "cam_test_start_btn", "cam_test_stop_btn",
         ):
             if hasattr(self, attr):
                 getattr(self, attr).setEnabled(False)
@@ -693,16 +704,23 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         "clear_error_btn": "clear_alarms",
         "connect_robot_btn": "connect_robot",
         "collision_set_btn": "set_collision_level",
-        "modbus_start_btn": "start_modbus",
-        "modbus_stop_btn": "stop_modbus",
         "realtime_btn": "get_vision_snapshot",
         "get_pos_btn": "get_current_pose",
-        "read_point_btn": "get_point",
+        "read_point_btn": "get_current_pose",
         "move_initial_btn": "move_to_point",
         "run_flow_btn": "start_debug_flow",
         "run_task_btn": "start_production_flow",
         "pause_btn": "pause_debug_flow",
         "continue_btn": "resume_debug_flow",
+        "stop_btn": "stop_current_task",
+        "validate_flow_btn": "validate_flow",
+        "run_step_btn": "run_step",
+        "alarm_clear_btn": "clear_alarm_history",
+        "move_to_pose_btn": "move_to_pose",
+        "d435i_connect_btn": "connect_camera",
+        "d405_connect_btn": "connect_camera",
+        "d435i_disconnect_btn": "disconnect_camera",
+        "d405_disconnect_btn": "disconnect_camera",
     }
 
     def _is_capability_supported(self, command_name: str) -> bool:
@@ -732,6 +750,55 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
                 # ``_refresh_action_states`` decides the actual state.
                 btn.setToolTip("")
 
+    def _set_core_buttons_runtime_status(self, snapshot) -> None:
+        """根据 Runtime 在线状态和机器人连接状态启用/禁用核心按钮。
+
+        按钮启用规则：
+        - emergency_stop_btn: 永远启用（安全关键操作）
+        - connect_robot_btn / clear_error_btn / realtime_btn: runtime online 时启用
+        - enable_robot_btn / disable_robot_btn / get_pos_btn / move_initial_btn /
+          linear_read_current_btn / run_flow_btn / run_task_btn:
+          runtime online + robot_connected 时启用
+
+        能力门控优先：若 _CAPABILITY_BUTTON_MAP 中按钮对应的能力不被支持，
+        则保持禁用状态（不启用）。
+        """
+        if snapshot is None:
+            online = False
+            robot_connected = False
+        else:
+            online = bool(snapshot.online)
+            robot_connected = bool(getattr(snapshot, "robot_connected", False))
+
+        # 急停按钮永远启用
+        if hasattr(self, "emergency_stop_btn"):
+            self.emergency_stop_btn.setEnabled(True)
+
+        # runtime online 时启用的按钮
+        online_only_buttons = ("connect_robot_btn", "clear_error_btn", "realtime_btn")
+        for attr in online_only_buttons:
+            if not hasattr(self, attr):
+                continue
+            # 检查能力门控（connect_robot_btn 在 _CAPABILITY_BUTTON_MAP 中）
+            command = self._CAPABILITY_BUTTON_MAP.get(attr)
+            if command and not self._is_capability_supported(command):
+                continue  # 能力不支持，保持禁用
+            getattr(self, attr).setEnabled(online)
+
+        # runtime online + robot_connected 时启用的按钮
+        connected_buttons = (
+            "enable_robot_btn", "disable_robot_btn", "get_pos_btn",
+            "move_initial_btn", "linear_read_current_btn",
+            "run_flow_btn", "run_task_btn",
+        )
+        for attr in connected_buttons:
+            if not hasattr(self, attr):
+                continue
+            command = self._CAPABILITY_BUTTON_MAP.get(attr)
+            if command and not self._is_capability_supported(command):
+                continue  # 能力不支持，保持禁用
+            getattr(self, attr).setEnabled(online and robot_connected)
+
     def _cache_runtime_capabilities(self, data: dict):
         """Cache ``capabilities`` from a ``get_status`` IPC response."""
         capabilities = data.get("capabilities") or []
@@ -758,6 +825,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         command,
         data=None,
         on_success=None,
+        on_failure=None,
         quiet=False,
     ):
         if command in self._ipc_pending_commands:
@@ -780,15 +848,21 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
                     self._debug_append(
                         f"{command}: {json.dumps(payload, ensure_ascii=False)}"
                     )
-            elif not quiet:
+            else:
                 error = response.get("error") or {}
-                self._debug_append(
-                    f"{command} [{error.get('code', 'ERROR')}]: "
+                err_msg = (
+                    f"[{error.get('code', 'ERROR')}] "
                     f"{error.get('message', '')}"
                 )
+                if on_failure:
+                    on_failure(err_msg)
+                elif not quiet:
+                    self._debug_append(f"{command} {err_msg}")
 
         def failed(message):
-            if not quiet:
+            if on_failure:
+                on_failure(message)
+            elif not quiet:
                 self._debug_append(f"{command}: Runtime 离线或请求失败: {message}")
 
         def cleanup():
@@ -864,10 +938,8 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             return
         ConfigService.instance().flush()
         self._send_runtime_ipc(
-            "publish_config",
-            on_success=lambda data: self._debug_append(
-                f"发布成功，下一任务版本: {data.get('revision')}"
-            ),
+            "reload_config",
+            on_success=lambda data: self._debug_append("配置已重载"),
         )
 
     def _on_reload_config(self):
@@ -901,6 +973,9 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         )
 
     def _start_debug_flow(self):
+        if not self._prepare_config_before_run():
+            self.statusBar().showMessage("配置保存失败，无法启动调试流程", 5000)
+            return
         self._send_runtime_ipc(
             "start_debug_flow",
             {"flow_id": self.editing_flow_id},
@@ -926,7 +1001,7 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             {
                 "camera_type": self.debug_camera_combo.currentText(),
                 "include_color": True,
-                "include_depth": self.debug_depth_checkbox.isChecked(),
+                "include_depth": False,
                 "include_mask": True,
                 "run_detection": True,
             },
@@ -945,17 +1020,6 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
                     Qt.TransformationMode.SmoothTransformation,
                 )
             )
-        depth_encoded = data.get("depth_preview_jpeg_base64")
-        if depth_encoded:
-            depth_pixmap = QPixmap()
-            depth_pixmap.loadFromData(base64.b64decode(depth_encoded))
-            self.debug_depth_label.setPixmap(
-                depth_pixmap.scaled(
-                    self.debug_depth_label.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            )
         summary = {
             "detection": data.get("detection"),
             "coordinates": data.get("coordinates"),
@@ -968,66 +1032,133 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
     def _show_runtime_logs(self, data):
         self.debug_output.setPlainText("\n".join(data.get("lines", [])))
 
+    # ------------------------------------------------------------------
+    # Spec Task 7: 实时日志拉取 / 视觉遥测 / 检测测试
+    # ------------------------------------------------------------------
+    def _fetch_runtime_logs(self):
+        """500ms 定时槽：若刷新开关勾选则拉取 Runtime 日志。"""
+        if not self.runtime_debug_page.log_auto_refresh_checkbox.isChecked():
+            return
+        self._runtime_facade.call_async(
+            "get_runtime_logs",
+            on_success=self._on_runtime_logs_received,
+            on_failure=lambda e: self.runtime_debug_page.set_log_paused(True),
+        )
+
+    def _on_runtime_logs_received(self, payload):
+        self.runtime_debug_page.append_log_lines(payload.get("lines", []))
+
+    def _on_fetch_detection_test(self):
+        self._runtime_facade.call_async(
+            "test_detection",
+            on_success=lambda p: self._show_telemetry_result("detection", p),
+            on_failure=lambda e: self._show_telemetry_failure("detection", e),
+        )
+
+    def _show_telemetry_result(self, name, payload):
+        text = json.dumps(payload, ensure_ascii=False, indent=2)[:1000]
+        QMessageBox.information(self, f"{name} 结果", text)
+
+    def _show_telemetry_failure(self, name, err):
+        QMessageBox.warning(self, f"{name} 失败", str(err))
+
     def _toggle_live_vision(self, active):
         self.debug_live_button.setText("停止实时图" if active else "开始实时图")
         if active:
-            self._debug_live_timer.start(750)
-            self._poll_live_vision()
+            # Spec Task 5：先启动 Runtime 侧流，成功后再启动 100ms 定时器
+            camera_type = self.debug_camera_combo.currentText()
+            self._send_runtime_ipc(
+                "start_vision_stream",
+                {"camera_type": camera_type},
+                on_success=self._on_vision_stream_started,
+                on_failure=self._on_live_vision_failure,
+            )
         else:
             self._debug_live_timer.stop()
+            self._send_runtime_ipc("stop_vision_stream")
+
+    def _on_vision_stream_started(self, data):
+        """start_vision_stream 成功回调：重置 seq 并启动 100ms 流轮询。"""
+        if not self.debug_live_button.isChecked():
+            # 用户在等待启动期间已点击停止：补发 stop 避免 Runtime 侧 worker 泄漏
+            self._send_runtime_ipc("stop_vision_stream")
+            return
+        self._last_stream_frame_seq = 0
+        self._debug_live_timer.start(100)
+        self._poll_live_vision()
 
     def _poll_live_vision(self):
         if not self.debug_live_button.isChecked():
             return
         self._send_runtime_ipc(
-            "get_vision_snapshot",
-            {
-                "camera_type": self.debug_camera_combo.currentText(),
-                "include_color": True,
-                "include_depth": self.debug_depth_checkbox.isChecked(),
-                "include_mask": True,
-                "run_detection": True,
-            },
-            self._show_vision_snapshot,
+            "get_vision_stream_frame",
+            {"last_seq_seen": self._last_stream_frame_seq},
+            self._show_vision_stream_frame,
+            on_failure=self._on_live_vision_failure,
             quiet=True,
         )
 
-    def _append_servo_telemetry(self, data):
-        telemetry = data.get("telemetry") or {}
-        if not telemetry:
-            return
-        row = self.debug_telemetry_table.rowCount()
-        if row >= 100:
-            self.debug_telemetry_table.removeRow(0)
-            row -= 1
-        self.debug_telemetry_table.insertRow(row)
-        xyz = list(telemetry.get("error_xyz_mm") or [0.0, 0.0, 0.0])
-        xyz += [0.0] * (3 - len(xyz))
-        values = (
-            telemetry.get("iterations", 0),
-            xyz[0],
-            xyz[1],
-            xyz[2],
-            telemetry.get("error_mm", 0.0),
-            telemetry.get("loop_hz", 0.0),
-            telemetry.get("capture_ms", 0.0),
-            telemetry.get("inference_ms", 0.0),
-            telemetry.get("depth_ms", 0.0),
-            telemetry.get("servo_ms", 0.0),
-            telemetry.get("control_total_ms", 0.0),
-        )
-        for column, value in enumerate(values):
-            text = str(value) if column == 0 else f"{float(value):.2f}"
-            self.debug_telemetry_table.setItem(
-                row,
-                column,
-                QTableWidgetItem(text),
+    def _show_vision_stream_frame(self, data):
+        """get_vision_stream_frame 成功回调：渲染流帧并更新检测信息。"""
+        # 流未启动或已停止：显示提示文字
+        if data.get("available") is False:
+            reason = data.get("reason") or "实时流未启动"
+            self.debug_image_label.setText(f"实时流未启动\n\n{reason}")
+            self.debug_image_label.setStyleSheet(
+                "color: #e67e22; background-color: #fef9f2; "
+                "border:1px solid #e67e22;"
             )
-        timestamp = time.monotonic()
-        iteration = int(telemetry.get("iterations", 0))
-        error_mm = float(telemetry.get("error_mm", 0.0))
-        self.debug_error_time_plot.add_sample(timestamp, iteration, error_mm)
-        self.debug_error_iteration_plot.add_sample(timestamp, iteration, error_mm)
+            return
+        # 无新帧：保持上一帧画面，不做任何操作
+        if data.get("no_new_frame"):
+            return
+        seq = data.get("seq")
+        if seq is not None:
+            self._last_stream_frame_seq = seq
+        encoded = data.get("jpeg_base64")
+        if encoded:
+            pixmap = QPixmap()
+            pixmap.loadFromData(base64.b64decode(encoded))
+            self.debug_image_label.setPixmap(
+                pixmap.scaled(
+                    self.debug_image_label.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        # 更新检测信息面板（复用 debug 输出面板）
+        metadata = data.get("metadata") or {}
+        detection = metadata.get("detection")
+        if detection or metadata.get("coordinates"):
+            summary = {
+                "detection": detection,
+                "coordinates": metadata.get("coordinates"),
+                "source": data.get("source"),
+                "seq": seq,
+            }
+            self._debug_append(json.dumps(summary, ensure_ascii=False, indent=2))
+
+    def _on_live_vision_failure(self, error_msg: str):
+        """实时图请求失败回调：CAMERA_NOT_READY 时显示占位提示并停止轮询。"""
+        self._debug_append(f"vision_stream: {error_msg}")
+        if "CAMERA_NOT_READY" not in error_msg:
+            # 其他错误（如 RUNTIME_BUSY、INTERNAL_ERROR）：只记录，不停止定时器
+            return
+        # CAMERA_NOT_READY：显示占位提示并停止实时图轮询
+        # 提取错误详情（"[CAMERA_NOT_READY] D405 相机未连接（...）"中的"D405 相机未连接..."部分）
+        detail = error_msg
+        if "] " in detail:
+            detail = detail.split("] ", 1)[1]
+        self.debug_image_label.setText(
+            f"相机未连接\n\n{detail}\n\n请点击'连接相机'按钮"
+        )
+        self.debug_image_label.setStyleSheet(
+            f"color: #e74c3c; background-color: #fdf2f2; "
+            f"border:1px solid #e74c3c;"
+        )
+        self._debug_live_timer.stop()
+        self.debug_live_button.setChecked(False)
+        self.debug_live_button.setText("开始实时图")
 
     def _start_status_timer(self):
         self._status_timer = QTimer(self)
@@ -1039,11 +1170,8 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         self._runtime_status = self._runtime_status_reader.read()
         snapshot = self._runtime_status
         if hasattr(self, "debug_runtime_state"):
-            publication = snapshot.raw.get("publication", {})
-            revision = publication.get("next_task_revision") or publication.get(
-                "revision",
-                "-",
-            )
+            # 单一数据源：publication 已废弃，显示 draft
+            revision = "draft"
             self.debug_runtime_state.setText(
                 f"Runtime: {snapshot.runtime_state} | 下一任务版本: {revision}"
             )
@@ -1118,9 +1246,33 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             "D405",
             "已连接" if snapshot.d405_connected else "未连接",
         )
+        # Task 4：同步机器人连接状态与 Runtime 在线状态到配置中心页
+        self.config_center_page.update_robot_connection_status(
+            connected=bool(snapshot.robot_connected),
+            runtime_online=bool(snapshot.online),
+        )
         self.production_monitor_page.update_status_cards(snapshot)
         self.production_monitor_page.update_production_display(snapshot)
+        # Task 5：命令控制台页根据 Runtime 在线状态启用/禁用发送按钮
+        if hasattr(self, "command_console_page"):
+            self.command_console_page.set_runtime_online(bool(snapshot.online))
+        # Task 4：运动调试页根据 Runtime 在线状态启用/禁用 jog/运动按钮
+        if hasattr(self, "motion_debug_page"):
+            self.motion_debug_page.set_runtime_online(
+                bool(snapshot.online) if snapshot else False
+            )
+        # 同步点位管理和相机测试按钮的 runtime 在线状态
+        online = bool(snapshot and snapshot.online)
+        if hasattr(self, "set_point_buttons_runtime_online"):
+            self.set_point_buttons_runtime_online(online)
         self._refresh_modbus_table()
+        self._set_core_buttons_runtime_status(snapshot)
+        # 同步软件急停状态（仅 Runtime 在线时覆盖本地状态，离线时保留最近一次）
+        if snapshot.online:
+            self._software_emergency_active = bool(
+                getattr(snapshot, "software_emergency_active", False)
+            )
+        self._update_emergency_stop_button()
 
     def _update_runtime_state_display(self, state: str) -> None:
         """Update the status-bar Runtime label and main-control indicator.
@@ -1193,9 +1345,9 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
     def _update_emergency_stop_button(self):
         if not hasattr(self, "emergency_stop_btn"):
             return
-        self.emergency_stop_btn.setText("安全停止")
-        active = "true" if getattr(self, "_software_emergency_active", False) else "false"
-        self.emergency_stop_btn.setProperty("active", active)
+        active = bool(getattr(self, "_software_emergency_active", False))
+        self.emergency_stop_btn.setText("解除急停" if active else "安全停止")
+        self.emergency_stop_btn.setProperty("active", "true" if active else "false")
         self.emergency_stop_btn.style().unpolish(self.emergency_stop_btn)
         self.emergency_stop_btn.style().polish(self.emergency_stop_btn)
 
@@ -1206,6 +1358,12 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         a long-running command is blocking the command worker thread. The
         button is debounced (500 ms) and stays clickable regardless of
         command execution state.
+
+        Toggles between ``safe_stop`` (when software emergency stop is not
+        active) and ``release_safe_stop`` (when it is already active),
+        reflecting the current ``_software_emergency_active`` state. The
+        local state is not updated here; it is refreshed from Runtime's
+        real state on the next ``_poll_status`` cycle.
         """
         import time as _time
         now = _time.monotonic()
@@ -1215,25 +1373,38 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         if getattr(self, "_emergency_cmd_running", False):
             return
         self._emergency_cmd_running = True
+        if getattr(self, "_software_emergency_active", False):
+            cmd_name = "release_safe_stop"
+        else:
+            cmd_name = "safe_stop"
         self._send_runtime_ipc_stop(
-            "safe_stop",
+            cmd_name,
             on_success=lambda data: self._on_emergency_stop_finished(
-                "safe_stop", bool(data.get("emergency_stop_sent"))
+                cmd_name,
+                bool(data.get("emergency_stop_sent"))
+                if cmd_name == "safe_stop"
+                else True,
             ),
             on_failure=lambda msg: self._on_emergency_stop_finished(
-                "safe_stop", False, error=msg
+                cmd_name, False, error=msg
             ),
         )
 
     def _on_emergency_stop_finished(self, cmd_name, success, error=""):
-        del cmd_name
         self._emergency_cmd_running = False
         if success:
-            self._software_emergency_active = True
-            self.statusBar().showMessage("安全停止已执行", 5000)
+            # 不立刻更新本地 _software_emergency_active，等下次 _poll_status
+            # 用 Runtime 真实状态覆盖，避免本地与 Runtime 不一致。
+            if cmd_name == "safe_stop":
+                self.statusBar().showMessage("安全停止已执行", 5000)
+            else:
+                self.statusBar().showMessage("解除急停已执行", 5000)
         else:
-            self._software_emergency_active = False
-            message = f"安全停止失败: {error}" if error else "安全停止失败"
+            # 失败时保持当前状态不变，仅刷新按钮显示。
+            if cmd_name == "safe_stop":
+                message = f"安全停止失败: {error}" if error else "安全停止失败"
+            else:
+                message = f"解除急停失败: {error}" if error else "解除急停失败"
             self.statusBar().showMessage(message, 5000)
         self._update_emergency_stop_button()
 
@@ -1248,6 +1419,89 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             on_success=lambda data: self.statusBar().showMessage(
                 f"已停止当前任务: {data}", 5000
             ),
+        )
+
+    # ------------------------------------------------------------------
+    # 运动调试页（Task 4）
+    # ------------------------------------------------------------------
+
+    def _on_jog_move(self, axis, direction, step, motion_type):
+        """Jog 步进运动：转发到 runtime_facade（走普通 IPC 通道 8765）。"""
+        self._runtime_facade._send(
+            "jog_move",
+            {
+                "axis": str(axis),
+                "direction": int(direction),
+                "step": float(step),
+                "motion_type": str(motion_type),
+            },
+            action_name="Jog",
+        )
+
+    def _on_move_to_pose(self, pose, motion_type, speed):
+        """手动位姿运动：转发到 runtime_facade（走普通 IPC 通道 8765）。"""
+        self._runtime_facade._send(
+            "move_to_pose",
+            {
+                "pose": list(pose),
+                "motion_type": str(motion_type),
+                "speed": float(speed),
+            },
+            action_name="运动到指定位姿",
+        )
+
+    def _on_safe_stop(self):
+        """安全停止：走 RuntimeFacade（独立 Stop 通道 8766）。"""
+        self._runtime_facade.safe_stop()
+
+    def _on_pose_received(self, payload):
+        """``get_current_pose`` IPC 成功回调：刷新运动调试页实时位姿显示。"""
+        if not hasattr(self, "motion_debug_page"):
+            return
+        pose = payload.get("pose", []) if isinstance(payload, dict) else []
+        self.motion_debug_page.update_current_pose(pose)
+
+    # ------------------------------------------------------------------
+    # 命令控制台页（Task 5）
+    # ------------------------------------------------------------------
+
+    def _on_command_console_send(self, command, data):
+        """命令控制台「发送」按钮槽：通过 IPC 异步发送命令。
+
+        Runtime 离线时直接在响应区提示，不创建线程。
+        """
+        if not self._runtime_status or not self._runtime_status.online:
+            self.command_console_page.set_response_text(
+                "Runtime 离线，无法发送", ok=False
+            )
+            return
+        thread = RuntimeIpcRequestThread(
+            self._runtime_ipc_client, command, data, self
+        )
+        # 保存引用避免 GC，完成/失败后清理
+        self._ipc_request_threads.add(thread)
+
+        def cleanup():
+            self._ipc_request_threads.discard(thread)
+            thread.deleteLater()
+
+        thread.completed.connect(self._on_command_console_response)
+        thread.failed.connect(self._on_command_console_failure)
+        thread.finished.connect(cleanup)
+        thread.start()
+
+    def _on_command_console_response(self, response):
+        """命令控制台 IPC 成功回调：美化展示整个响应。"""
+        ok = bool(
+            response.get("ok", response.get("pong", response.get("connected", False)))
+        )
+        text = json.dumps(response, ensure_ascii=False, indent=2)
+        self.command_console_page.set_response_text(text, ok=ok)
+
+    def _on_command_console_failure(self, err_msg):
+        """命令控制台 IPC 失败回调。"""
+        self.command_console_page.set_response_text(
+            f"IPC 发送失败: {err_msg}", ok=False
         )
 
     def _refresh_alarm_table(self):
@@ -1268,7 +1522,33 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         success, msg = self._runtime_facade.clear_alarm_history()
         self.statusBar().showMessage(msg, 3000)
         return success
-    
+
+    def _clear_recovery(self):
+        success, msg = self._runtime_facade.clear_recovery()
+        self.statusBar().showMessage(msg, 3000)
+        return success
+
+    def _on_modbus_write_register(self, addr: int, value: int) -> None:
+        """Forward a manual register-write request to the runtime via IPC.
+
+        Triggered by the "手动写寄存器（调试）" card on the Modbus page. The
+        runtime owns the slave and writes the value in its own process.
+
+        For the command register (40001), ``simulate_external=True`` is
+        appended so the write goes through the same command-dispatch path
+        as an external PLC writing via port 502 (triggers
+        ``_on_command`` → ``_dispatch_command``).
+        """
+        payload = {"addr": addr, "value": value}
+        if addr == 40001:
+            payload["simulate_external"] = True
+        success, msg = self._runtime_facade._send(
+            "write_modbus_register",
+            payload,
+            action_name=f"写入寄存器 {addr}",
+        )
+        self.statusBar().showMessage(msg, 3000)
+
     # ------------------------------------------------------------------
     # 配置中心信号连接与处理
     # ------------------------------------------------------------------
@@ -1295,6 +1575,9 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         # 配置重载
         page.reload_config_requested.connect(self._on_config_reload)
 
+        # 运动安全配置
+        page.motion_safety_save_requested.connect(self._on_config_save_motion_safety)
+
     def _on_config_save_ip(self, ip):
         """保存机器人 IP 并提示。"""
         if not ip:
@@ -1312,6 +1595,22 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
             self.statusBar().showMessage("拍照位已保存", 5000)
         else:
             self.statusBar().showMessage("拍照位保存失败", 3000)
+
+    def _on_config_save_motion_safety(self, config_dict):
+        """保存运动安全配置并提示。"""
+        from ..config.config_manager import set_motion_safety_config
+        try:
+            if set_motion_safety_config(config_dict):
+                self.statusBar().showMessage("运动安全配置已保存", 5000)
+                # 触发 Runtime reload_config 让新边界立即生效
+                self._on_config_reload()
+            else:
+                self.statusBar().showMessage("运动安全配置保存失败", 3000)
+        except ValueError as exc:
+            self.statusBar().showMessage(f"运动安全配置保存失败: {exc}", 5000)
+        except Exception as exc:
+            logger.exception("保存运动安全配置异常")
+            self.statusBar().showMessage(f"运动安全配置保存异常: {exc}", 5000)
 
     def _on_config_select_camera_model(self, camera_type):
         """选择并保存相机 ONNX 模型路径。"""
@@ -1400,12 +1699,18 @@ class DobotMainWindow(RobotControlMixin, VisionMixin, ModbusMixin, PointManageme
         logger.info("正在关闭应用程序...")
         if hasattr(self, '_status_timer') and self._status_timer is not None:
             self._status_timer.stop()
-        if hasattr(self, "_modbus_refresh_timer"):
-            self._modbus_refresh_timer.stop()
-        if hasattr(self, "_debug_telemetry_timer"):
-            self._debug_telemetry_timer.stop()
         if hasattr(self, "_debug_live_timer"):
             self._debug_live_timer.stop()
+            # Spec Task 5.7：页面关闭时同步停止 Runtime 侧视觉流，避免 worker 泄漏
+            if hasattr(self, "debug_live_button") and self.debug_live_button.isChecked():
+                try:
+                    self._runtime_ipc_client.request("stop_vision_stream", {})
+                except Exception as exc:
+                    logger.warning("关闭时停止视觉流失败: %s", exc)
+        if hasattr(self, "_runtime_log_timer"):
+            self._runtime_log_timer.stop()
+        if hasattr(self, "_motion_pose_timer"):
+            self._motion_pose_timer.stop()
         for thread in list(getattr(self, "_ipc_request_threads", ())):
             thread.requestInterruption()
             thread.wait(3500)

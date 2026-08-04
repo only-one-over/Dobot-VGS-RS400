@@ -25,6 +25,7 @@ from ..config.config_manager import (
     set_point,
     resolve_point,
     get_performance_config,
+    get_pipeline_config,
     get_visual_servo_config,
 )
 from ..vision.vision_system import FramePacket
@@ -119,6 +120,7 @@ def wait_for_flow_delay_or_signal(
     poll_interval = max(0.001, float(poll_interval))
     remaining = duration_s
     last_tick = time.monotonic()
+    was_paused = False
 
     while remaining > 0:
         if stop_event.is_set():
@@ -129,8 +131,12 @@ def wait_for_flow_delay_or_signal(
         now = time.monotonic()
         paused = bool(is_paused_ref and is_paused_ref[0])
         if not paused:
+            if was_paused:
+                # 暂停→恢复转换：重置 last_tick，避免暂停时长泄漏进 remaining
+                last_tick = now
             remaining -= max(0.0, now - last_tick)
-        last_tick = now
+            last_tick = now
+        was_paused = paused
 
         if remaining <= 0:
             return "timeout"
@@ -491,6 +497,107 @@ class FlowExecutor:
             if hasattr(worker, "set_flow_detection_enabled"):
                 worker.set_flow_detection_enabled(False)
 
+    def _detect_camera_object_pipelined(
+        self, pipelined, vision, camera_type, ctx, max_frames, early_confidence
+    ):
+        """流水线模式主循环：从 PipelinedDetector 取最新检测结果，做置信度筛选。
+
+        业务逻辑（置信度阈值筛选、最佳结果记录、超时计时、stop_event 响应、
+        失败原因）与串行路径 :meth:`_detect_camera_object_for_flow` 保持一致；
+        区别仅在于“拿帧 + 跑推理”由 InferenceWorker 后台线程完成，主线程只
+        消费 result_queue 里的最新结果。
+        """
+        best_result = None
+        best_confidence = 0.0
+        best_frame = 0
+        processed_frames = 0
+        no_detection_frames = 0
+        no_position_frames = 0
+        no_frame_polls = 0
+        deadline = time.perf_counter() + max(3.0, float(max_frames) * 0.5)
+
+        while processed_frames < max_frames and time.perf_counter() < deadline:
+            if ctx.stop_event.is_set():
+                return {
+                    "object_position": None,
+                    "confidence": 0.0,
+                    "failure_reason": "用户停止",
+                    "processed_frames": processed_frames,
+                }
+
+            result = pipelined.get_latest_detection()
+            if result is None:
+                no_frame_polls += 1
+                time.sleep(0.005)
+                continue
+
+            processed_frames += 1
+            target = result.get("target")
+            capture_ms = float(result.get("capture_ms", 0.0) or 0.0)
+
+            if target is None:
+                no_detection_frames += 1
+                if self.on_log:
+                    self.on_log(
+                        f"📊 {camera_type} 帧{processed_frames}/{max_frames}: 未检测到目标"
+                    )
+                continue
+
+            object_position = result.get("object_position")
+            if (
+                not object_position
+                or len(object_position.get("camera_coords", [])) < 3
+            ):
+                no_position_frames += 1
+                target_score = float(target.get("score", target.get("confidence", 0.0)) or 0.0)
+                if self.on_log:
+                    self.on_log(
+                        f"📊 {camera_type} 帧{processed_frames}/{max_frames}: "
+                        f"检测到目标(score={target_score:.2f})，但深度/掩膜坐标计算失败"
+                    )
+                continue
+
+            conf = float(object_position.get("confidence", target.get("score", 0.0)) or 0.0)
+            source = object_position.get("source", "unknown")
+            if self.on_log:
+                self.on_log(
+                    f"📊 {camera_type} 帧{processed_frames}/{max_frames}: "
+                    f"置信度={conf:.2f} 来源={source} capture={capture_ms:.1f}ms"
+                )
+            if conf > best_confidence:
+                best_result = object_position
+                best_confidence = conf
+                best_frame = processed_frames
+            if best_confidence >= early_confidence:
+                if self.on_log:
+                    self.on_log(f"✅ 置信度充足({best_confidence:.2f})，提前退出")
+                break
+
+        if best_result is not None:
+            return {
+                "object_position": best_result,
+                "confidence": best_confidence,
+                "best_frame": best_frame,
+                "processed_frames": processed_frames,
+                "failure_reason": "",
+            }
+
+        if processed_frames == 0:
+            reason = f"{camera_type} 未获取到有效图像帧(流水线无结果,no_frame_polls={no_frame_polls})"
+        elif no_position_frames > 0:
+            reason = (
+                f"检测到目标但深度/掩膜坐标计算失败"
+                f"(无检测{no_detection_frames}帧, 坐标失败{no_position_frames}帧)"
+            )
+        else:
+            reason = f"未检测到物品(处理{processed_frames}帧)"
+        return {
+            "object_position": None,
+            "confidence": best_confidence,
+            "processed_frames": processed_frames,
+            "failure_reason": reason,
+        }
+
     def _detect_camera_object_for_flow(self, vision, camera_type, ctx, max_frames, early_confidence):
         """Run flow camera detection through the same numpy packet path as camera test."""
         worker = self._get_camera_test_worker(camera_type)
@@ -505,8 +612,33 @@ class FlowExecutor:
 
         # Lazy import: 纯 Python 采集线程，无 Qt 依赖。
         from ..vision.capture_worker import CaptureWorker
+        from ..vision.vision_system import PipelinedDetector
 
         vision.reset_tracking()
+
+        # 优先尝试流水线模式（采集/推理解耦，提升 GPU 占用）；启动失败则回退串行。
+        # 回退判定：PipelinedDetector.start() 内部会捕获异常并返回 False
+        # （例如 CaptureWorker 不支持 frame_queue 参数时，工厂回调抛 TypeError）。
+        # position_worker_enabled（默认 False）：启用时 InferenceWorker 只跑 detection，
+        # 位置计算交给独立 PositionWorker 线程，避免 CPU 位置计算阻塞 GPU 推理。
+        # 高风险（kalman_3d 等共享状态可能竞争），仅诊断/实验用。
+        pipeline_cfg = get_pipeline_config()
+        pipelined = PipelinedDetector(
+            capture_worker_factory=lambda frame_queue: CaptureWorker(
+                vision, frame_queue=frame_queue
+            ),
+            vision_system=vision,
+            position_worker_enabled=bool(pipeline_cfg.get("position_worker_enabled", False)),
+        )
+        if pipelined.start():
+            try:
+                return self._detect_camera_object_pipelined(
+                    pipelined, vision, camera_type, ctx, max_frames, early_confidence
+                )
+            finally:
+                pipelined.stop()
+
+        # 回退串行模式（原逻辑：capture_thread + run_detection_tracked 逐帧串行）
         capture_thread = CaptureWorker(vision)
         capture_thread.start()
 
@@ -640,6 +772,9 @@ class FlowExecutor:
             self.controller._active_flow_thread = self
 
             if not self.controller.acquire_motion("flow"):
+                # 清理已设置的引用，避免泄漏
+                self._ctx = None
+                self.controller._active_flow_thread = None
                 if self.on_log:
                     self.on_log("❌ 无法获取运动控制权，可能有其他操作正在执行")
                 self.last_result = FlowResult.failure(
@@ -746,6 +881,13 @@ class FlowExecutor:
                                     self._fail_module(ctx, i, name, "直线运动失败")
                                     return self.last_result
                                 self._log_force_guard_if_triggered(i, name)
+                            else:
+                                self._fail_module(
+                                    ctx, i, name,
+                                    f"camera_detected 目标仅支持 MovL 运动方式，当前为 {module['params']['motion_type']}",
+                                    code="INVALID_MOTION_TYPE",
+                                )
+                                return self.last_result
                             move_timing = getattr(self.controller, '_last_move_timing', {})
                         elif module['params']['target'] == "saved_point":
                             point_name = module['params'].get('point_name', '')

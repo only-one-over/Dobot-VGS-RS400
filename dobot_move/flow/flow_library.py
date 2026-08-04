@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import shutil
 import uuid
@@ -13,23 +14,27 @@ from typing import Any
 from ..config.config_manager import get_grasp_flow_file
 
 
+logger = logging.getLogger(__name__)
+
 FLOW_SCHEMA_VERSION = 3
 LEGACY_FLOW_ID = "flow-1"
 SUPPORTED_CAMERA_TYPES = {"D435i", "D405"}
 
-# Default role → flow_id mapping for the three fixed production flows.
+# Default role → flow_id mapping for the fixed production flows.
+# ``error_recovery`` is intentionally absent: the runtime no longer
+# dispatches an error-recovery hook, so the role is not required. If a
+# user library still carries the mapping it is preserved (and validated)
+# but never read by the state machine.
 DEFAULT_FLOW_ROLES: dict[str, str] = {
     "low_hook": "flow-low-hook",
     "high_hook": "flow-high-hook",
-    "error_recovery": "flow-error-recovery",
 }
 
-# Display names for the three fixed role flows (used during migration
+# Display names for the fixed role flows (used during migration
 # when a role flow is missing and must be created).
 ROLE_FLOW_NAMES: dict[str, str] = {
     "flow-low-hook": "低钩子提钩",
     "flow-high-hook": "高钩子提钩",
-    "flow-error-recovery": "错误回钩",
 }
 
 
@@ -74,16 +79,37 @@ class FlowLibrary:
         migrate: bool = True,
     ) -> "FlowLibrary":
         flow_path = Path(path or get_grasp_flow_file())
+        raw: Any = None
         if flow_path.exists():
-            with open(flow_path, "r", encoding="utf-8") as handle:
-                raw = json.load(handle)
+            try:
+                with open(flow_path, "r", encoding="utf-8") as handle:
+                    raw = json.load(handle)
+            except json.JSONDecodeError:
+                # File corrupted: try to recover from the .bak backup
+                # written alongside the file by ``save()``. Never
+                # silently fall back to defaults here — that would
+                # overwrite the user's data once the caller saves.
+                bak_path = flow_path.with_suffix(flow_path.suffix + ".bak")
+                recovered: Any = None
+                if bak_path.exists():
+                    try:
+                        with open(bak_path, "r", encoding="utf-8") as bak_handle:
+                            recovered = json.load(bak_handle)
+                        logger.warning("从备份恢复流程库: %s", bak_path)
+                    except json.JSONDecodeError:
+                        recovered = None
+                if recovered is None:
+                    raise ValueError(
+                        f"流程库文件损坏且备份不可用: {flow_path}"
+                    )
+                raw = recovered
         else:
             raw = copy.deepcopy(default_modules or [])
 
         migrated = isinstance(raw, list)
         if migrated:
             raw = cls._legacy_payload(raw)
-        # Schema v2 → v3 auto-migration: ensure flow_roles and the three
+        # Schema v2 → v3 auto-migration: ensure flow_roles and the two
         # fixed role flows exist while preserving user modules data.
         schema_migrated = False
         if migrate and isinstance(raw, dict):
@@ -99,11 +125,11 @@ class FlowLibrary:
     def _migrate_to_v3(payload: dict[str, Any]) -> dict[str, Any]:
         """Migrate a pre-v3 payload to schema_version=3.
 
-        - Adds the ``flow_roles`` mapping (default three-role mapping if
+        - Adds the ``flow_roles`` mapping (default two-role mapping if
           missing or partial).
-        - Ensures the three fixed role flows (flow-low-hook /
-          flow-high-hook / flow-error-recovery) exist; creates empty
-          modules flows for any that are missing.
+        - Ensures the two fixed role flows (flow-low-hook /
+          flow-high-hook) exist; creates empty modules flows for any
+          that are missing.
         - Preserves existing flows and their modules data verbatim.
         - Repairs ``main_flow_id`` / ``last_edited_flow_id`` if they no
           longer point to existing flows.
@@ -142,7 +168,7 @@ class FlowLibrary:
             flow_roles.setdefault(role, fid)
         payload["flow_roles"] = flow_roles
 
-        # Ensure three fixed role flows exist; create empty ones if missing.
+        # Ensure two fixed role flows exist; create empty ones if missing.
         # If a role flow's default display name collides with an existing
         # user flow name, append "_migrated" suffix to disambiguate.
         # flow_id is preserved (still uses the DEFAULT_FLOW_ROLES mapping).
@@ -186,7 +212,7 @@ class FlowLibrary:
     @staticmethod
     def _legacy_payload(modules: list[dict[str, Any]]) -> dict[str, Any]:
         # Emitted as schema_version=2 so that ``load()`` routes through
-        # ``_migrate_to_v3`` to inject ``flow_roles`` and the three fixed
+        # ``_migrate_to_v3`` to inject ``flow_roles`` and the two fixed
         # role flows alongside the legacy flow.
         return {
             "schema_version": 2,
@@ -244,7 +270,7 @@ class FlowLibrary:
             last_edited_flow_id = main_flow_id
 
         # Validate flow_roles mapping (all role → flow_id must point to
-        # existing flows). Default the three production roles if absent.
+        # existing flows). Default the two production roles if absent.
         raw_flow_roles = payload.get("flow_roles")
         flow_roles: dict[str, str] = {}
         if isinstance(raw_flow_roles, dict):

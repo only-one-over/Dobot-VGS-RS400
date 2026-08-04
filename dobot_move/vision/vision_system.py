@@ -12,11 +12,14 @@ except ImportError:
     raise ImportError("缺少依赖 opencv-python，请执行: pip install opencv-python")
 import logging
 import os
+import queue
+import threading
 import time
 from dataclasses import dataclass
 
 from ..config.config_manager import (
     get_calibration,
+    get_camera_config,
     get_camera_handeye_matrix,
     load_config,
     resolve_camera_model_path,
@@ -29,38 +32,203 @@ from ..robot.transform_utils import euler2rot as _euler2rot, pose2matrix as _pos
 logger = logging.getLogger(__name__)
 _CUDA_RUNTIME_FAILURE = None
 _CUDA_DLL_HANDLES = []
+# 预处理 UMat 可用性缓存：None=未检测, True/False=已检测并缓存
+_PREPROCESS_USE_UMAT: bool | None = None
 
 
-def preload_onnx_runtime_dlls(ort):
-    """Preload ONNX Runtime dependencies, including a cuDNN 9 Windows sublibrary."""
-    if hasattr(ort, "preload_dlls"):
-        ort.preload_dlls(directory="")
+def _setup_nvidia_dll_path() -> None:
+    """把 nvidia.* 包的 DLL 目录注册到 Windows DLL 搜索路径（仅 Windows）。
+
+    新版 nvidia-cublas/nvidia-cufft 等包（无 cu13 后缀）把 DLL 合并到
+    ``nvidia/cu13/bin/x86_64/`` 下，onnxruntime 默认不搜索该路径，导致
+    ``import onnxruntime`` 时打印 "Failed to load cublas64_13.dll" 警告，
+    虽不影响延迟加载的 CUDA EP 实际工作，但日志噪声大。
+
+    本函数在模块加载时调用一次，使用 ``os.add_dll_directory``（Python 3.8+
+    推荐方式，比修改 PATH 环境变量更可靠）注册 DLL 搜索目录，确保后续任何
+    ``import onnxruntime`` 或 ``ctypes.CDLL`` 都能找到 nvidia DLL。
+
+    失败时静默（nvidia 包未安装时 ``find_spec`` 返回 None，跳过即可），
+    不阻塞模块导入。
+    """
     if os.name != "nt":
         return
+    try:
+        import importlib.util
+        from pathlib import Path
+
+        nvidia_pkg_names = (
+            "nvidia.cudnn",
+            "nvidia.cu13",
+            "nvidia.cuda_runtime",
+            "nvidia.cublas",
+            "nvidia.cufft",
+            "nvidia.curand",
+            "nvidia.cuda_nvrtc",
+            "nvidia.nvjitlink",
+        )
+        existing_path = os.environ.get("PATH", "")
+        added = 0
+        for pkg_name in nvidia_pkg_names:
+            pkg_spec = importlib.util.find_spec(pkg_name)
+            if pkg_spec is None:
+                continue
+            pkg_locations = list(pkg_spec.submodule_search_locations or [])
+            if not pkg_locations:
+                continue
+            pkg_root = Path(pkg_locations[0])
+            for sub in ("bin", "bin/x86_64"):
+                cand = pkg_root / sub
+                if not cand.is_dir():
+                    continue
+                cand_str = str(cand.resolve())
+                # 优先用 os.add_dll_directory（Python 3.8+ 推荐）
+                try:
+                    os.add_dll_directory(cand_str)
+                    added += 1
+                except (OSError, AttributeError):
+                    # 回退到 PATH 修改（兼容旧 Python 或异常情况）
+                    if cand_str not in existing_path:
+                        existing_path = cand_str + os.pathsep + existing_path
+        if existing_path != os.environ.get("PATH", ""):
+            os.environ["PATH"] = existing_path
+        if added:
+            logger.debug("已注册 %d 个 nvidia DLL 搜索目录", added)
+    except Exception as exc:
+        logger.debug("设置 nvidia DLL 搜索路径失败（可忽略）: %s", exc)
+
+
+# 模块加载时尽早设置 PATH，让后续 import onnxruntime 能找到 nvidia DLL。
+_setup_nvidia_dll_path()
+
+
+def _detect_umat_available() -> bool:
+    """检测当前 OpenCV 环境是否可用 UMat（OpenCL/Vulkan 后端）执行 GPU 加速预处理。
+
+    UMat 能把 preprocess_image_yolov8 中的 resize/cvtColor/画布填充搬到 GPU
+    执行，降低 CPU 开销。本函数在首次调用 preprocess_image_yolov8 时被调用
+    一次，结果缓存到模块级 ``_PREPROCESS_USE_UMAT``，避免重复检测开销。
+
+    检测方式：构造一张 16x16 的零图，依次尝试转 UMat、resize、``.get()``
+    转回 ndarray，任一步抛异常即视为 UMat 不可用（返回 False）。
+    """
+    try:
+        test_mat = cv2.UMat(np.zeros((16, 16, 3), np.uint8))
+        resized = cv2.resize(test_mat, (8, 8))
+        _ = resized.get()
+        return True
+    except Exception:
+        return False
+
+
+def preload_onnx_runtime_dlls(ort) -> bool:
+    """Preload ONNX Runtime dependencies, including a cuDNN 9 Windows sublibrary.
+
+    返回 True 表示 DLL 预加载成功（或非 Windows 平台），False 表示 cuDNN
+    Tensor IR 子库加载失败，调用方应跳过 CUDA 分支直接走 CPU。
+    """
+    if hasattr(ort, "preload_dlls"):
+        try:
+            ort.preload_dlls(directory="")
+        except Exception as exc:
+            logger.warning("ort.preload_dlls 调用失败: %s", exc)
+    if os.name != "nt":
+        return True
 
     try:
         import ctypes
         import importlib.util
         from pathlib import Path
 
+        # nvidia DLL 目录已由模块级 _setup_nvidia_dll_path() 加入 PATH，
+        # 此处无需重复设置。
+
         spec = importlib.util.find_spec("nvidia.cudnn")
-        locations = list(spec.submodule_search_locations or []) if spec else []
+        if spec is None:
+            logger.warning("nvidia.cudnn 包未安装，跳过 cuDNN Tensor IR 子库预加载")
+            return False
+        locations = list(spec.submodule_search_locations or [])
         if not locations:
-            return
+            logger.warning(
+                "nvidia.cudnn 包缺少子模块搜索路径，跳过 cuDNN Tensor IR 子库预加载"
+            )
+            return False
         tensor_ir_path = (
             Path(locations[0]) / "bin" / "cudnn_engines_tensor_ir64_9.dll"
         )
-        if tensor_ir_path.is_file():
-            resolved = str(tensor_ir_path.resolve())
-            already_loaded = any(
-                getattr(handle, "_name", None) == resolved
-                for handle in _CUDA_DLL_HANDLES
+        if not tensor_ir_path.is_file():
+            logger.warning(
+                "cuDNN Tensor IR 子库文件不存在: %s", tensor_ir_path,
             )
-            if not already_loaded:
-                _CUDA_DLL_HANDLES.append(ctypes.CDLL(resolved))
-                logger.debug("已预加载 cuDNN Tensor IR 子库: %s", resolved)
+            return False
+        resolved = str(tensor_ir_path.resolve())
+        already_loaded = any(
+            getattr(handle, "_name", None) == resolved
+            for handle in _CUDA_DLL_HANDLES
+        )
+        if not already_loaded:
+            _CUDA_DLL_HANDLES.append(ctypes.CDLL(resolved))
+            logger.debug("已预加载 cuDNN Tensor IR 子库: %s", resolved)
+
+        # 新增：检查其他 CUDA 依赖（cudart / cublas / cublasLt / cufft）
+        # onnxruntime-gpu CUDA EP 还依赖 cudart64_*.dll、cublas64_*.dll、
+        # cublasLt64_*.dll、cufft64_*.dll，缺失任一都会导致 CUDA 退回 CPU。
+        #
+        # 兼容两种 nvidia 包目录结构：
+        # 1. 旧包（带 cu12 后缀，如 nvidia-cublas-cu12）：
+        #    nvidia/cublas/bin/cublas64_12.dll
+        #    nvidia/cuda_runtime/bin/cudart64_12.dll
+        #    nvidia/cufft/bin/cufft64_*.dll
+        # 2. 新包（无后缀，如 nvidia-cublas）合并到 nvidia.cu13 命名空间：
+        #    nvidia/cu13/bin/x86_64/cublas64_13.dll
+        #    nvidia/cu13/bin/x86_64/cudart64_13.dll
+        #    nvidia/cu13/bin/x86_64/cufft64_12.dll
+        #
+        # 每个 DLL 在多个候选包/子目录中查找，命中即视为已就绪。
+        _CUDA_DEPS = (
+            # (dll_prefix, (候选包名列表), (候选子目录列表))
+            ("cudart64", ("nvidia.cuda_runtime", "nvidia.cu13"), ("bin", "bin/x86_64")),
+            ("cublas64", ("nvidia.cublas", "nvidia.cu13"), ("bin", "bin/x86_64")),
+            ("cublasLt64", ("nvidia.cublas", "nvidia.cu13"), ("bin", "bin/x86_64")),
+            ("cufft64", ("nvidia.cufft", "nvidia.cu13"), ("bin", "bin/x86_64")),
+        )
+        missing = []
+        for dll_prefix, pkg_candidates, subdirs in _CUDA_DEPS:
+            found = False
+            for pkg_name in pkg_candidates:
+                if found:
+                    break
+                pkg_spec = importlib.util.find_spec(pkg_name)
+                if pkg_spec is None:
+                    continue
+                pkg_locations = list(pkg_spec.submodule_search_locations or [])
+                if not pkg_locations:
+                    continue
+                for subdir in subdirs:
+                    bin_dir = Path(pkg_locations[0]) / subdir
+                    if not bin_dir.is_dir():
+                        continue
+                    if list(bin_dir.glob(f"{dll_prefix}*.dll")):
+                        found = True
+                        break
+            if not found:
+                missing.append(
+                    f"{dll_prefix}*.dll "
+                    f"(在候选包 {pkg_candidates} 的 {subdirs}/ 目录中均未找到)"
+                )
+
+        if missing:
+            for m in missing:
+                logger.warning(
+                    "CUDA 依赖缺失: %s，请运行 "
+                    "`pip install --force-reinstall onnxruntime-gpu[cuda,cudnn]`",
+                    m,
+                )
+            return False
+        return True
     except Exception as exc:
         logger.warning("预加载 cuDNN Tensor IR 子库失败，将通过真实推理检测: %s", exc)
+        return False
 
 try:
     import dobot_core
@@ -135,12 +303,40 @@ class VisionSystem:
             int(performance_config.get("performance_log_interval_frames", 30)),
         )
         self._perf_stats = {}
+        # yolo_every_n: 每 N 帧跑一次完整 YOLO 推理（session.run），其余帧只用 ByteTrack
+        # 跟踪预测，用于在流水线模式下提升 inference_fps。从 performance.visual_servo
+        # 读取，默认 3（与 config_manager.DEFAULT_VISUAL_SERVO_CONFIG 一致）。
+        _vs_cfg = performance_config.get("visual_servo", {}) or {}
+        self.yolo_every_n = max(1, int(_vs_cfg.get("yolo_every_n", 3)))
+        self._yolo_frame_counter = 0
         self.camera_available = False
         self._consecutive_capture_failures = 0
         self._max_consecutive_failures = 5
+        # 相机硬件 fps 测量：记录上一帧 RealSense 时间戳，用于计算相邻帧 diff
+        self._last_frame_timestamp_ms = 0.0  # 上一帧的硬件时间戳（ms）
+        self._low_camera_fps_count = 0  # 连续低 fps 计数（camera_fps < 25）
+        # 诊断帧缓存：弱引用式注入，默认 None 表示未注册。由 runtime 层挂载
+        # DiagnosticFrameCache 实例；InferenceWorker 在每帧推理完成后 fan-out 写入，
+        # 复用生产推理结果避免重复 session.run。不在此 import diagnostic_frame_cache
+        # 模块，避免 vision 层依赖 runtime 层导致循环导入。
+        self._diagnostic_cache = None
         self.pipeline = None
         self.profile = None
         self.depth_scale = 0.001
+        # 相机配置：enable_align / enable_depth_filter 等开关，缺失时取默认值
+        camera_config = get_camera_config()
+        self._enable_align = bool(camera_config.get("enable_align", True))
+        self._enable_depth_filter = bool(camera_config.get("enable_depth_filter", True))
+        if not self._enable_align:
+            logger.warning(
+                "相机深度对齐已关闭（camera.enable_align=false），"
+                "深度未对齐到彩色视角，位置计算可能不准（仅诊断用）"
+            )
+        if not self._enable_depth_filter:
+            logger.warning(
+                "深度滤波已关闭（camera.enable_depth_filter=false），"
+                "深度噪声可能增加（仅诊断用）"
+            )
         # 深度范围：优先从配置读取，无配置时使用默认值
         depth_range_config = config.get("camera", {}).get("depth_range", {})
         if camera_type == "D405":
@@ -160,17 +356,17 @@ class VisionSystem:
         self.is_seg_model = True
         self.fx, self.fy = None, None
         self.cx, self.cy = None, None
-        
+
         calib_data = get_calibration(camera_type)
         if not calib_data or "cam_to_flange_pose" not in calib_data:
             raise ValueError(f"未找到相机 {camera_type} 的标定数据")
-        self.T_cam2gripper = get_camera_handeye_matrix(camera_type)
+        self.T_cam2flange = get_camera_handeye_matrix(camera_type)
         logger.info(f"✅ 加载 {camera_type} 手眼标定矩阵 T_hand_eye:")
-        logger.debug(np.round(self.T_cam2gripper, 4))
+        logger.debug(np.round(self.T_cam2flange, 4))
 
         self.model_path = resolve_camera_model_path(camera_type, model_path)
         self._initialize_onnx_model()
-        
+
         logger.info("正在启动相机...")
         try:
             self.pipeline = rs.pipeline()
@@ -205,15 +401,15 @@ class VisionSystem:
             self.fx, self.fy = self.color_intrin.fx, self.color_intrin.fy
             self.cx, self.cy = self.color_intrin.ppx, self.color_intrin.ppy
             logger.debug(f"✅ 相机内参(彩色): fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}")
-            
+
             self.camera_available = True
             logger.info("✅ 相机初始化成功 (使用彩色相机内参)")
-                
+
         except Exception as e:
             self.pipeline = None
             self.profile = None
             raise RuntimeError(f"相机初始化失败: {e}")
-        
+
         if self.enable_tracking:
             self.tracker = BYTETracker(track_thresh=0.5, match_thresh=0.8, track_buffer=30)
             self.tracked_target_id = None
@@ -290,7 +486,7 @@ class VisionSystem:
         try:
             import onnxruntime as ort
 
-            preload_onnx_runtime_dlls(ort)
+            dll_preload_ok = preload_onnx_runtime_dlls(ort)
             available_providers = ort.get_available_providers()
             self.inference_provider = "CPU"
             using_cuda = False
@@ -298,11 +494,48 @@ class VisionSystem:
             if (
                 'CUDAExecutionProvider' in available_providers
                 and _CUDA_RUNTIME_FAILURE is None
+                and dll_preload_ok
             ):
-                self.session = ort.InferenceSession(
-                    self.model_path,
-                    providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
-                )
+                # 配置 SessionOptions：启用内存模式重用和图优化
+                sess_options = ort.SessionOptions()
+                sess_options.enable_mem_pattern = True
+                sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+                # CUDA EP provider_options：用显存换速度
+                # 注意：onnxruntime 要求 provider_options 的值必须是字符串类型
+                cuda_provider_options = {
+                    # 允许 cuDNN 卷积使用最大工作区显存，提升卷积算子性能
+                    "cudnn_conv_use_max_workspace": "1",
+                    # 按请求大小扩展显存 arena，避免过度预占用显存
+                    "arena_extend_strategy": "kSameAsRequested",
+                    # 启用可调算子（TunableOp），自动选择最优 GPU kernel 实现
+                    "tunable_op_enable": "1",
+                    # 禁用 CUDA Graph 捕获（输入形状动态变化时不宜启用）
+                    "enable_cuda_graph": "0",
+                }
+
+                try:
+                    self.session = ort.InferenceSession(
+                        self.model_path,
+                        sess_options=sess_options,
+                        providers=[
+                            ('CUDAExecutionProvider', cuda_provider_options),
+                            'CPUExecutionProvider',
+                        ],
+                    )
+                except Exception as cuda_opt_exc:
+                    # 旧版 onnxruntime 可能不支持某些 provider_options key，
+                    # 回退到不带 provider_options 的简单 providers 列表，保证兼容性
+                    logger.warning(
+                        "CUDA provider_options 创建失败，回退到默认配置: %s",
+                        str(cuda_opt_exc).splitlines()[0][:200],
+                    )
+                    self.session = ort.InferenceSession(
+                        self.model_path,
+                        sess_options=sess_options,
+                        providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
+                    )
                 active_providers = self.session.get_providers()
                 if 'CUDAExecutionProvider' in active_providers:
                     using_cuda = True
@@ -320,7 +553,14 @@ class VisionSystem:
                     self.model_path,
                     providers=['CPUExecutionProvider'],
                 )
-                if _CUDA_RUNTIME_FAILURE is not None:
+                if (
+                    not dll_preload_ok
+                    and 'CUDAExecutionProvider' in available_providers
+                    and _CUDA_RUNTIME_FAILURE is None
+                ):
+                    self.inference_provider = "CPU (DLL预加载失败)"
+                    logger.warning("DLL 预加载失败，跳过 CUDA 直接走 CPU")
+                elif _CUDA_RUNTIME_FAILURE is not None:
                     self.inference_provider = "CPU (CUDA运行失败回退)"
                     logger.warning(
                         "本进程已检测到 CUDA 运行环境异常，%s 直接使用 CPU: %s",
@@ -356,6 +596,7 @@ class VisionSystem:
                     error_summary,
                 )
                 logger.debug("CUDA 首次推理完整异常", exc_info=True)
+                self._log_cuda_diagnostic()
                 self.session = ort.InferenceSession(
                     self.model_path,
                     providers=['CPUExecutionProvider'],
@@ -428,6 +669,69 @@ class VisionSystem:
                 f"{self.camera_type} 模型加载失败 ({self.model_path}): {exc}"
             ) from exc
 
+    def _log_cuda_diagnostic(self):
+        """打印 CUDA 依赖诊断信息，便于用户排查 GPU 退回 CPU 的原因。"""
+        try:
+            import onnxruntime as ort
+            import importlib.util
+            from pathlib import Path
+
+            providers = ort.get_available_providers()
+            logger.warning("=== CUDA 诊断 ===")
+            logger.warning("available_providers: %s", providers)
+
+            # 与 preload_onnx_runtime_dlls 一致的 _CUDA_DEPS 检测逻辑，
+            # 用于列出具体缺失的 DLL 文件名（如 cudart64_*.dll）。
+            _CUDA_DEPS = [
+                ("nvidia.cudnn", "cudnn_engines_tensor_ir64_9", "bin"),
+                ("nvidia.cuda_runtime", "cudart64", "bin"),
+                ("nvidia.cublas", "cublas64", "bin"),
+                ("nvidia.cublas", "cublasLt64", "bin"),
+                ("nvidia.cufft", "cufft64", "bin"),
+            ]
+
+            missing_dlls = []
+            for pkg_name, dll_prefix, subdir in _CUDA_DEPS:
+                spec = importlib.util.find_spec(pkg_name)
+                if spec is None:
+                    missing_dlls.append(
+                        f"{dll_prefix}*.dll ({pkg_name} 包未安装)"
+                    )
+                    logger.warning("  %s: 未安装", pkg_name)
+                    continue
+                logger.warning("  %s: 已安装", pkg_name)
+                locations = list(spec.submodule_search_locations or [])
+                if not locations:
+                    missing_dlls.append(
+                        f"{dll_prefix}*.dll ({pkg_name} 包缺少子模块搜索路径)"
+                    )
+                    continue
+                bin_dir = Path(locations[0]) / subdir
+                if not bin_dir.is_dir():
+                    missing_dlls.append(
+                        f"{dll_prefix}*.dll ({pkg_name} 包缺少 {subdir}/ 目录)"
+                    )
+                    continue
+                matches = list(bin_dir.glob(f"{dll_prefix}*.dll"))
+                if not matches:
+                    missing_dlls.append(
+                        f"{dll_prefix}*.dll "
+                        f"({pkg_name} 包的 {subdir}/ 目录中无匹配文件)"
+                    )
+
+            if missing_dlls:
+                logger.warning("缺失 DLL 列表:")
+                for m in missing_dlls:
+                    logger.warning("  - %s", m)
+                logger.warning(
+                    "修复命令: pip install --force-reinstall "
+                    "onnxruntime-gpu[cuda,cudnn]"
+                )
+            else:
+                logger.warning("所有 CUDA 依赖 DLL 均已就绪")
+        except Exception as e:
+            logger.warning("CUDA 诊断收集失败: %s", e)
+
     def warmup_onnx(self):
         """ONNX session warmup：运行一次 dummy inference 消除 CUDA JIT 延迟"""
         if self.session is None:
@@ -456,11 +760,25 @@ class VisionSystem:
             return
 
         count = max(1, stats["count"])
+        # 计算 fps：基于"两次日志输出之间的实际时间"。
+        # 首次（last_log == 0.0）尚无前一次输出基准，不算 fps；
+        # 从第二次开始用 count / elapsed 计算。
+        fps_str = ""
+        if stats["last_log"] > 0:
+            elapsed = now - stats["last_log"]
+            if elapsed > 0:
+                fps = count / elapsed
+                fps_str = f"fps={fps:.1f} "
         parts = [
-            f"{key}={total / count:.1f}ms"
+            f"{key}={total / count:.1f}"
+            if key.endswith("_fps")
+            else f"{key}={total / count:.1f}ms"
             for key, total in sorted(stats["totals"].items())
         ]
-        logger.info("performance[%s] frames=%s %s", scope, stats["count"], " ".join(parts))
+        logger.info(
+            "performance[%s] frames=%s %s%s",
+            scope, stats["count"], fps_str, " ".join(parts),
+        )
         stats["count"] = 0
         stats["totals"] = {}
         stats["last_log"] = now
@@ -705,14 +1023,14 @@ class VisionSystem:
         相机坐标 → 末端坐标
         使用手眼矩阵进行直接转换（相机 → 末端的变换）
         """
-        if self.T_cam2gripper is None:
+        if self.T_cam2flange is None:
             raise ValueError("手眼标定矩阵未初始化，无法转换坐标")
 
         # 相机齐次坐标 [Xc,Yc,Zc,1]
         point_cam = np.array([camera_coords[0], camera_coords[1], camera_coords[2], 1.0])
-        
+
         # 直接使用手眼矩阵进行转换（相机 → 末端）
-        point_end = self.T_cam2gripper @ point_cam
+        point_end = self.T_cam2flange @ point_cam
 
         logger.debug(f"📍相机坐标: {camera_coords}")
         logger.debug(f"🔄末端坐标: {point_end[:3]}")
@@ -733,9 +1051,9 @@ class VisionSystem:
 
         # 最终基座坐标
         point_base = T_tool2base @ point_end
-        
+
         logger.debug(f"🏠 计算得到基座坐标: {point_base[:3]}")
-        
+
         return point_base[:3]
 
     def capture_frames(self):
@@ -748,12 +1066,17 @@ class VisionSystem:
             if self._consecutive_capture_failures >= self._max_consecutive_failures:
                 self.camera_available = False
             return None, None
-        
+
         try:
             start = time.perf_counter()
             frames = self.pipeline.wait_for_frames(timeout_ms=self.capture_timeout_ms)
             wait_done = time.perf_counter()
-            aligned_frames = self.align.process(frames)
+            # camera.enable_align=false 时跳过深度→彩色对齐（诊断用），
+            # 此时 aligned_frames 即原始 frames，深度未对齐到彩色视角。
+            if self._enable_align:
+                aligned_frames = self.align.process(frames)
+            else:
+                aligned_frames = frames
             align_done = time.perf_counter()
             depth_frame = aligned_frames.get_depth_frame()
             color_frame = aligned_frames.get_color_frame()
@@ -765,18 +1088,47 @@ class VisionSystem:
                     logger.warning("连续 %d 次捕获帧失败，标记相机不可用", self._consecutive_capture_failures)
                 return None, None
 
-            if self.depth_processor is not None:
+            # camera.enable_depth_filter=false 时跳过深度滤波链（诊断用）。
+            if self._enable_depth_filter and self.depth_processor is not None:
                 depth_frame = self.depth_processor.process_frame(depth_frame)
             filter_done = time.perf_counter()
-            self._record_performance(
-                "capture",
-                {
-                    "wait": (wait_done - start) * 1000.0,
-                    "align": (align_done - wait_done) * 1000.0,
-                    "depth_filter": (filter_done - align_done) * 1000.0,
-                    "total": (filter_done - start) * 1000.0,
-                },
-            )
+
+            # 计算相机硬件 fps（基于 RealSense 帧时间戳差）
+            # 首帧时 _last_frame_timestamp_ms == 0，跳过 diff 计算，camera_fps 保持 0.0
+            camera_fps = 0.0
+            try:
+                frame_ts_ms = float(depth_frame.get_timestamp())
+                if (
+                    self._last_frame_timestamp_ms > 0
+                    and frame_ts_ms > self._last_frame_timestamp_ms
+                ):
+                    diff_ms = frame_ts_ms - self._last_frame_timestamp_ms
+                    if diff_ms > 0:
+                        camera_fps = 1000.0 / diff_ms
+                self._last_frame_timestamp_ms = frame_ts_ms
+            except Exception:
+                pass
+
+            timings = {
+                "wait": (wait_done - start) * 1000.0,
+                "align": (align_done - wait_done) * 1000.0,
+                "depth_filter": (filter_done - align_done) * 1000.0,
+                "total": (filter_done - start) * 1000.0,
+            }
+            if camera_fps > 0:
+                timings["camera_fps"] = camera_fps
+                # 连续低 fps 告警（camera_fps < 25 视为异常）
+                if camera_fps < 25.0:
+                    self._low_camera_fps_count += 1
+                    if self._low_camera_fps_count >= 3:
+                        logger.warning(
+                            "相机硬件 fps 连续 %d 次低于 25（当前 %.1f），"
+                            "可能受 USB 带宽/分辨率/align 影响",
+                            self._low_camera_fps_count, camera_fps,
+                        )
+                else:
+                    self._low_camera_fps_count = 0
+            self._record_performance("capture", timings)
 
             self._consecutive_capture_failures = 0
 
@@ -816,6 +1168,14 @@ class VisionSystem:
 
     def preprocess_image_yolov8(self, image, target_size=(640, 640)):
         """为YOLOv8模型预处理图像"""
+        global _PREPROCESS_USE_UMAT
+        # 首次调用时检测 UMat 可用性并缓存结果，避免重复检测开销
+        if _PREPROCESS_USE_UMAT is None:
+            _PREPROCESS_USE_UMAT = _detect_umat_available()
+            if not _PREPROCESS_USE_UMAT:
+                logger.warning("OpenCV UMat 不可用，预处理将走 CPU 路径（可能影响 GPU 推理吞吐）")
+        use_umat = _PREPROCESS_USE_UMAT
+
         h, w = image.shape[:2]
 
         # 计算缩放比例，保持宽高比
@@ -823,22 +1183,48 @@ class VisionSystem:
         new_w = int(w * scale)
         new_h = int(h * scale)
 
-        # 调整图像大小
-        resized = cv2.resize(image, (new_w, new_h))
-
-        # 创建画布并填充
-        canvas = np.full((target_size[1], target_size[0], 3), 114, dtype=np.uint8)
         y_offset = (target_size[1] - new_h) // 2
         x_offset = (target_size[0] - new_w) // 2
-        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
 
-        # 转换为RGB和浮点类型
-        rgb_image = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        # resize/画布填充/cvtColor 优先走 UMat（GPU/OpenCL 后端），失败回退 numpy 路径
+        rgb_image = None
+        if use_umat:
+            try:
+                # 输入图像转 UMat，resize/cvtColor/画布填充均在 GPU 上执行
+                umat_in = cv2.UMat(image)
+                umat_resized = cv2.resize(umat_in, (new_w, new_h))
+                # 用 copyMakeBorder 在 UMat 上完成 letterbox 画布填充，
+                # 等价于 numpy 路径的 np.full 画布 + 切片赋值，但避免 UMat
+                # 不支持切片赋值的问题
+                top = y_offset
+                bottom = target_size[1] - new_h - y_offset
+                left = x_offset
+                right = target_size[0] - new_w - x_offset
+                umat_padded = cv2.copyMakeBorder(
+                    umat_resized, top, bottom, left, right,
+                    cv2.BORDER_CONSTANT, value=(114, 114, 114),
+                )
+                umat_rgb = cv2.cvtColor(umat_padded, cv2.COLOR_BGR2RGB)
+                # 转回 ndarray，后续 astype/transpose 仍在 CPU 上执行
+                rgb_image = umat_rgb.get()
+            except Exception as exc:
+                logger.warning("UMat 预处理失败，回退 numpy 路径: %s", exc)
+                rgb_image = None
+
+        if rgb_image is None:
+            # numpy 路径（原逻辑）：resize → np.full 画布 + 切片赋值 → cvtColor
+            resized = cv2.resize(image, (new_w, new_h))
+            canvas = np.full((target_size[1], target_size[0], 3), 114, dtype=np.uint8)
+            canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+            rgb_image = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+
         input_tensor = rgb_image.astype(np.float32) / 255.0
 
         # 转换维度顺序: HWC -> NCHW
-        input_tensor = np.transpose(input_tensor, (2, 0, 1))
-        input_tensor = np.expand_dims(input_tensor, axis=0)
+        # transpose 会产生非连续内存视图，ORT 内部需做隐式拷贝，
+        # 这里显式转为 C-contiguous 内存布局，消除额外拷贝开销
+        input_tensor = np.ascontiguousarray(np.transpose(input_tensor, (2, 0, 1)))
+        input_tensor = np.ascontiguousarray(np.expand_dims(input_tensor, axis=0))
 
         return input_tensor, (w, h), scale, (x_offset, y_offset), (new_w, new_h)
 
@@ -1217,9 +1603,30 @@ class VisionSystem:
             logger.error(f"检测出错: {e}")
             return None
 
-    def run_detection_tracked(self, color_image):
+    def run_detection_tracked(self, color_image, force_inference=False):
         if self.tracker is None:
+            # 无跟踪器时无法跳帧（跳帧依赖 ByteTrack 维护目标状态），直接跑完整检测
             return self.run_detection(color_image)
+
+        # yolo_every_n 跳帧：先判断本帧是否需要跑 YOLO 推理，再更新计数器。
+        # counter 从 0 开始，第一帧 (counter%N==0) 跑检测，确保初始有目标可跟踪；
+        # 之后每 N 帧跑 1 次 session.run，其余帧只用 ByteTrack 预测（_track_only_no_inference）。
+        # 跳帧逻辑在 run_detection_tracked 内部处理，InferenceWorker 调用时自动生效。
+        yolo_every_n = getattr(self, 'yolo_every_n', 1)
+        counter = getattr(self, '_yolo_frame_counter', 0)
+        if force_inference:
+            # force_inference=True 时强制跑检测，且不递增计数器，不影响后续跳帧节奏
+            should_infer = True
+        else:
+            should_infer = (yolo_every_n <= 1) or (counter % yolo_every_n == 0)
+            counter += 1
+            self._yolo_frame_counter = counter
+        logger.debug(
+            "yolo_every_n skip: counter=%d, every_n=%d, infer=%s, force=%s",
+            counter, yolo_every_n, should_infer, force_inference,
+        )
+        if not should_infer:
+            return self._track_only_no_inference(color_image)
 
         detections = self.run_detection(color_image)
         if detections is None:
@@ -1249,6 +1656,24 @@ class VisionSystem:
 
         target = self._select_target(tracked_tracks)
         return target
+
+    def _track_only_no_inference(self, color_image):
+        """跳帧时仅用 ByteTrack 预测目标位置，不跑 session.run。
+
+        对 tracker 当前维护的 tracked_stracks 逐个调用 predict() 推演 bbox（Kalman
+        预测），然后复用 _select_target 选目标。**不调 tracker.update()** —— 因为
+        update([], img_size) 会把所有 tracked 目标立即标记为 lost 并清空（见
+        BYTETracker.update 的空检测分支），那样跳帧反而会丢失跟踪目标。
+
+        若 tracker 无 tracked_stracks 且无可用 kalman 预测，返回 None（由调用方兜底）。
+        """
+        try:
+            for t in self.tracker.tracked_stracks:
+                t.predict()
+        except Exception:
+            logger.exception("跳帧跟踪预测失败")
+            return None
+        return self._select_target(self.tracker.tracked_stracks)
 
     def _select_target(self, tracks):
         if not tracks:
@@ -1367,6 +1792,8 @@ class VisionSystem:
         self.tracked_target_id = None
         self.last_valid_position = None
         self._kalman_last_time = None
+        # 重置跳帧计数器，确保 reset 后与 tracker 状态同步（counter=0 时下一帧跑检测）
+        self._yolo_frame_counter = 0
 
     def close(self):
         """
@@ -1380,3 +1807,423 @@ class VisionSystem:
                 logger.error(f"❌ 关闭相机失败: {e}")
             self.camera_available = False
             self.pipeline = None
+
+
+class InferenceWorker(threading.Thread):
+    """从 frame_queue 取帧，跑 preprocess+session.run+postprocess+位置计算，结果放 result_queue。
+
+    与 :class:`CaptureWorker` 解耦，让 GPU 推理无需等帧采集完成，提升 GPU 占用率。
+
+    线程安全说明：``VisionSystem`` 的 ``tracker`` / ``kalman_3d`` / ``last_valid_position``
+    等状态在 ``run_detection_tracked`` 与 ``calculate_object_position_smoothed`` 中都会被
+    读写。为避免跨线程竞争，本 worker 默认同时执行这两步（preprocess + session.run +
+    postprocess + 位置平滑），把所有视觉状态变更收敛在单一线程内；主线程只读取最终
+    结果做置信度筛选。这样无需给 VisionSystem 加锁，最小改动且无死锁风险。
+
+    启用 PositionWorker 时（``compute_position=False``）：本 worker 只跑 detection 段，
+    把 ``(packet, target, capture_ms)`` 三元组入 intermediate_queue，位置计算交给
+    PositionWorker 线程。**注意**：此模式下 ``run_detection_tracked`` 与
+    ``calculate_object_position_smoothed`` 会并发访问 ``kalman_3d`` /
+    ``_kalman_last_time`` / ``last_valid_position`` 等状态，存在潜在线程安全风险
+    （见 :class:`PositionWorker` 文档），仅诊断/实验用，默认禁用。
+    """
+
+    def __init__(self, vision_system, frame_queue, result_queue, stop_event, compute_position=True):
+        # vision_system: VisionSystem 实例（用于调 run_detection_tracked /
+        #   calculate_object_position_smoothed，复用其 preprocess/session.run/postprocess）
+        # frame_queue: queue.Queue，CaptureWorker 入 ``(packet, capture_ms)``
+        # result_queue: queue.Queue(maxsize=1)，存最新检测结果
+        # stop_event: threading.Event
+        # compute_position: 是否在本 worker 内调用 calculate_object_position_smoothed。
+        #   默认 True 保持原行为。启用 PositionWorker 时传 False，位置计算交给
+        #   PositionWorker 线程，本 worker 只把 (packet, target, capture_ms) 入
+        #   intermediate_queue（由调用方传入，实际是 result_queue 形参）。
+        super().__init__(daemon=True, name="inference-worker")
+        self._vision = vision_system
+        self._frame_queue = frame_queue
+        self._result_queue = result_queue
+        self._stop_event = stop_event
+        self._compute_position = compute_position
+        # 分段计时累计统计（detection / position / total），定期输出后重置
+        # 与 VisionSystem._record_performance 行为一致：日志输出后清零，便于分段观察
+        self._frame_count = 0
+        self._detection_total_ms = 0.0
+        self._position_total_ms = 0.0
+        self._total_ms = 0.0
+        # 复用 vision_system 的 performance_log_interval_frames；缺失时回退默认 30
+        self._log_interval = getattr(vision_system, 'performance_log_interval_frames', 30)
+        self._last_log_time = time.perf_counter()
+
+    def run(self):
+        while not self._stop_event.is_set():
+            try:
+                frame = self._frame_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                result = self._run_inference(frame)
+                # 入 result_queue（maxsize=1），满了丢旧，保证主线程拿到最新结果
+                try:
+                    self._result_queue.put_nowait(result)
+                except queue.Full:
+                    try:
+                        self._result_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self._result_queue.put_nowait(result)
+                    except queue.Full:
+                        pass
+            except Exception as exc:
+                logger.warning("InferenceWorker 推理失败: %s", exc)
+
+    def _run_inference(self, frame):
+        """复用 vision_system 已有方法跑推理 + 位置计算，返回结果字典。
+
+        加分段计时：detection 段（run_detection_tracked，含 preprocess + session.run
+        + postprocess + tracker）和 position 段（calculate_object_position_smoothed）。
+        每 ``_log_interval`` 帧输出一次 INFO 日志，定位瓶颈在 detection 还是 position。
+
+        当 ``self._compute_position`` 为 False（启用 PositionWorker 时）：
+        只跑 detection 段，返回 (packet, target, capture_ms) 三元组交给
+        PositionWorker 线程做位置计算；本 worker 不再访问 kalman_3d 等状态。
+        """
+        packet, capture_ms = frame
+        t0 = time.perf_counter()
+        # run_detection_tracked 内部已包含 preprocess + session.run + postprocess + 跟踪器更新；
+        # yolo_every_n 跳帧也由其内部处理（每 N 帧只跑 1 次 session.run，其余帧只用
+        # ByteTrack 预测），InferenceWorker 无需额外跳帧逻辑。
+        target = self._vision.run_detection_tracked(packet.color_image)
+        t1 = time.perf_counter()
+        if not self._compute_position:
+            # 启用 PositionWorker：本 worker 只跑 detection，把 (packet, target, capture_ms)
+            # 入 intermediate_queue（即调用方传入的 result_queue 形参），位置计算由
+            # PositionWorker 线程执行。分段计时只统计 detection 段。
+            detection_ms = (t1 - t0) * 1000.0
+            self._frame_count += 1
+            self._detection_total_ms += detection_ms
+            self._total_ms += detection_ms
+            if self._frame_count % self._log_interval == 0:
+                now = time.perf_counter()
+                elapsed = now - self._last_log_time
+                fps = self._frame_count / elapsed if elapsed > 0 else 0.0
+                logger.info(
+                    "performance[inference_worker] frames=%d fps=%.1f detection=%.1fms total=%.1fms (position offloaded)",
+                    self._frame_count,
+                    fps,
+                    self._detection_total_ms / self._frame_count,
+                    self._total_ms / self._frame_count,
+                )
+                self._frame_count = 0
+                self._detection_total_ms = 0.0
+                self._total_ms = 0.0
+                self._last_log_time = now
+            # 返回三元组：PositionWorker 从 intermediate_queue 取这个结构
+            return (packet, target, capture_ms)
+        # 位置计算也复用现有方法（同时保持 kalman/tracker 状态单线程访问）
+        object_position = self._vision.calculate_object_position_smoothed(
+            packet.depth_image, packet.color_image, target
+        )
+        t2 = time.perf_counter()
+        detection_ms = (t1 - t0) * 1000.0
+        position_ms = (t2 - t1) * 1000.0
+        total_ms = (t2 - t0) * 1000.0
+        # 累计到统计（与 _record_performance 行为一致：日志输出后清零，便于分段观察）
+        self._frame_count += 1
+        self._detection_total_ms += detection_ms
+        self._position_total_ms += position_ms
+        self._total_ms += total_ms
+        # 定期日志：在 worker 线程内输出，覆盖 detection / position 两段
+        if self._frame_count % self._log_interval == 0:
+            now = time.perf_counter()
+            elapsed = now - self._last_log_time
+            fps = self._frame_count / elapsed if elapsed > 0 else 0.0
+            logger.info(
+                "performance[inference_worker] frames=%d fps=%.1f detection=%.1fms position=%.1fms total=%.1fms",
+                self._frame_count,
+                fps,
+                self._detection_total_ms / self._frame_count,
+                self._position_total_ms / self._frame_count,
+                self._total_ms / self._frame_count,
+            )
+            # 重置累计（与 _record_performance 行为一致）
+            self._frame_count = 0
+            self._detection_total_ms = 0.0
+            self._position_total_ms = 0.0
+            self._total_ms = 0.0
+            self._last_log_time = now
+        # fan-out 到诊断缓存（若已注册）：复用本帧推理结果，避免诊断流重复 session.run。
+        # 用 getattr 动态访问，未注册时只多一次属性查询 + None 判断，几乎零开销；
+        # 不引入对 diagnostic_frame_cache 模块的 import，避免 vision→runtime 循环导入。
+        cache = getattr(self._vision, "_diagnostic_cache", None)
+        if cache is not None:
+            try:
+                # 绘制标注（bbox + mask），与 runtime_vision_debug.capture_vision_snapshot 一致
+                annotated = packet.color_image.copy()
+                mask = target.get("mask") if target else None
+                if mask is not None:
+                    mask_array = np.asarray(mask)
+                    if mask_array.shape[:2] != annotated.shape[:2]:
+                        mask_array = cv2.resize(
+                            mask_array.astype(np.uint8),
+                            (annotated.shape[1], annotated.shape[0]),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    mask_bool = mask_array > 0
+                    overlay = annotated.copy()
+                    overlay[mask_bool] = (0, 200, 255)
+                    annotated = cv2.addWeighted(annotated, 0.7, overlay, 0.3, 0)
+                if target and target.get("bbox") is not None:
+                    x1, y1, x2, y2 = [int(value) for value in target["bbox"]]
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                # JPEG 编码内联在此，不依赖 runtime_vision_debug（避免 vision 层依赖 runtime 层）
+                ok, encoded = cv2.imencode(
+                    ".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85]
+                )
+                if ok:
+                    jpeg_bytes = encoded.tobytes()
+                    seq = packet.seq
+                    metadata = {
+                        "detection": (
+                            {
+                                "bbox": target.get("bbox"),
+                                "track_id": target.get("track_id"),
+                                "score": float(target.get("score", 0.0)),
+                                "predicted": bool(target.get("predicted", False)),
+                            }
+                            if target
+                            else None
+                        ),
+                        "coordinates": object_position,
+                        "timings_ms": {
+                            "detection": detection_ms,
+                            "position": position_ms,
+                            "total": total_ms,
+                        },
+                    }
+                    cache.update(seq, jpeg_bytes, metadata)
+            except Exception as exc:
+                # fan-out 失败不能影响主流程，只记 warning 日志
+                logger.warning("fan-out 写入诊断缓存失败: %s", exc)
+        return {
+            "seq": packet.seq,
+            "capture_ms": capture_ms,
+            "target": target,
+            "object_position": object_position,
+        }
+
+
+class PipelinedDetector:
+    """封装 CaptureWorker + InferenceWorker，提供流水线检测接口。
+
+    失败时回退到串行模式：``start()`` 返回 False，调用方据 ``is_pipelined``
+    属性决定走流水线路径还是原串行路径。
+
+    帧数据流（默认，``position_worker_enabled=False``）：
+        CaptureWorker 采集 → frame_queue(maxsize=2，满了丢最旧) →
+        InferenceWorker 推理（detection + 位置计算）→ result_queue(maxsize=1，存最新)
+        → 主线程取最新结果。
+
+    帧数据流（``position_worker_enabled=True``，实验性）：
+        CaptureWorker 采集 → frame_queue(maxsize=2) →
+        InferenceWorker 推理（仅 detection）→ intermediate_queue(maxsize=1) →
+        PositionWorker 位置计算 → result_queue(maxsize=1) → 主线程取最新结果。
+    """
+
+    def __init__(self, capture_worker_factory, vision_system, position_worker_enabled=False):
+        # capture_worker_factory: callable(frame_queue) -> CaptureWorker | None
+        #   接收 PipelinedDetector 内部创建的 frame_queue，返回一个已配置好帧输出
+        #   的 CaptureWorker（或 None 表示创建失败，触发回退串行）。
+        # vision_system: VisionSystem 实例
+        # position_worker_enabled: 是否启用 PositionWorker 异步化（默认 False）。
+        #   True 时 InferenceWorker 只跑 detection，位置计算由独立 PositionWorker 线程执行。
+        #   高风险：见 PositionWorker 文档的线程安全说明，仅诊断/实验用。
+        self._capture_worker_factory = capture_worker_factory
+        self._vision_system = vision_system
+        self._position_worker_enabled = bool(position_worker_enabled)
+        self._capture_worker = None
+        self._inference_worker = None
+        self._position_worker = None
+        self._frame_queue = None
+        self._result_queue = None
+        self._intermediate_queue = None  # 启用 PositionWorker 时 InferenceWorker→PositionWorker 的中转队列
+        self._stop_event = None
+        self._is_pipelined = False
+
+    @property
+    def is_pipelined(self) -> bool:
+        return self._is_pipelined
+
+    def start(self) -> bool:
+        """启动流水线。成功返回 True，失败返回 False（调用方应回退串行）。"""
+        try:
+            self._frame_queue = queue.Queue(maxsize=2)
+            self._result_queue = queue.Queue(maxsize=1)
+            self._stop_event = threading.Event()
+            capture_worker = self._capture_worker_factory(self._frame_queue)
+            if capture_worker is None:
+                self.stop()
+                return False
+            self._capture_worker = capture_worker
+            if self._position_worker_enabled:
+                # 启用 PositionWorker：InferenceWorker 入 intermediate_queue，
+                # PositionWorker 从 intermediate_queue 取后入 result_queue。
+                self._intermediate_queue = queue.Queue(maxsize=1)
+                self._inference_worker = InferenceWorker(
+                    self._vision_system,
+                    self._frame_queue,
+                    self._intermediate_queue,  # InferenceWorker 的 result_queue 实参指向中转队列
+                    self._stop_event,
+                    compute_position=False,
+                )
+                self._position_worker = PositionWorker(
+                    self._vision_system,
+                    self._intermediate_queue,
+                    self._result_queue,
+                    self._stop_event,
+                )
+            else:
+                # 默认路径：InferenceWorker 自己做位置计算，直接入 result_queue
+                self._inference_worker = InferenceWorker(
+                    self._vision_system,
+                    self._frame_queue,
+                    self._result_queue,
+                    self._stop_event,
+                )
+            self._capture_worker.start()
+            self._inference_worker.start()
+            if self._position_worker is not None:
+                self._position_worker.start()
+            self._is_pipelined = True
+            return True
+        except Exception as exc:
+            logger.warning("PipelinedDetector 启动失败，将回退串行模式: %s", exc)
+            self.stop()
+            return False
+
+    def get_latest_detection(self, timeout=0.0):
+        """返回最新检测结果，无新结果返回 None。跳过过期结果。
+
+        先（可选）阻塞 ``timeout`` 等首个结果，再排空队列里所有剩余结果，只保留
+        最新一个。``result_queue`` maxsize=1，通常只有 0 或 1 个结果，排空是为了
+        健壮处理。
+        """
+        if self._result_queue is None:
+            return None
+        latest = None
+        if timeout and timeout > 0:
+            try:
+                latest = self._result_queue.get(timeout=timeout)
+            except queue.Empty:
+                return None
+        # 排空剩余，只保留最新（跳过过期结果）
+        try:
+            while True:
+                latest = self._result_queue.get_nowait()
+        except queue.Empty:
+            pass
+        return latest
+
+    def stop(self):
+        """停止所有线程，清理资源。idempotent，可重复调用。"""
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._inference_worker is not None and self._inference_worker.is_alive():
+            try:
+                self._inference_worker.join(timeout=2.0)
+            except Exception:
+                pass
+        if self._position_worker is not None and self._position_worker.is_alive():
+            try:
+                self._position_worker.join(timeout=2.0)
+            except Exception:
+                pass
+        if self._capture_worker is not None:
+            stop_fn = getattr(self._capture_worker, "stop", None)
+            if stop_fn is not None:
+                try:
+                    stop_fn()
+                except Exception:
+                    pass
+            join_fn = getattr(self._capture_worker, "join", None)
+            if join_fn is not None and self._capture_worker.is_alive():
+                try:
+                    join_fn(timeout=1.0)
+                except Exception:
+                    pass
+        self._is_pipelined = False
+
+
+class PositionWorker(threading.Thread):
+    """从 intermediate_queue 取 (packet, target, capture_ms)，跑 calculate_object_position_smoothed，结果放 result_queue。
+
+    与 :class:`InferenceWorker` 解耦，让 GPU 推理（detection 段）不被 CPU 位置计算
+    （深度对齐 + mask 点云提取 + Kalman）阻塞，提升 inference_fps。
+
+    帧数据流（启用 ``pipeline.position_worker_enabled`` 时）：
+        InferenceWorker（仅 detection）→ intermediate_queue(maxsize=1) →
+        PositionWorker（位置计算）→ result_queue(maxsize=1) → 主线程取最新结果。
+
+    线程安全说明（高风险，默认禁用）：
+        ``calculate_object_position_smoothed`` 会读写 ``VisionSystem`` 的
+        ``kalman_3d``（predict/update）、``_kalman_last_time``、
+        ``last_valid_position`` 等状态；同时 ``run_detection_tracked``（在
+        InferenceWorker 线程执行）内部的 ``_select_target`` 在无跟踪目标时也会
+        读写 ``kalman_3d`` / ``_kalman_last_time`` / ``last_valid_position``。
+        启用本 worker 后这两个线程会并发访问这些共享状态，存在潜在竞争。
+
+        未加锁的原因（权衡）：
+        - 加 ``threading.Lock`` 会让 detection 段和 position 段重新串行化，失去
+          异步收益（与默认串行路径等价但多了线程切换开销）。
+        - 加 ``threading.RLock`` 虽不会死锁，但默认路径（InferenceWorker 同线程
+          调用两段）会引入无竞争的锁开销，违反"默认路径不变"原则。
+        - 因此本 worker 采用"尽力而为"策略：不加锁，仅在注释中标记风险。启用前
+          请确认能接受偶发的 kalman 状态竞争（如预测漂移、dt 跳变）。生产环境
+          务必保持 ``pipeline.position_worker_enabled=false``。
+
+    默认不启用（``pipeline.position_worker_enabled=false``），由
+    :class:`PipelinedDetector` 根据配置决定是否创建本 worker。
+    """
+
+    def __init__(self, vision_system, intermediate_queue, result_queue, stop_event):
+        # vision_system: VisionSystem 实例
+        # intermediate_queue: queue.Queue，InferenceWorker 入 (packet, target, capture_ms)
+        # result_queue: queue.Queue(maxsize=1)，存最终结果（含 object_position）
+        # stop_event: threading.Event
+        super().__init__(daemon=True, name="position-worker")
+        self._vision = vision_system
+        self._intermediate_queue = intermediate_queue
+        self._result_queue = result_queue
+        self._stop_event = stop_event
+
+    def run(self):
+        while not self._stop_event.is_set():
+            try:
+                item = self._intermediate_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                packet, target, capture_ms = item
+                object_position = self._vision.calculate_object_position_smoothed(
+                    packet.depth_image, packet.color_image, target
+                )
+                result = {
+                    "seq": packet.seq,
+                    "capture_ms": capture_ms,
+                    "target": target,
+                    "object_position": object_position,
+                }
+                # 入 result_queue（maxsize=1），满了丢旧
+                try:
+                    self._result_queue.put_nowait(result)
+                except queue.Full:
+                    try:
+                        self._result_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self._result_queue.put_nowait(result)
+                    except queue.Full:
+                        pass
+            except Exception as exc:
+                logger.warning("PositionWorker 位置计算失败: %s", exc)

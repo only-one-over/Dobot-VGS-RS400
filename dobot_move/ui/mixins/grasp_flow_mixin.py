@@ -1,3 +1,4 @@
+import logging
 import os
 
 from ...ui.qt_compat import QInputDialog, QMessageBox, QTableWidgetItem
@@ -5,6 +6,8 @@ from ...ui.qt_compat import QInputDialog, QMessageBox, QTableWidgetItem
 from ...config.config_manager import get_grasp_flow_file
 from ...flow.flow_library import FlowLibrary
 from ...flow.flow_step_list import STATUS_COMPLETED, STATUS_RUNNING
+
+logger = logging.getLogger(__name__)
 
 
 class GraspFlowMixin:
@@ -141,9 +144,24 @@ class GraspFlowMixin:
                     params.pop(legacy_key, None)
 
     def run_grasping_task(self):
+        # 运行前先保存草稿 + 通知 Runtime reload_config，
+        # 否则 Runtime 可能执行旧版本流程
+        if not self._prepare_config_before_run():
+            self.statusBar().showMessage("配置准备失败，无法启动流程", 5000)
+            return
         main_flow_id = getattr(self.flow_library, "main_flow_id", None)
         success, msg = self._runtime_facade.run_flow(main_flow_id)
         self.statusBar().showMessage(msg, 3000)
+        return success
+
+    def release_delay(self):
+        """放行延时等待（modbus_or_timeout 模式下即时继续）。
+
+        Spec Task 5.4: 供 UI 调试流程遇到延时模块时操作员即时放行，
+        无需等待超时。按钮接入可后续完成；此方法已可通过菜单/快捷键调用。
+        """
+        success, msg = self._runtime_facade.release_delay()
+        self.statusBar().showMessage(msg, 2000)
         return success
 
     def check_main_flow_readiness(self):
@@ -599,9 +617,60 @@ class GraspFlowMixin:
 
     def run_grasp_flow(self, modbus_triggered=False, flow_id=None):
         del modbus_triggered
+        # 运行前先保存草稿 + 同步发布到 Runtime publication，
+        # 否则 Runtime 会执行 publication 中的旧版本流程
+        if not self._prepare_config_before_run():
+            self.statusBar().showMessage("配置准备失败，无法启动流程", 5000)
+            return
         success, msg = self._runtime_facade.run_flow(flow_id)
         self.statusBar().showMessage(msg, 3000)
         return success
+
+    def _prepare_config_before_run(self):
+        """运行流程前保存草稿并通知 Runtime 重载配置。
+
+        单一数据源模型：UI 写 user_data/config.json + grasp_flow_modules.json，
+        然后通过 IPC reload_config 让 Runtime 失效内存缓存并重新读盘。
+
+        步骤：
+        1. 静默保存当前编辑的流程到磁盘（不弹窗，失败时静默跳过）
+        2. flush 配置确保草稿落盘
+        3. 通过 IPC 发送 reload_config 给 Runtime（让 Runtime 失效缓存重读磁盘）
+        """
+        # 1. 静默保存当前编辑的流程到磁盘
+        if getattr(self, "grasp_flow_modules", None) and hasattr(self, "flow_library"):
+            try:
+                if hasattr(self, "_normalize_flow_modules"):
+                    self._normalize_flow_modules()
+                editing_flow_id = getattr(self, "editing_flow_id", None)
+                if editing_flow_id is not None:
+                    self.flow_library.get_flow(editing_flow_id)[
+                        "modules"
+                    ] = self.grasp_flow_modules
+                    self.flow_library.save()
+            except Exception:
+                return False
+        # 2. flush 配置确保落盘
+        try:
+            from ...config.config_manager import ConfigService
+            ConfigService.instance().flush()
+        except Exception:
+            return False
+        # 3. 通知 Runtime 重载配置（失效内存缓存，重新读磁盘）
+        try:
+            ipc_client = getattr(self, "_runtime_ipc_client", None)
+            if ipc_client is not None and hasattr(ipc_client, "request"):
+                response = ipc_client.request("reload_config")
+                logger.info("已通知 Runtime reload_config: %s", response)
+            elif hasattr(self, "_send_runtime_ipc"):
+                self._send_runtime_ipc("reload_config")
+        except Exception as e:
+            logger.warning("reload_config 通知失败: %s", e)
+            self.statusBar().showMessage(
+                f"通知 Runtime 重载失败：{e}，可能执行旧版本", 5000
+            )
+            return False
+        return True
 
     def _start_grasp_flow_snapshot(
         self,

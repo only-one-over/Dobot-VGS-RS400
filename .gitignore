@@ -26,6 +26,10 @@ test_yolo26_*.py
 AGENTS.md
 PORTING_GUIDE.md
 figma_thumbnail.png
+_apply_*.py
+dobot_move/config.json
+dobot_move/config.json.bak
+dobot_move/alarm_history.json
 vendor/
 !dobot_move/windows_service/vendor/
 !dobot_move/windows_service/vendor/LICENSE-WinSW.txt
@@ -37,8 +41,17 @@ docs/code_wiki.md
 # User data (preserved when replacing dobot_move/)
 user_data/*
 !user_data/.gitkeep
+!user_data/logs/
+user_data/logs/*
 !user_data/logs/.gitkeep
 *.lock
+runtime_health.json
+runtime_state.json
 
 # Runtime logs (WinSW service output)
-logs/
+/logs/
+
+# Offline deployment artifacts (large binaries, do not commit)
+wheels/
+*.zip
+dobot-vgs-offline.zip

@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from .service_config import (
+    build_remote_api_service_xml,
     build_runtime_service_xml,
     build_watchdog_service_xml,
 )
@@ -33,6 +34,13 @@ def main(argv=None) -> int:
     )
     (args.output_dir / "DobotRuntimeWatchdog.xml").write_text(
         build_watchdog_service_xml(
+            args.project_root,
+            args.python_exe,
+        ),
+        encoding="utf-8",
+    )
+    (args.output_dir / "DobotRemoteApiService.xml").write_text(
+        build_remote_api_service_xml(
             args.project_root,
             args.python_exe,
         ),

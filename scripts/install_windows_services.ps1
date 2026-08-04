@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$ProjectRoot = "C:\DobotRuntime",
     [string]$PythonExe = "",
     [string]$ServiceUser = ".\DobotRuntimeSvc",

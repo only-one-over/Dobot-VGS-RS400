@@ -6,6 +6,7 @@ from ..ui.qt_compat import (
     Qt,
     QCheckBox,
     QComboBox,
+    QFont,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -16,16 +17,21 @@ from ..ui.qt_compat import (
     QScrollArea,
     QTabWidget,
     QTableWidget,
+    QTextCursor,
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    pyqtSignal,
 )
 from ..ui.ui_theme import set_button_role, COLORS, metric_value_style
-from ..ui.gui_debug_widgets import ErrorTrendPlot
 
 
 class RuntimeDebugPage(QWidget):
-    """Three-tab Runtime debug panel: status overview, flow debug, vision diagnostics."""
+    """Four-tab Runtime debug panel: status overview, flow debug, vision
+    diagnostics, and live log streaming."""
+
+    fetch_detection_test = pyqtSignal()
+    camera_connect_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -196,7 +202,19 @@ class RuntimeDebugPage(QWidget):
 
         self.debug_camera_combo = QComboBox()
         self.debug_camera_combo.addItems(["D405", "D435i"])
-        vision_layout.addWidget(self.debug_camera_combo, 0, 0)
+
+        # 用 QHBoxLayout 把 combo 和"连接相机"按钮包在一起
+        camera_bar = QHBoxLayout()
+        camera_bar.addWidget(self.debug_camera_combo)
+        self.debug_camera_connect_button = QPushButton("连接相机")
+        set_button_role(self.debug_camera_connect_button, "secondary")
+        self.debug_camera_connect_button.clicked.connect(
+            lambda *_: self.camera_connect_requested.emit(
+                self.debug_camera_combo.currentText()
+            )
+        )
+        camera_bar.addWidget(self.debug_camera_connect_button)
+        vision_layout.addLayout(camera_bar, 0, 0)
 
         snapshot_button = QPushButton("采集诊断快照")
         set_button_role(snapshot_button, "secondary")
@@ -208,15 +226,13 @@ class RuntimeDebugPage(QWidget):
         # Click connection handled by host gui_app.py
         vision_layout.addWidget(logs_button, 0, 2)
 
+        # "实时图"走流模式：start_vision_stream + get_vision_stream_frame，
+        # 由 host gui_app.py 周期性拉取帧并刷新 debug_image_label。
         self.debug_live_button = QPushButton("开始实时图")
         set_button_role(self.debug_live_button, "secondary")
         self.debug_live_button.setCheckable(True)
         # Toggled connection handled by host gui_app.py
         vision_layout.addWidget(self.debug_live_button, 0, 3)
-
-        self.debug_depth_checkbox = QCheckBox("深度图")
-        self.debug_depth_checkbox.setChecked(True)
-        vision_layout.addWidget(self.debug_depth_checkbox, 0, 4)
 
         self.debug_image_label = QLabel("等待 Runtime 视觉快照")
         self.debug_image_label.setMinimumSize(360, 240)
@@ -224,55 +240,17 @@ class RuntimeDebugPage(QWidget):
         self.debug_image_label.setStyleSheet(
             f"background-color:{COLORS['bg']}; border:1px solid {COLORS['line']};"
         )
-        vision_layout.addWidget(self.debug_image_label, 1, 0, 1, 3)
+        vision_layout.addWidget(self.debug_image_label, 1, 0, 1, 5)
 
-        self.debug_depth_label = QLabel("等待深度图")
-        self.debug_depth_label.setMinimumSize(360, 240)
-        self.debug_depth_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.debug_depth_label.setStyleSheet(
-            f"background-color:{COLORS['bg']}; border:1px solid {COLORS['line']};"
+        # Row 2: 检测测试（secondary 角色，通过信号由 host 连接）
+        self.debug_detection_btn = QPushButton("检测测试")
+        set_button_role(self.debug_detection_btn, "secondary")
+        self.debug_detection_btn.clicked.connect(
+            lambda *_: self.fetch_detection_test.emit()
         )
-        vision_layout.addWidget(self.debug_depth_label, 1, 3, 1, 2)
+        vision_layout.addWidget(self.debug_detection_btn, 2, 0)
+
         tab_vision_layout.addWidget(vision_group)
-
-        # Telemetry table
-        self.debug_telemetry_table = QTableWidget(0, 11)
-        self.debug_telemetry_table.setHorizontalHeaderLabels(
-            [
-                "迭代",
-                "X误差",
-                "Y误差",
-                "Z误差",
-                "总误差",
-                "频率(Hz)",
-                "采集(ms)",
-                "推理(ms)",
-                "深度(ms)",
-                "下发(ms)",
-                "总周期(ms)",
-            ]
-        )
-        self.debug_telemetry_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-        self.debug_telemetry_table.setEditTriggers(
-            QTableWidget.EditTrigger.NoEditTriggers
-        )
-        tab_vision_layout.addWidget(self.debug_telemetry_table)
-
-        # Error trend plots
-        plots_layout = QHBoxLayout()
-        self.debug_error_time_plot = ErrorTrendPlot(
-            "总误差 vs 时间",
-            x_mode="time",
-        )
-        self.debug_error_iteration_plot = ErrorTrendPlot(
-            "总误差 vs 迭代",
-            x_mode="iteration",
-        )
-        plots_layout.addWidget(self.debug_error_time_plot)
-        plots_layout.addWidget(self.debug_error_iteration_plot)
-        tab_vision_layout.addLayout(plots_layout)
 
         # Debug output text area
         self.debug_output = QTextEdit()
@@ -282,11 +260,49 @@ class RuntimeDebugPage(QWidget):
 
         tab_vision_layout.addStretch()
 
+        # --- Tab 4: 实时日志 ---
+        tab_log = QWidget()
+        tab_log_layout = QVBoxLayout(tab_log)
+        tab_log_layout.setSpacing(8)
+        tab_log_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 日志文本框：只读、等宽字体、自动滚动到底
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        log_font = QFont("Consolas", 9)
+        log_font.setStyleHint(QFont.StyleHint.TypeWriter)
+        self.log_view.setFont(log_font)
+
+        # 顶部控制栏：刷新开关 + 清空按钮 + 状态标签
+        self.log_auto_refresh_checkbox = QCheckBox("刷新开关")
+        self.log_clear_btn = QPushButton("清空")
+        set_button_role(self.log_clear_btn, "secondary")
+        self.log_clear_btn.clicked.connect(self.log_view.clear)
+        self.log_status_label = QLabel("实时拉取")
+        self.log_status_label.setStyleSheet(
+            f"color: {COLORS['muted']}; font-size: 9pt;"
+        )
+        # 默认勾选刷新开关；勾选后再连接 toggled 信号，避免初始 setChecked
+        # 触发时 status_label 尚未就绪。
+        self.log_auto_refresh_checkbox.setChecked(True)
+        self.log_auto_refresh_checkbox.toggled.connect(
+            lambda checked: self.set_log_paused(not checked)
+        )
+
+        log_ctrl_layout = QHBoxLayout()
+        log_ctrl_layout.addWidget(self.log_auto_refresh_checkbox)
+        log_ctrl_layout.addWidget(self.log_clear_btn)
+        log_ctrl_layout.addWidget(self.log_status_label)
+        log_ctrl_layout.addStretch()
+        tab_log_layout.addLayout(log_ctrl_layout)
+        tab_log_layout.addWidget(self.log_view, 1)
+
         # --- Assemble tabs ---
         for tab_widget, tab_name in (
             (tab_status, "状态概览"),
             (tab_flow, "流程调试"),
             (tab_vision, "视觉诊断"),
+            (tab_log, "实时日志"),
         ):
             tab_scroll = QScrollArea()
             tab_scroll.setWidget(tab_widget)
@@ -294,3 +310,27 @@ class RuntimeDebugPage(QWidget):
             tabs.addTab(tab_scroll, tab_name)
 
         layout.addWidget(tabs)
+
+    # ------------------------------------------------------------------
+    # Live log API
+    # ------------------------------------------------------------------
+    def append_log_lines(self, lines):
+        """追加日志行，保留最近 1000 行并自动滚动到底。"""
+        if not lines:
+            return
+        current = self.log_view.toPlainText()
+        incoming = [str(line) for line in lines]
+        if current:
+            all_lines = current.split("\n") + incoming
+        else:
+            all_lines = list(incoming)
+        if len(all_lines) > 1000:
+            all_lines = all_lines[-1000:]
+        self.log_view.setPlainText("\n".join(all_lines))
+        cursor = self.log_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.log_view.setTextCursor(cursor)
+
+    def set_log_paused(self, paused):
+        """更新日志状态标签（已暂停 / 实时拉取）。"""
+        self.log_status_label.setText("已暂停" if paused else "实时拉取")

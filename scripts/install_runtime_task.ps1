@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     [已废弃] 注册 Windows 计划任务方式的 Runtime 部署。
 

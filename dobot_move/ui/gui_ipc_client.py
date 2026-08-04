@@ -140,6 +140,37 @@ class RuntimeIpcClient:
     def reload_config(self) -> dict[str, Any]:
         return self.request("reload_config")
 
+    def publish_config_sync(self, timeout: float = 3.0) -> tuple[bool, str]:
+        """同步调用 publish_config IPC 并等待响应。
+
+        用于运行前必须确保发布完成的场景。
+
+        Args:
+            timeout: 超时秒数，默认 3 秒
+
+        Returns:
+            (True, response_json_str) 成功
+            (False, error_msg) 失败或超时
+        """
+        saved_timeout = self.timeout_s
+        self.timeout_s = max(0.1, float(timeout))
+        try:
+            response = self.request("publish_config")
+            if isinstance(response, dict):
+                if response.get("ok") or response.get("published"):
+                    return True, json.dumps(response, ensure_ascii=False)
+                error = response.get("error", "unknown error")
+                return False, str(error)
+            return True, str(response)
+        except socket.timeout:
+            return False, "timeout"
+        except (ConnectionError, OSError) as e:
+            return False, str(e)
+        except Exception as e:
+            return False, f"unexpected error: {e}"
+        finally:
+            self.timeout_s = saved_timeout
+
     def get_publication_status(self) -> dict[str, Any]:
         return self.request("get_publication_status")
 

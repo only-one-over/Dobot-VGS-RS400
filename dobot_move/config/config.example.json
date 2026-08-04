@@ -1,7 +1,7 @@
 {
   "_README": "部署配置模板。复制到 user_data/config.json 后修改标注 [必改] 的字段，其余保持默认即可。也可通过环境变量覆盖（见文件末尾 _env_override 说明）。部署后运行 python run.py --check-config 验证。",
 
-  "robot_ip": "192.168.5.1",
+  "robot_ip": "192.168.1.50",
   "_robot_ip_note": "[必改] 机器人的局域网 IP 地址。也可用环境变量 DOBOT_ROBOT_IP 覆盖。",
 
   "modbus_port": 502,
@@ -22,7 +22,11 @@
       "_D435i_note": "[必改] D435i 相机的 ONNX 模型绝对路径。留空则使用默认模型 dobot_move/best.onnx。环境变量 DOBOT_D435I_MODEL。",
       "D405": "",
       "_D405_note": "[必改] D405 相机的 ONNX 模型绝对路径。留空则使用默认模型。环境变量 DOBOT_D405_MODEL。"
-    }
+    },
+    "enable_align": true,
+    "_enable_align_note": "[选改] 是否执行 RealSense 深度→彩色对齐（align.process）。诊断 16fps 瓶颈时可设为 false 跳过对齐做对比。默认 true。关闭后深度未对齐到彩色视角，位置计算可能不准（仅诊断用）。",
+    "enable_depth_filter": true,
+    "_enable_depth_filter_note": "[选改] 是否执行深度滤波链（spatial/temporal/hole_filling）。诊断时可设为 false 跳过滤波做对比。默认 true。关闭后深度噪声可能增加（仅诊断用）。"
   },
 
   "calibration": {
@@ -38,6 +42,11 @@
 
   "points": {},
   "_points_note": "[自动生成] 点位表。首次运行时自动创建 initial_point/d435i/d405 三个默认点位。可在 GUI 中编辑。",
+
+  "pipeline": {
+    "position_worker_enabled": false,
+    "_position_worker_enabled_note": "[选改·高风险] 是否启用 PositionWorker 异步化。默认 false 保持原行为（InferenceWorker 串行跑检测+位置计算）。设为 true 时 InferenceWorker 只跑 run_detection_tracked（GPU 推理），位置计算（calculate_object_position_smoothed）由独立 PositionWorker 线程执行，避免 CPU 位置计算阻塞 GPU 推理。注意：启用后 run_detection_tracked 与 calculate_object_position_smoothed 会并发访问 VisionSystem 的 kalman_3d / _kalman_last_time / last_valid_position 等状态，存在潜在线程安全风险，仅诊断/实验用。"
+  },
 
   "remote_api": {
     "host": "0.0.0.0",
@@ -62,9 +71,30 @@
     "health_path": "user_data/runtime_health.json",
     "service_stop_marker_path": "user_data/runtime_service_stopped.json",
     "startup_connect_timeout_s": 5.0,
-    "camera_retry_interval_s": 10.0
+    "camera_retry_interval_s": 10.0,
+    "tool_index": 0,
+    "user_index": 0
   },
-  "_runtime_note": "[选改] Runtime 服务运行时配置。ipc_host/ipc_port 为 IPC 主通道，ipc_stop_port 为安全停止通道。路径项若为相对路径则以项目根目录为基准。",
+  "_runtime_note": "[选改] Runtime 服务运行时配置。ipc_host/ipc_port 为 IPC 主通道，ipc_stop_port 为安全停止通道。路径项若为相对路径则以项目根目录为基准。tool_index 为工具坐标系索引（0 = 法兰坐标系，默认）；user_index 为用户坐标系索引（0 = 基坐标系，默认）。也可用环境变量 DOBOT_TOOL_INDEX / DOBOT_USER_INDEX 覆盖。",
+
+  "motion_safety": {
+    "_note": "[选改] 运动安全配置。GUI 配置中心可编辑。缺失时使用 CR20A 默认值 (±1900mm X/Y, ±1200mm Z)。修改后需重载 Runtime 生效。",
+    "workspace_x_min": -1900.0,
+    "workspace_x_max": 1900.0,
+    "workspace_y_min": -1900.0,
+    "workspace_y_max": 1900.0,
+    "workspace_z_min": -1200.0,
+    "workspace_z_max": 1200.0,
+    "orientation_min": -360.0,
+    "orientation_max": 360.0,
+    "max_delta_xyz": 800.0,
+    "max_delta_rot": 90.0,
+    "speed_min": 1.0,
+    "speed_max_percent": 100.0,
+    "speed_max_abs": 2000.0,
+    "accel_min": 1.0,
+    "accel_max": 100.0
+  },
 
   "_env_override": {
     "_note": "以下环境变量可覆盖 config.json 中的对应字段，优先级：环境变量 > config.json > 代码默认值。适合多机部署时差异化配置。",
@@ -73,6 +103,8 @@
     "DOBOT_MODBUS_SLAVE": "覆盖 modbus_slave_id",
     "DOBOT_D435I_MODEL": "覆盖 camera.models.D435i",
     "DOBOT_D405_MODEL": "覆盖 camera.models.D405",
-    "DOBOT_REMOTE_API_PORT": "覆盖 remote_api.port"
+    "DOBOT_REMOTE_API_PORT": "覆盖 remote_api.port",
+    "DOBOT_TOOL_INDEX": "覆盖 runtime.tool_index（工具坐标系索引，0 = 法兰坐标系）",
+    "DOBOT_USER_INDEX": "覆盖 runtime.user_index（用户坐标系索引，0 = 基坐标系）"
   }
 }

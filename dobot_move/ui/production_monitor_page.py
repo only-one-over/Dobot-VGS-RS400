@@ -49,7 +49,6 @@ class ProductionMonitorPage(QWidget):
         "paused": "已暂停",
         "holding_hook": "扶钩等待",
         "resetting": "复位中",
-        "error_recovery": "错误恢复中",
         "flow_error": "流程错误",
         "robot_error": "机器人故障",
         "camera_error": "相机故障",
@@ -301,7 +300,6 @@ class ProductionMonitorPage(QWidget):
             "paused",
             "holding_hook",
             "resetting",
-            "error_recovery",
         }:
             color = COLORS["warning"]
         elif state_value in {

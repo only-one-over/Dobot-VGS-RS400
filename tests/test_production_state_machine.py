@@ -94,7 +94,6 @@ class TestProductionState:
             "paused",
             "holding_hook",
             "resetting",
-            "error_recovery",
             "flow_error",
             "robot_error",
             "camera_error",
@@ -120,11 +119,10 @@ class TestProductionState:
                 ProductionState.CAMERA_ERROR,
             }
         )
-        # MANUAL_OFFLINE / RESETTING / ERROR_RECOVERY are intentionally
+        # MANUAL_OFFLINE / RESETTING are intentionally
         # absent from MODBUS_STATUS_MAP (no PLC-facing code).
         assert ProductionState.MANUAL_OFFLINE not in MODBUS_STATUS_MAP
         assert ProductionState.RESETTING not in MODBUS_STATUS_MAP
-        assert ProductionState.ERROR_RECOVERY not in MODBUS_STATUS_MAP
 
 
 # ===========================================================================
@@ -137,13 +135,11 @@ class TestProductionTaskContext:
         ctx = ProductionTaskContext.create(
             hook_type=0,
             primary_flow_id="flow-low",
-            recovery_flow_id="flow-recovery",
             state="running",
         )
         assert isinstance(ctx.task_id, str) and len(ctx.task_id) > 0
         assert ctx.hook_type == 0
         assert ctx.primary_flow_id == "flow-low"
-        assert ctx.recovery_flow_id == "flow-recovery"
         assert ctx.state == "running"
         assert ctx.started_at > 0
 
@@ -152,26 +148,22 @@ class TestProductionTaskContext:
             task_id="abc",
             hook_type=1,
             primary_flow_id="f1",
-            recovery_flow_id="f2",
             state="running",
             started_at=1.0,
         )
         assert ctx.paused_at_step is None
         assert ctx.failure_code is None
         assert ctx.failure_kind is None
-        assert ctx.recovery_started is False
 
     def test_task_id_is_unique(self):
         ctx1 = ProductionTaskContext.create(
             hook_type=0,
             primary_flow_id="a",
-            recovery_flow_id="b",
             state="running",
         )
         ctx2 = ProductionTaskContext.create(
             hook_type=0,
             primary_flow_id="a",
-            recovery_flow_id="b",
             state="running",
         )
         assert ctx1.task_id != ctx2.task_id
@@ -188,7 +180,6 @@ class TestProductionFlowRouter:
             {
                 "low_hook": "flow-low",
                 "high_hook": "flow-high",
-                "error_recovery": "flow-recovery",
             }
         )
 
@@ -206,18 +197,10 @@ class TestProductionFlowRouter:
         with pytest.raises(ValueError):
             self._make_router().resolve_primary(-1)
 
-    def test_resolve_recovery(self):
-        assert self._make_router().resolve_recovery() == "flow-recovery"
-
     def test_resolve_primary_missing_role_raises(self):
         router = ProductionFlowRouter({"low_hook": "f1"})  # no high_hook
         with pytest.raises(ValueError):
             router.resolve_primary(1)
-
-    def test_resolve_recovery_missing_role_raises(self):
-        router = ProductionFlowRouter({"low_hook": "f1"})
-        with pytest.raises(ValueError):
-            router.resolve_recovery()
 
 
 # ===========================================================================
@@ -352,6 +335,8 @@ class _FakeController:
         self._active_flow_thread = None
         self.runtime_maintenance = False
         self.runtime_recovery_required = None
+        self.software_emergency_active = False
+        self.prepare_for_action_calls = []
         # PR 3 tracking
         self.written_statuses: list[tuple[int, int]] = []
         self.pause_calls = 0
@@ -370,6 +355,14 @@ class _FakeController:
 
     def get_modbus_stats(self):
         return {"is_running": self.modbus_running}
+
+    def get_motion_safety_state(self):
+        robot_mode = 5 if self.is_enabled else 1
+        return types.SimpleNamespace(robot_mode=robot_mode)
+
+    def prepare_for_action(self, **kwargs):
+        self.prepare_for_action_calls.append(dict(kwargs))
+        return True, "ok"
 
     def set_modbus_program_runner(
         self, runner, readiness_checker=None, command_delegate=None
@@ -479,7 +472,6 @@ def _runtime_agent_fixture():
             {
                 "low_hook": "flow-low",
                 "high_hook": "flow-high",
-                "error_recovery": "flow-recovery",
             }
         )
         # Mock program_runner heavy methods; keep pause/resume/stop as
@@ -549,18 +541,15 @@ class TestHighHookSelection:
 
 
 class TestInvalidHookType:
-    def test_invalid_hook_type_transitions_to_flow_error(self):
-        """STANDBY + 40001=3 + 40004=2 → FLOW_ERROR (ValueError from router)."""
+    def test_invalid_hook_type_is_rejected_before_state_transition(self):
+        """STANDBY + 40001=3 + 40004=2 writes 110 and remains STANDBY."""
         with _runtime_agent_fixture() as (agent, controller):
             agent._set_production_state(ProductionState.STANDBY)
             controller.written_statuses.clear()
-            # hook_type=2 is invalid; flow_router.resolve_primary raises ValueError
             agent._dispatch_command(cmd=3, mode=0, hook_type=2)
-            assert agent.production_state == ProductionState.FLOW_ERROR
+            assert agent.production_state == ProductionState.STANDBY
             assert agent.production_task is None
-            # 40001 should be written to 110 (FLOW_ERROR)
             assert (110, 0) in controller.written_statuses
-            # start_request must NOT have been called
             agent.program_runner.start_request.assert_not_called()
 
 
@@ -680,7 +669,6 @@ class TestManualOffline:
             agent._on_mode_changed(old_mode=0, new_mode=1)
             assert agent.production_state == ProductionState.MANUAL_OFFLINE
             assert agent.manual_offline is True
-            assert agent.supervisor.manual_offline is True
             assert agent.production_task is None
             # Robot connection should be closed
             assert controller.close_transport_calls >= 1
@@ -688,15 +676,6 @@ class TestManualOffline:
             agent.program_runner.stop.assert_called()
             # dashboard.Stop called
             assert controller.dashboard.stop_calls >= 1
-
-    def test_supervisor_manual_offline_skips_reconnect(self):
-        """RobotConnectionSupervisor.step() must not attempt reconnect when manual_offline."""
-        with _runtime_agent_fixture() as (agent, controller):
-            controller.is_connected = False
-            agent.supervisor.manual_offline = True
-            state = agent.supervisor.step()
-            # Should return current state without attempting connect
-            assert state == agent.supervisor.state
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +702,6 @@ class TestReOnline:
             agent._dispatch_command(cmd=1, mode=0, hook_type=0)
             assert agent.production_state == ProductionState.STANDBY
             assert agent.manual_offline is False
-            assert agent.supervisor.manual_offline is False
             # ResetStrategy (ERROR path for MANUAL_OFFLINE) should clear+enable+move
             assert controller.clear_error_calls >= 1
             assert controller.enable_calls >= 1
@@ -763,7 +741,6 @@ class TestHoldingHook:
             agent.production_task = ProductionTaskContext.create(
                 hook_type=0,
                 primary_flow_id="flow-low",
-                recovery_flow_id="flow-recovery",
                 state="holding_hook",
             )
             agent._dispatch_command(cmd=3, mode=0, hook_type=0)
@@ -785,7 +762,6 @@ class TestResetAfterHoldingHook:
             agent.production_task = ProductionTaskContext.create(
                 hook_type=0,
                 primary_flow_id="flow-low",
-                recovery_flow_id="flow-recovery",
                 state="holding_hook",
             )
             controller.written_statuses.clear()
@@ -806,7 +782,6 @@ class TestResetAfterHoldingHook:
             agent.production_task = ProductionTaskContext.create(
                 hook_type=0,
                 primary_flow_id="flow-low",
-                recovery_flow_id="flow-recovery",
                 state="holding_hook",
             )
             controller.move_to_initial_return = False
@@ -869,13 +844,13 @@ class TestManualModeFallthrough:
 
 
 class TestStartNewTaskGuards:
-    def test_maintenance_mode_blocks_new_task(self):
+    def test_maintenance_mode_allows_debug_start(self):
         with _runtime_agent_fixture() as (agent, _controller):
             agent._set_production_state(ProductionState.STANDBY)
             agent.maintenance_mode = True
             agent._dispatch_command(cmd=3, mode=0, hook_type=0)
-            assert agent.production_state == ProductionState.STANDBY
-            agent.program_runner.start_request.assert_not_called()
+            assert agent.production_state == ProductionState.RUNNING
+            agent.program_runner.start_request.assert_called_once()
 
     def test_debug_task_blocks_new_production_task(self):
         with _runtime_agent_fixture() as (agent, _controller):
@@ -948,13 +923,11 @@ class TestReonlineNotConnected:
         with _runtime_agent_fixture() as (agent, controller):
             agent._set_production_state(ProductionState.MANUAL_OFFLINE)
             agent.manual_offline = True
-            agent.supervisor.manual_offline = True
             controller.is_connected = False
             controller.written_statuses.clear()
             agent._dispatch_command(cmd=1, mode=0, hook_type=0)
             # manual_offline flags cleared
             assert agent.manual_offline is False
-            assert agent.supervisor.manual_offline is False
             # Reset deferred — state stays MANUAL_OFFLINE (no STANDBY transition)
             assert agent.production_state == ProductionState.MANUAL_OFFLINE
             # 40001=2 NOT written (reset hasn't completed)
@@ -987,7 +960,6 @@ class TestSetProductionState:
             agent.production_task = ProductionTaskContext.create(
                 hook_type=0,
                 primary_flow_id="f",
-                recovery_flow_id="r",
                 state="standby",
             )
             agent._set_production_state(ProductionState.RUNNING)

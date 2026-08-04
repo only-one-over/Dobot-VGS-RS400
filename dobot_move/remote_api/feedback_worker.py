@@ -27,6 +27,8 @@ class FeedbackWorker:
         stale_ok_s: float = 0.3,
         stale_fail_s: float = 2.0,
     ) -> None:
+        # reconnect_interval_s 为指数退避的初始退避值（秒），实际退避会
+        # 随连续失败次数翻倍，封顶 15.0s，收到首帧数据后重置。
         self._robot_ip = robot_ip
         self._feedback_port = feedback_port
         self._reconnect_interval_s = reconnect_interval_s
@@ -83,7 +85,13 @@ class FeedbackWorker:
         return fb, health, age, error
 
     def _run(self) -> None:
-        """Background loop: connect, read, reconnect on failure."""
+        """Background loop: connect, read, reconnect on failure.
+
+        Uses exponential backoff on repeated connection failures: the wait
+        doubles each failure (capped at 15.0s) and resets to the initial
+        interval once a frame is successfully received.
+        """
+        fail_count = 0
         while not self._stop_event.is_set():
             try:
                 logger.info(
@@ -99,6 +107,8 @@ class FeedbackWorker:
                                 self._latest_feedback = data
                                 self._recv_time = time.monotonic()
                                 self._error = ""
+                            # 成功收到首帧数据后重置退避计数
+                            fail_count = 0
                 finally:
                     if hasattr(fb, "close"):
                         try:
@@ -108,9 +118,11 @@ class FeedbackWorker:
             except Exception as e:
                 with self._lock:
                     self._error = str(e)
+                backoff = min(self._reconnect_interval_s * (2 ** fail_count), 15.0)
                 logger.warning(
-                    "30004 反馈连接异常: %s，%.0fs 后重连",
-                    e, self._reconnect_interval_s,
+                    "30004 反馈连接异常: %s，%.1fs 后重连（第 %d 次失败）",
+                    e, backoff, fail_count + 1,
                 )
-                # Wait for reconnect interval or stop signal
-                self._stop_event.wait(self._reconnect_interval_s)
+                # Wait for backoff or stop signal
+                self._stop_event.wait(backoff)
+                fail_count += 1

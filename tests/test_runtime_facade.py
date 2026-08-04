@@ -42,7 +42,6 @@ def test_offline_returns_failure_without_sending():
         facade.safe_stop,
         facade.move_to_initial_position,
         facade.get_current_pose,
-        facade.get_point,
         facade.open_realtime_feedback,
         facade.run_flow,
         facade.pause_flow,

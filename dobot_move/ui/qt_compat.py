@@ -13,7 +13,7 @@ from PySide6.QtCore import (
     Slot as pyqtSlot,
     Property as pyqtProperty,
 )
-from PySide6.QtGui import QColor, QDrag, QFont, QImage, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtGui import QColor, QDrag, QFont, QImage, QPainter, QPalette, QPen, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -30,11 +30,14 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QStatusBar,
     QTabWidget,

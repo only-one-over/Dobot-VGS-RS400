@@ -73,7 +73,6 @@ class PointManagementPage(QWidget):
         self.read_point_btn = QPushButton("读取当前点位")
         set_button_role(self.read_point_btn, "secondary")
         self.read_point_btn.setMinimumWidth(120)
-        self.read_point_btn.setEnabled(False)
         point_btn_layout.addWidget(self.read_point_btn)
 
         self.refresh_points_btn = QPushButton("刷新点位")

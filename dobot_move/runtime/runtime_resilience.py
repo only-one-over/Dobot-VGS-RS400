@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import threading
@@ -11,6 +12,9 @@ import uuid
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeState(str, Enum):
@@ -35,13 +39,43 @@ def atomic_write_json(
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     with open(tmp_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
         handle.flush()
         if durable:
             os.fsync(handle.fileno())
-    os.replace(tmp_path, path)
+    try:
+        _atomic_replace_with_retry(tmp_path, path, payload)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _atomic_replace_with_retry(
+    tmp_path: Path,
+    path: Path,
+    payload: dict[str, Any],
+    max_retries: int = 3,
+    retry_delay_s: float = 0.01,
+) -> None:
+    """原子替换，带 PermissionError 重试和 fallback。"""
+    for attempt in range(max_retries):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except PermissionError:
+            if attempt == max_retries - 1:
+                logger.warning(
+                    "原子替换失败 %d 次，fallback 到直接写入: %s", max_retries, path
+                )
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                return
+            time.sleep(retry_delay_s)
 
 
 class RuntimeStateStore:

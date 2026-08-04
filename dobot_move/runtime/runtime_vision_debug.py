@@ -66,7 +66,26 @@ def capture_vision_snapshot(
     target = None
     position = None
     if run_detection:
-        target = vision.run_detection_tracked(color)
+        # 快照是一次性请求，必须每帧都跑完整检测；不能走 run_detection_tracked
+        # （内部有 yolo_every_n 跳帧逻辑会把快照当作视频流的一帧计数）。
+        # 这里直接用 run_detection 取 score 最高的检测，且不调 tracker.update，
+        # 避免影响并发的连续视频流跟踪状态。
+        detections = vision.run_detection(color)
+        if detections:
+            best_det = max(
+                detections,
+                key=lambda d: float(d.get("score", d.get("confidence", 0.0)) or 0.0),
+            )
+            target = {
+                "bbox": best_det["bbox"],
+                "score": best_det["score"],
+                "mask": best_det.get("mask"),
+                "class_id": best_det.get("class_id", 0),
+                "class_name": best_det.get("class_name", "hook"),
+                "predicted": False,
+            }
+        else:
+            target = None
     inference_done = time.perf_counter()
     if target is not None:
         position = vision.calculate_object_position_smoothed(
@@ -118,6 +137,8 @@ def capture_vision_snapshot(
     valid_depth = depth[depth > 0]
     result = {
         "camera_type": camera_type,
+        "camera_ok": True,  # 走到这里说明 packet 非 None（None 会抛 RuntimeError）
+        "inference_ok": (not run_detection) or (target is not None),
         "frame": {
             "width": int(color.shape[1]),
             "height": int(color.shape[0]),
@@ -155,7 +176,7 @@ def capture_vision_snapshot(
         },
         "calibration": {
             "camera_to_gripper": _json_value(
-                getattr(vision, "T_cam2gripper", None)
+                getattr(vision, "T_cam2flange", None)
             ),
         },
         "depth": {

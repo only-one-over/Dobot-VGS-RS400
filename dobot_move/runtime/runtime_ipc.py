@@ -24,7 +24,7 @@ DEFAULT_IPC_TOKEN_PATH = Path(__file__).resolve().parent.parent.parent / "user_d
 # These bypass the normal FIFO queue so they run even when a long
 # command is blocking the command worker thread.
 ALLOWED_STOP_COMMANDS = frozenset(
-    {"safe_stop", "stop_current_task", "stop_debug_flow"}
+    {"safe_stop", "stop_current_task", "stop_debug_flow", "release_safe_stop"}
 )
 
 

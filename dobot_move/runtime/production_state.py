@@ -32,7 +32,6 @@ class ProductionState(str, Enum):
     PAUSED = "paused"
     HOLDING_HOOK = "holding_hook"
     RESETTING = "resetting"
-    ERROR_RECOVERY = "error_recovery"
     FLOW_ERROR = "flow_error"
     ROBOT_ERROR = "robot_error"
     CAMERA_ERROR = "camera_error"
@@ -41,9 +40,9 @@ class ProductionState(str, Enum):
 # Mapping from a :class:`ProductionState` to the value written into
 # Modbus holding register 40001. Only states with a defined PLC-facing
 # status code appear here. States without an explicit PLC signal
-# (``MANUAL_OFFLINE`` / ``RESETTING`` / ``ERROR_RECOVERY``) are
-# intentionally absent — callers must handle the ``KeyError`` or
-# skip the 40001 update for those states.
+# (``MANUAL_OFFLINE`` / ``RESETTING``) are intentionally absent —
+# callers must handle the ``KeyError`` or skip the 40001 update for
+# those states.
 MODBUS_STATUS_MAP: Dict[ProductionState, int] = {
     ProductionState.IDLE: 0,
     ProductionState.STANDBY: 2,

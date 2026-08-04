@@ -282,7 +282,7 @@ python run.py
 |------|------|------|
 | `cam_to_flange_pose` | mm / deg | 相机相对法兰（末端）的位姿 `[x, y, z, rx, ry, rz]` |
 
-系统直接将 `cam_to_flange_pose` 转为 4x4 齐次矩阵作为手眼矩阵 `T_cam2gripper`。
+系统直接将 `cam_to_flange_pose` 转为 4x4 齐次矩阵作为手眼矩阵 `T_cam2flange`。
 
 > 注意：旧版配置使用 `tool_base_calib_pose` + `cam_base_calib_pose` 双位姿格式，系统检测到旧格式时会自动迁移（计算 `inv(T_tool2base) @ T_cam2base`），无需手动转换。本项目使用 **ZYX 旋转顺序** 的欧拉角约定，外部标定数据导入时需确认顺序一致。建议多次标定取平均值，标定误差应 < 5 mm。
 
@@ -433,14 +433,15 @@ GUI 操作步骤：
 
 ## 6. 生产部署
 
-### 6.1 WinSW 双服务架构说明
+### 6.1 WinSW 三服务架构说明
 
-生产环境推荐使用 WinSW 双服务架构：
+生产环境推荐使用 WinSW 三服务架构：
 
 | 服务名 | 职责 | 运行账户 |
 |--------|------|----------|
 | `DobotRuntimeService` | 独占机器人、D405、D435i、Modbus 502、流程执行器和 localhost IPC | `.\DobotRuntimeSvc`（专用本地账户） |
 | `DobotRuntimeWatchdog` | 检查健康文件，卡死时先独立发送 `Stop()`，再通过 SCM 重启 Runtime 服务 | `LocalSystem` |
+| `DobotRemoteApiService` | HTTP REST API 服务（状态/报警/反馈/Modbus），监听 8000 端口 | `.\DobotRuntimeSvc`（与 Runtime 共享） |
 
 关键特性：
 
@@ -448,6 +449,7 @@ GUI 操作步骤：
 - IPC 只监听 `127.0.0.1:8765`，服务模式必须提供 `runtime_ipc.token`。
 - Runtime 服务异常重启后仍遵守恢复锁，绝不自动续跑上次机器人流程。
 - Watchdog 独立 `Stop()` 只是补充保护，不能替代物理急停、安全门和安全 PLC。
+- Remote API 服务与 Runtime 解耦，独立崩溃重启，不影响机器人运动控制。
 
 ### 6.2 安装步骤
 
@@ -457,7 +459,7 @@ GUI 操作步骤：
 - 每台设备重新创建 `.venv` 并安装 `requirements.txt`，**不要复制其他设备的虚拟环境**
 - 确认 `dobot_move\windows_service\vendor\WinSW-x64.exe` 存在且 SHA256 匹配
 - 确认模型文件、`user_data/config.json`、流程文件和标定参数已就位
-- 确认 502、8765、8766、29999、30004 端口未被占用
+- 确认 502、8000、8765、8766、29999、30004 端口未被占用
 - 使用管理员 PowerShell
 
 固定目录部署（推荐 `C:\DobotRuntime`）：
@@ -500,7 +502,7 @@ powershell -ExecutionPolicy Bypass `
 2. 创建或验证 `DobotRuntimeSvc`，自动生成强密码（-CreateServiceUser 时）或通过安全凭据窗口读取密码。
 3. 生成 `runtime_ipc.token` 并限制其文件权限。
 4. 备份、停止并禁用旧任务计划，但不删除任务定义。
-5. 安装并启动 Runtime 和 Watchdog 服务。
+5. 安装并启动 Runtime、Watchdog 和 Remote API 三个服务。
 6. 检查服务状态、健康文件和带认证的 IPC ping。
 7. 验证失败时卸载服务并恢复旧任务原有的启用和运行状态。
 
@@ -515,6 +517,7 @@ powershell -ExecutionPolicy Bypass `
 # 查看服务状态
 Get-Service DobotRuntimeService
 Get-Service DobotRuntimeWatchdog
+Get-Service DobotRemoteApiService
 
 # 查看健康状态文件
 Get-Content .\runtime_health.json
@@ -543,7 +546,7 @@ powershell -ExecutionPolicy Bypass `
   -StartLegacyTasks
 ```
 
-卸载顺序固定为 **先 Watchdog、后 Runtime**，避免 Watchdog 在 Runtime 正常停止期间将其重新启动。
+卸载顺序固定为 **先 Remote API、再 Watchdog、后 Runtime**，避免 Watchdog 在 Runtime 正常停止期间将其重新启动。
 
 完整服务部署、卸载和回滚说明详见 [docs/windows_service.md](docs/windows_service.md)。
 
@@ -552,6 +555,8 @@ powershell -ExecutionPolicy Bypass `
 ## 7. Remote API
 
 Remote REST API 是供外部平板/MES 只读查询机器人状态的独立 HTTP 服务，**不暴露任何控制命令**，不影响 Runtime/Watchdog/GUI。
+
+> **WinSW 服务模式**：当通过 `install_windows_services.ps1` 安装后，`DobotRemoteApiService` 会随系统自动启动，监听 8000 端口，无需手动运行 `python -m dobot_move.remote_api`。服务崩溃后 WinSW 会在 10 秒后自动重启。
 
 ### 7.1 启动命令
 

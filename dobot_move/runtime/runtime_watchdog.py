@@ -142,6 +142,8 @@ class RuntimeWatchdog:
         service_stop_timeout_s: float = 40.0,
         query_service_state: Optional[Callable[[], str]] = None,
         restart_service: Optional[Callable[[int], None]] = None,
+        pre_restart_delay_s: float = 30.0,
+        stop_event: Optional[threading.Event] = None,
     ):
         self.health_path = Path(health_path)
         self.task_name = task_name
@@ -155,6 +157,8 @@ class RuntimeWatchdog:
             self.stop_timeout_s,
             float(service_stop_timeout_s),
         )
+        self.pre_restart_delay_s = float(pre_restart_delay_s)
+        self._stop_event = stop_event
         state_dir = Path(state_dir or self.health_path.parent)
         self.restart_window = RestartWindow(
             state_dir / "runtime_watchdog_restarts.json",
@@ -307,6 +311,23 @@ class RuntimeWatchdog:
             except Exception:
                 logger.exception("watchdog independent Stop() failed")
 
+        # Pre-restart delay for TIME_WAIT expiry
+        if self.pre_restart_delay_s > 0:
+            logger.info(
+                "watchdog pre-restart delay %.1fs for TIME_WAIT expiry",
+                self.pre_restart_delay_s,
+            )
+            if self._stop_event is not None:
+                # Interruptible wait
+                deadline = time.monotonic() + self.pre_restart_delay_s
+                while time.monotonic() < deadline:
+                    if self._stop_event.is_set():
+                        logger.info("watchdog pre-restart delay interrupted by stop signal")
+                        return "aborted"
+                    self._stop_event.wait(min(0.5, deadline - time.monotonic()))
+            else:
+                time.sleep(self.pre_restart_delay_s)
+
         pid = int((health.get("process") or {}).get("pid", 0) or 0)
         if self.restart_mode == "task" and pid > 0:
             try:
@@ -341,6 +362,12 @@ def parse_args(argv=None):
     parser.add_argument("--stop-timeout", type=float, default=2.0)
     parser.add_argument("--restart-window", type=float, default=600.0)
     parser.add_argument("--restart-limit", type=int, default=3)
+    parser.add_argument(
+        "--pre-restart-delay",
+        type=float,
+        default=30.0,
+        help="Seconds to wait before restarting runtime (default 30, for TIME_WAIT expiry)",
+    )
     parser.add_argument("--log-dir", type=Path, default=PROJECT_ROOT / "user_data" / "logs")
     parser.add_argument("--lock-path", type=Path, default=PROJECT_ROOT / "user_data" / "runtime_watchdog.lock")
     return parser.parse_args(argv)
@@ -378,6 +405,8 @@ def main(argv=None) -> int:
         restart_mode=args.restart_mode,
         service_name=args.service_name,
         service_stop_timeout_s=args.service_stop_timeout,
+        pre_restart_delay_s=args.pre_restart_delay,
+        stop_event=stop_event,
     )
     try:
         stop_event.wait(max(30.0, args.stale_after))

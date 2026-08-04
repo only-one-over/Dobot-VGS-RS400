@@ -240,6 +240,10 @@ class RuntimeFacade:
     def stop_flow(self) -> tuple[bool, str]:
         return self._send("stop_debug_flow", action_name="停止流程")
 
+    def release_delay(self) -> tuple[bool, str]:
+        """放行延时等待（modbus_or_timeout 模式下即时继续）。"""
+        return self._send("release_delay", action_name="放行延时等待")
+
     def clear_alarm_history(self) -> tuple[bool, str]:
         return self._send("clear_alarm_history", action_name="清空报警历史")
 

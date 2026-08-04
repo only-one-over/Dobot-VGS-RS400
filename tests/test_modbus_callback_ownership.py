@@ -212,11 +212,12 @@ def test_write_status_hook_err_is_coroutine_function():
     assert asyncio.iscoroutinefunction(server._write_status_hook_err)
 
 
-def test_illegal_hook_type_cmd_hook_writes_110_without_blocking():
-    """非法 40004 + cmd==3 时 _action_callback 通过 await 写 40001=110，不阻塞。"""
+def test_illegal_hook_type_cmd_hook_is_forwarded_without_blocking():
+    """非法 40004 + cmd==3 由 runtime 启动入口校验，Modbus 回调只转发。"""
     modbus_server = _real_modules()
+    calls = []
     server = modbus_server.DobotModbusServer(
-        on_command_callback=lambda cmd, mode=0, hook_type=0: None
+        on_command_callback=lambda cmd, mode=0, hook_type=0: calls.append((cmd, mode, hook_type))
     )
     context = _MockContext()
     server._server = _MockServer(context)
@@ -238,11 +239,9 @@ def test_illegal_hook_type_cmd_hook_writes_110_without_blocking():
     # 改为 async/await 后应立即完成。
     asyncio.run(_run())
 
-    # 40001 被写入 110 (STATUS_HOOK_ERR)
-    assert len(context.set_values_calls) == 1
-    _, _, address, values = context.set_values_calls[0]
-    assert address == modbus_server._WIRE_ADDR
-    assert values == [modbus_server.STATUS_HOOK_ERR]
+    # 从站事件循环不直接写 40001=110；非法 hook_type 交给 runtime 处理。
+    assert context.set_values_calls == []
+    assert calls == [(modbus_server.CMD_HOOK, modbus_server.MODE_AUTO, 2)]
 
 
 def test_legal_hook_type_cmd_hook_does_not_call_write_status_hook_err():
@@ -751,8 +750,9 @@ def test_action_callback_only_enqueues_via_on_command_callback():
     source = inspect.getsource(modbus_server.DobotModbusServer._action_callback)
     # The only command-dispatch call should be self._on_command(...)
     assert "self._on_command(" in source
-    # _write_status_hook_err is allowed (async, only for illegal 40004)
-    assert "await self._write_status_hook_err" in source
+    # Illegal hook-type handling has moved to runtime start_new_task; the
+    # Modbus event-loop callback only delegates command writes.
+    assert "await self._write_status_hook_err" not in source
 
 
 
@@ -932,4 +932,3 @@ def test_on_modbus_command_flow_active_no_delay_logic():
 
     assert len(controller.modbus_server.calls) == 1
     assert controller.modbus_server.calls[0]["status"] == modbus_server.STATUS_RUNNING
-

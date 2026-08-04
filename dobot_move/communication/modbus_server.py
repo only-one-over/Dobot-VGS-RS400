@@ -186,12 +186,26 @@ class DobotModbusServer:
                 return False
 
     async def _action_callback(self, function_code, start_address, address, count, current_registers, set_values):
-        """SimDevice action 回调：实时监测主站写操作"""
+        """SimDevice action 回调：实时监测主站写操作。
+
+        pymodbus 3.14.0 签名（6 参数）：
+        - function_code: int - 功能码
+        - start_address: int - 块起始地址（本项目 SimData(address=0) 固定为 0）
+        - address: int - 请求地址
+        - count: int - 寄存器数量
+        - current_registers: list[int] - 整个共享块的当前寄存器值
+        - set_values: list[int] | None - 写请求的值（None 表示读请求）
+
+        旧版 3.12.1 签名为 (function_code, address, current_registers,
+        new_registers)（4 参数），但第 4 参数恒为 None，无法获取写入值，
+        已在 3.14.0 修复。
+        """
         if set_values is None:
             return None
         if function_code not in HR_FC:
             return None
 
+        # SimData(address=0, count=65536) → 块起始地址固定为 0
         internal_status_write = self._consume_internal_status_write(address, set_values)
         offset = address - start_address
         old_values = list(current_registers[offset:offset + len(set_values)])
@@ -313,23 +327,10 @@ class DobotModbusServer:
             )
             current_hook_type = int(current_hook_type)
 
-            # 非法 40004 检测：cmd==3 时拒绝启动，写 40001=110
-            if current_hook_type < HOOK_TYPE_LOW or current_hook_type > HOOK_TYPE_HIGH:
-                if cmd_value == CMD_HOOK:
-                    logger.error(
-                        "[Modbus协议错误] 40004 钩子类型非法: %d (合法范围 0/1)，拒绝 40001=3 启动，写 40001=110",
-                        current_hook_type,
-                    )
-                    await self._write_status_hook_err()
-                    return None
-                else:
-                    logger.warning(
-                        "[Modbus协议警告] 40004 钩子类型非法: %d (合法范围 0/1)，命令 %d 仍传递",
-                        current_hook_type,
-                        cmd_value,
-                    )
-
-            self._on_command(cmd_value, mode=current_mode, hook_type=current_hook_type)
+            try:
+                self._on_command(cmd_value, mode=current_mode, hook_type=current_hook_type)
+            except Exception:
+                logger.exception("_on_command 回调异常")
 
         return None
 
@@ -373,10 +374,10 @@ class DobotModbusServer:
         devices = self._build_devices()
         identity = ModbusDeviceIdentification()
         identity.VendorName = "Dobot"
-        identity.ProductCode = "CR5"
+        identity.ProductCode = "CR20A"
         identity.VendorUrl = "https://www.dobot.cc"
         identity.ProductName = "Dobot Modbus Server"
-        identity.ModelName = "CR5"
+        identity.ModelName = "CR20A"
         identity.MajorMinorRevision = "2.0"
 
         self._server = ModbusTcpServer(
@@ -445,7 +446,11 @@ class DobotModbusServer:
         # 停止服务器
         if self._server and self._loop and self._loop.is_running():
             try:
-                asyncio.run_coroutine_threadsafe(self._server.shutdown(), self._loop)
+                shutdown_future = asyncio.run_coroutine_threadsafe(self._server.shutdown(), self._loop)
+                try:
+                    shutdown_future.result(timeout=2.0)
+                except Exception:
+                    logger.warning("modbus shutdown 超时，依赖事件循环关闭兜底", exc_info=True)
             except Exception:
                 pass
         if self._port:
@@ -541,3 +546,42 @@ class DobotModbusServer:
                 entry["value_display"] = REGISTER_VALUE_DESC.get((addr, val), str(val))
             result[addr] = entry
         return result
+
+    def write_register_value(self, addr: int, value: int) -> bool:
+        """线程安全写入单个保持寄存器（40001-40004）。
+
+        通过 ``asyncio.run_coroutine_threadsafe`` 在从站事件循环上调度
+        ``context.async_setValues``，与 :meth:`get_register_values` 风格一致。
+        ``addr`` 为 5 位显示地址（40001-40004），内部映射到 0-based 线路地址
+        ``_WIRE_ADDR + (addr - REG_CMD_STATUS)``。
+
+        Returns:
+            True 写入成功；False 表示服务未运行、地址越界、超时或异常
+        """
+        if not self._loop or not self._loop.is_running() or not self._server:
+            return False
+        try:
+            offset = int(addr) - REG_CMD_STATUS
+            if offset < 0 or offset > 3:
+                logger.error("write_register_value 地址越界: addr=%s", addr)
+                return False
+        except Exception:
+            return False
+        try:
+            wire_addr = _WIRE_ADDR + offset
+            values = [int(value) & 0xFFFF]
+            signature = self._mark_internal_status_write(wire_addr, values)
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._server.context.async_setValues(
+                        self._slave_id, 3, wire_addr, values
+                    ),
+                    self._loop,
+                )
+                future.result(timeout=2.0)
+            finally:
+                self._discard_internal_status_write(signature)
+            return True
+        except Exception as e:
+            logger.error("write_register_value failed: %s", e)
+            return False
